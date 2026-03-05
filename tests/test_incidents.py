@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 # Use production URL from environment
-BASE_URL = "https://fleet-shield-2.preview.emergentagent.com"
+BASE_URL = "https://fleet-build-lab.preview.emergentagent.com"
 
 # Test credentials
 TEST_EMAIL = "admin@test.com"

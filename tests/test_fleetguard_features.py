@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timedelta
 
 # Get the backend URL from environment
-BASE_URL = os.environ.get('EXPO_PUBLIC_BACKEND_URL', 'https://fleet-shield-2.preview.emergentagent.com')
+BASE_URL = os.environ.get('EXPO_PUBLIC_BACKEND_URL', 'https://fleet-build-lab.preview.emergentagent.com')
 
 # Test credentials
 ADMIN_EMAIL = "admin@test.com"
