@@ -252,6 +252,25 @@ def get_password_hash(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
+import re
+async def generate_unique_username(name: str, company_id: str) -> str:
+    """Generate a unique username from the person's name"""
+    # Clean the name: lowercase, remove special chars, replace spaces with dots
+    base_username = re.sub(r'[^a-z0-9]', '.', name.lower().strip())
+    base_username = re.sub(r'\.+', '.', base_username).strip('.')  # Clean up multiple dots
+    
+    if not base_username:
+        base_username = "user"
+    
+    # Check if username exists in the same company
+    username = base_username
+    counter = 1
+    while await db.users.find_one({"username": username, "company_id": company_id}):
+        username = f"{base_username}{counter}"
+        counter += 1
+    
+    return username
+
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS))
@@ -327,9 +346,10 @@ class AIDamageStatus:
 
 # Auth Models
 class UserRegister(BaseModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None  # Optional - can login with username instead
     password: str
     name: str
+    username: Optional[str] = None  # Auto-generated if not provided
     phone: Optional[str] = None
     role: str = UserRole.DRIVER
     company_id: Optional[str] = None
@@ -354,8 +374,10 @@ class DriverUpdate(BaseModel):
     dangerous_goods_expiry: Optional[str] = None
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: Optional[str] = None  # Can be email or username
+    username: Optional[str] = None  # Alternative to email
     password: str
+    remember_me: bool = False  # Keep logged in option
 
 # Fuel Submission Models
 class FuelSubmission(BaseModel):
@@ -999,7 +1021,21 @@ async def register(user: UserRegister, request: Request):
 
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin, request: Request):
-    user = await db.users.find_one({"email": credentials.email})
+    # Support login with email OR username
+    login_identifier = credentials.email or credentials.username
+    if not login_identifier:
+        raise HTTPException(status_code=400, detail="Email or username is required")
+    
+    login_identifier = login_identifier.lower().strip()
+    
+    # Try to find user by email or username
+    user = await db.users.find_one({
+        "$or": [
+            {"email": login_identifier},
+            {"username": login_identifier}
+        ]
+    })
+    
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -1009,7 +1045,9 @@ async def login(credentials: UserLogin, request: Request):
         {"$set": {"last_login": datetime.utcnow(), "ip_address": request.client.host if request.client else "unknown"}}
     )
     
-    token = create_access_token({"sub": str(user["_id"])})
+    # Token expiry based on "remember me" option
+    expires_delta = timedelta(days=30) if credentials.remember_me else timedelta(days=1)
+    token = create_access_token({"sub": str(user["_id"])}, expires_delta=expires_delta)
     
     return {
         "access_token": token,
@@ -1486,29 +1524,38 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    existing = await db.users.find_one({"email": user.email.lower()})
+    # Check if email is provided and already exists
+    if user.email:
+        existing = await db.users.find_one({"email": user.email.lower()})
+        
+        # Check if email belongs to an admin in the same company
+        if existing:
+            # If it's an admin from the same company, enable them as operator too
+            if existing.get("role") in [UserRole.ADMIN, UserRole.SUPER_ADMIN] and existing.get("company_id") == current_user["company_id"]:
+                # Add is_also_operator flag to the existing admin account
+                await db.users.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {
+                        "is_also_operator": True,
+                        "operator_enabled_at": datetime.utcnow()
+                    }}
+                )
+                # Return the updated user
+                updated_user = await db.users.find_one({"_id": existing["_id"]})
+                return serialize_doc(updated_user)
+            else:
+                raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Check if email belongs to an admin in the same company
-    if existing:
-        # If it's an admin from the same company, enable them as operator too
-        if existing.get("role") in [UserRole.ADMIN, UserRole.SUPER_ADMIN] and existing.get("company_id") == current_user["company_id"]:
-            # Add is_also_operator flag to the existing admin account
-            await db.users.update_one(
-                {"_id": existing["_id"]},
-                {"$set": {
-                    "is_also_operator": True,
-                    "operator_enabled_at": datetime.utcnow()
-                }}
-            )
-            # Return the updated user
-            updated_user = await db.users.find_one({"_id": existing["_id"]})
-            return serialize_doc(updated_user)
-        else:
-            raise HTTPException(status_code=400, detail="Email already registered")
+    # Generate unique username
+    username = user.username or await generate_unique_username(user.name, current_user["company_id"])
+    
+    # Check if username already exists in this company
+    if await db.users.find_one({"username": username, "company_id": current_user["company_id"]}):
+        username = await generate_unique_username(user.name, current_user["company_id"])
     
     driver_doc = {
         "_id": ObjectId(),
-        "email": user.email.lower(),
+        "username": username,
         "password_hash": get_password_hash(user.password),
         "name": user.name,
         "phone": user.phone,
@@ -1516,8 +1563,20 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         "company_id": current_user["company_id"],
         "assigned_vehicles": [],
         "created_at": datetime.utcnow(),
-        "ip_address": request.client.host if request.client else "unknown"
+        "ip_address": request.client.host if request.client else "unknown",
+        # License and training details
+        "license_number": user.license_number,
+        "license_class": user.license_class,
+        "license_expiry": user.license_expiry,
+        "medical_certificate_expiry": user.medical_certificate_expiry,
+        "first_aid_expiry": user.first_aid_expiry,
+        "forklift_license_expiry": user.forklift_license_expiry,
+        "dangerous_goods_expiry": user.dangerous_goods_expiry,
     }
+    # Only add email if provided (sparse index doesn't like None values)
+    if user.email:
+        driver_doc["email"] = user.email.lower()
+    
     await db.users.insert_one(driver_doc)
     
     return serialize_doc(driver_doc)
@@ -3460,7 +3519,19 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     # Create indexes for better query performance
-    await db.users.create_index("email", unique=True)
+    # Drop old email index and create a sparse one (allows multiple nulls)
+    try:
+        await db.users.drop_index("email_1")
+    except:
+        pass  # Index might not exist
+    try:
+        await db.users.drop_index("company_id_1_username_1")
+    except:
+        pass  # Index might not exist
+    
+    # Sparse indexes allow multiple null values
+    await db.users.create_index("email", unique=True, sparse=True)
+    await db.users.create_index("username", sparse=True)  # Not unique globally, just for lookups
     await db.users.create_index([("company_id", 1), ("role", 1)])
     await db.vehicles.create_index([("company_id", 1), ("registration_number", 1)])
     await db.vehicles.create_index([("company_id", 1), ("status", 1)])
