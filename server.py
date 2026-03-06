@@ -2681,10 +2681,22 @@ async def get_dashboard_stats(
         "company_id": company_id,
         "rego_expiry": {"$lte": thirty_days, "$gte": today_str}
     })
+    # Get names of vehicles with expiring rego
+    rego_expiring_vehicles = await db.vehicles.find({
+        "company_id": company_id,
+        "rego_expiry": {"$lte": thirty_days, "$gte": today_str}
+    }, {"name": 1, "rego_expiry": 1, "_id": 0}).to_list(10)
+    
     upcoming_insurance = await db.vehicles.count_documents({
         "company_id": company_id,
         "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}
     })
+    # Get names of vehicles with expiring insurance
+    insurance_expiring_vehicles = await db.vehicles.find({
+        "company_id": company_id,
+        "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}
+    }, {"name": 1, "insurance_expiry": 1, "_id": 0}).to_list(10)
+    
     upcoming_safety_cert = await db.vehicles.count_documents({
         "company_id": company_id,
         "safety_certificate_expiry": {"$lte": thirty_days, "$gte": today_str}
@@ -2693,6 +2705,11 @@ async def get_dashboard_stats(
         "company_id": company_id,
         "coi_expiry": {"$lte": thirty_days, "$gte": today_str}
     })
+    # Get names of vehicles with expiring COI
+    coi_expiring_vehicles = await db.vehicles.find({
+        "company_id": company_id,
+        "coi_expiry": {"$lte": thirty_days, "$gte": today_str}
+    }, {"name": 1, "coi_expiry": 1, "_id": 0}).to_list(10)
     
     # Total expiring soon (all categories)
     expiring_soon = upcoming_rego + upcoming_insurance + upcoming_safety_cert + upcoming_coi
@@ -2761,6 +2778,10 @@ async def get_dashboard_stats(
         "upcoming_insurance_expiry": upcoming_insurance,
         "upcoming_safety_cert_expiry": upcoming_safety_cert,
         "upcoming_coi_expiry": upcoming_coi,
+        # Vehicle names with expiring items
+        "rego_expiring_vehicles": rego_expiring_vehicles,
+        "insurance_expiring_vehicles": insurance_expiring_vehicles,
+        "coi_expiring_vehicles": coi_expiring_vehicles,
         "unread_alerts": unread_alerts,
         "drivers_license_expiring": drivers_license_expiring,
         "drivers_license_expired": drivers_license_expired,
