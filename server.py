@@ -50,26 +50,48 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
-# Simple in-memory cache for dashboard stats (reduces DB queries)
-dashboard_cache: Dict[str, Any] = {}
-CACHE_TTL_SECONDS = 30  # Cache for 30 seconds
+# Universal in-memory cache for API responses
+api_cache: Dict[str, Any] = {}
+CACHE_TTL = {
+    "dashboard": 30,    # Dashboard stats: 30 seconds
+    "vehicles": 30,     # Vehicles list: 30 seconds
+    "drivers": 30,      # Drivers list: 30 seconds
+    "inspections": 15,  # Inspections: 15 seconds (more dynamic)
+}
 
-def get_cached_stats(company_id: str) -> Optional[dict]:
-    """Get cached dashboard stats if still valid"""
-    cache_key = f"dashboard_{company_id}"
-    if cache_key in dashboard_cache:
-        cached = dashboard_cache[cache_key]
-        if datetime.utcnow().timestamp() - cached["timestamp"] < CACHE_TTL_SECONDS:
+def get_cached(cache_type: str, company_id: str) -> Optional[Any]:
+    """Get cached data if still valid"""
+    cache_key = f"{cache_type}_{company_id}"
+    if cache_key in api_cache:
+        cached = api_cache[cache_key]
+        ttl = CACHE_TTL.get(cache_type, 30)
+        if datetime.utcnow().timestamp() - cached["timestamp"] < ttl:
             return cached["data"]
     return None
 
-def set_cached_stats(company_id: str, data: dict):
-    """Cache dashboard stats"""
-    cache_key = f"dashboard_{company_id}"
-    dashboard_cache[cache_key] = {
+def set_cached(cache_type: str, company_id: str, data: Any):
+    """Cache API response data"""
+    cache_key = f"{cache_type}_{company_id}"
+    api_cache[cache_key] = {
         "timestamp": datetime.utcnow().timestamp(),
         "data": data
     }
+
+def invalidate_cache(cache_type: str, company_id: str):
+    """Invalidate cache when data changes"""
+    cache_key = f"{cache_type}_{company_id}"
+    if cache_key in api_cache:
+        del api_cache[cache_key]
+
+# Legacy functions for backwards compatibility
+dashboard_cache = api_cache
+CACHE_TTL_SECONDS = 30
+
+def get_cached_stats(company_id: str) -> Optional[dict]:
+    return get_cached("dashboard", company_id)
+
+def set_cached_stats(company_id: str, data: dict):
+    set_cached("dashboard", company_id, data)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -1382,9 +1404,11 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    company_id = current_user["company_id"]
+    
     vehicle_doc = {
         "_id": ObjectId(),
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "name": vehicle.name,
         "registration_number": vehicle.registration_number,
         "trailer_attached": vehicle.trailer_attached,
@@ -1400,12 +1424,16 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
     }
     await db.vehicles.insert_one(vehicle_doc)
     
+    # Invalidate vehicles cache
+    invalidate_cache("vehicles", company_id)
+    invalidate_cache("dashboard", company_id)
+    
     # Check for upcoming expiries and create alerts
-    await check_and_create_expiry_alerts(vehicle_doc, current_user["company_id"])
+    await check_and_create_expiry_alerts(vehicle_doc, company_id)
     
     # Update company vehicle count
     await db.companies.update_one(
-        {"_id": ObjectId(current_user["company_id"])},
+        {"_id": ObjectId(company_id)},
         {"$inc": {"active_vehicles_count": 1}}
     )
     
@@ -1418,14 +1446,26 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
 
 @api_router.get("/vehicles")
 async def get_vehicles(current_user: dict = Depends(get_current_user)):
-    query = {"company_id": current_user["company_id"]}
+    company_id = current_user["company_id"]
     
-    # Drivers only see assigned vehicles
+    # For drivers, don't use cache (they see filtered list)
     if current_user["role"] == UserRole.DRIVER:
-        query["assigned_driver_ids"] = str(current_user["_id"])
+        query = {"company_id": company_id, "assigned_driver_ids": str(current_user["_id"])}
+        vehicles = await db.vehicles.find(query).to_list(1000)
+        return serialize_doc(vehicles)
     
+    # Check cache for admins/owners
+    cached = get_cached("vehicles", company_id)
+    if cached:
+        return cached
+    
+    query = {"company_id": company_id}
     vehicles = await db.vehicles.find(query).to_list(1000)
-    return serialize_doc(vehicles)
+    result = serialize_doc(vehicles)
+    
+    # Cache the result
+    set_cached("vehicles", company_id, result)
+    return result
 
 @api_router.get("/vehicles/active-today")
 async def get_active_vehicles_today(
@@ -1474,6 +1514,10 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
     
     vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
     
+    # Invalidate cache
+    invalidate_cache("vehicles", current_user["company_id"])
+    invalidate_cache("dashboard", current_user["company_id"])
+    
     await log_audit_trail(
         str(current_user["_id"]), "update", "vehicle", vehicle_id,
         request.client.host if request.client else "unknown", update_data
@@ -1486,16 +1530,22 @@ async def delete_vehicle(vehicle_id: str, request: Request, current_user: dict =
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    company_id = current_user["company_id"]
+    
     result = await db.vehicles.delete_one({
         "_id": ObjectId(vehicle_id),
-        "company_id": current_user["company_id"]
+        "company_id": company_id
     })
     
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
+    # Invalidate cache
+    invalidate_cache("vehicles", company_id)
+    invalidate_cache("dashboard", company_id)
+    
     await db.companies.update_one(
-        {"_id": ObjectId(current_user["company_id"])},
+        {"_id": ObjectId(company_id)},
         {"$inc": {"active_vehicles_count": -1}}
     )
     
@@ -1533,23 +1583,33 @@ async def get_drivers(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    company_id = current_user["company_id"]
+    
+    # Check cache first
+    cached = get_cached("drivers", company_id)
+    if cached:
+        return cached
+    
     # Get regular drivers
     drivers = await db.users.find({
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "role": UserRole.DRIVER
     }).to_list(1000)
     
     # Also get admins who are enabled as operators
     admin_operators = await db.users.find({
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "role": {"$in": [UserRole.ADMIN, UserRole.SUPER_ADMIN]},
         "is_also_operator": True
     }).to_list(100)
     
     # Combine lists
     all_operators = drivers + admin_operators
+    result = serialize_doc(all_operators)
     
-    return serialize_doc(all_operators)
+    # Cache the result
+    set_cached("drivers", company_id, result)
+    return result
 
 @api_router.post("/drivers")
 async def create_driver(user: UserRegister, request: Request, current_user: dict = Depends(get_current_user)):
@@ -1611,6 +1671,10 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     
     await db.users.insert_one(driver_doc)
     
+    # Invalidate cache
+    invalidate_cache("drivers", current_user["company_id"])
+    invalidate_cache("dashboard", current_user["company_id"])
+    
     return serialize_doc(driver_doc)
 
 @api_router.delete("/drivers/{driver_id}")
@@ -1618,14 +1682,20 @@ async def delete_driver(driver_id: str, current_user: dict = Depends(get_current
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    company_id = current_user["company_id"]
+    
     result = await db.users.delete_one({
         "_id": ObjectId(driver_id),
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "role": UserRole.DRIVER
     })
     
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Driver not found")
+    
+    # Invalidate cache
+    invalidate_cache("drivers", company_id)
+    invalidate_cache("dashboard", company_id)
     
     return {"message": "Driver deleted"}
 
