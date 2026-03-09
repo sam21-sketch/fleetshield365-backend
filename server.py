@@ -277,20 +277,29 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 import re
 async def generate_unique_username(name: str, company_id: str) -> str:
-    """Generate a unique username from the person's name"""
-    # Clean the name: lowercase, remove special chars, replace spaces with dots
-    base_username = re.sub(r'[^a-z0-9]', '.', name.lower().strip())
-    base_username = re.sub(r'\.+', '.', base_username).strip('.')  # Clean up multiple dots
+    """Generate a unique username from the person's name with random numbers"""
+    import random
     
-    if not base_username:
-        base_username = "user"
+    # Clean the name: lowercase, remove special chars, keep only first name
+    clean_name = re.sub(r'[^a-z0-9]', '', name.lower().strip().split()[0] if name.strip() else 'user')
     
-    # Check if username exists in the same company
-    username = base_username
-    counter = 1
+    if not clean_name:
+        clean_name = "user"
+    
+    # Try base username first, then add random numbers
+    username = clean_name
+    attempts = 0
+    max_attempts = 50
+    
     while await db.users.find_one({"username": username, "company_id": company_id}):
-        username = f"{base_username}{counter}"
-        counter += 1
+        # Generate random 1-2 digit number (1-99)
+        random_num = random.randint(1, 99)
+        username = f"{clean_name}{random_num}"
+        attempts += 1
+        if attempts >= max_attempts:
+            # Fallback to 3 digit random if too many collisions
+            username = f"{clean_name}{random.randint(100, 999)}"
+            break
     
     return username
 
