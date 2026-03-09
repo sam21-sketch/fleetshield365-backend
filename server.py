@@ -50,6 +50,27 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
+# Simple in-memory cache for dashboard stats (reduces DB queries)
+dashboard_cache: Dict[str, Any] = {}
+CACHE_TTL_SECONDS = 30  # Cache for 30 seconds
+
+def get_cached_stats(company_id: str) -> Optional[dict]:
+    """Get cached dashboard stats if still valid"""
+    cache_key = f"dashboard_{company_id}"
+    if cache_key in dashboard_cache:
+        cached = dashboard_cache[cache_key]
+        if datetime.utcnow().timestamp() - cached["timestamp"] < CACHE_TTL_SECONDS:
+            return cached["data"]
+    return None
+
+def set_cached_stats(company_id: str, data: dict):
+    """Cache dashboard stats"""
+    cache_key = f"dashboard_{company_id}"
+    dashboard_cache[cache_key] = {
+        "timestamp": datetime.utcnow().timestamp(),
+        "data": data
+    }
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -2736,6 +2757,11 @@ async def get_dashboard_stats(
 ):
     company_id = current_user["company_id"]
     
+    # Check cache first for faster response
+    cached = get_cached_stats(company_id)
+    if cached:
+        return cached
+    
     # Calculate "today" in client's timezone
     now_utc = datetime.utcnow()
     client_offset = timedelta(minutes=-tz_offset)
@@ -2806,7 +2832,7 @@ async def get_dashboard_stats(
                 elif exp <= sixty_days:
                     drivers_training_expiring += 1
     
-    return {
+    result = {
         "total_vehicles": total_vehicles,
         "total_drivers": len(drivers),
         "inspections_today": inspections_today,
@@ -2830,6 +2856,11 @@ async def get_dashboard_stats(
         "drivers_training_expiring": drivers_training_expiring,
         "drivers_training_expired": drivers_training_expired,
     }
+    
+    # Cache the result
+    set_cached_stats(company_id, result)
+    
+    return result
 
 
 @api_router.get("/dashboard/chart-data")
@@ -3607,6 +3638,11 @@ async def startup_event():
     await db.alerts.create_index([("company_id", 1), ("created_at", -1)])
     await db.maintenance_logs.create_index([("company_id", 1), ("service_date", -1)])
     await db.fuel_submissions.create_index([("company_id", 1), ("timestamp", -1)])
+    # Indexes for expiry date queries (dashboard performance)
+    await db.vehicles.create_index([("company_id", 1), ("rego_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("insurance_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("safety_certificate_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("coi_expiry", 1)])
     logger.info("Database indexes created")
 
 @app.on_event("shutdown")
