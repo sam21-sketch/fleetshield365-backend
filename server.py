@@ -162,27 +162,73 @@ async def send_expiry_alert_email(admin_email: str, company_name: str, alerts: L
     """
     return await send_email_notification(admin_email, f"[FleetShield365] {len(alerts)} Expiry Alert(s) Require Attention", html_content)
 
-async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str):
-    """Send issue alert email when an inspection has issues"""
+async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict] = None, inspection_id: str = None):
+    """Send issue alert email when an inspection has issues - WITH PHOTOS"""
+    
+    # Build photo HTML if photos provided
+    photo_html = ""
+    if photos and len(photos) > 0:
+        photo_html = """
+        <div style="margin: 20px 0;">
+            <h3 style="color: #374151;">Inspection Photos:</h3>
+            <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+        """
+        for photo in photos[:8]:  # Limit to 8 photos
+            photo_type = photo.get('photo_type', 'Photo').replace('_', ' ').title()
+            base64_data = photo.get('base64_data', '')
+            if base64_data:
+                # Ensure proper data URL format
+                if not base64_data.startswith('data:'):
+                    base64_data = f"data:image/jpeg;base64,{base64_data}"
+                photo_html += f"""
+                <div style="text-align: center;">
+                    <img src="{base64_data}" style="width: 150px; height: 120px; object-fit: cover; border-radius: 8px; border: 2px solid {'#DC2626' if 'damage' in photo_type.lower() else '#E5E7EB'};" />
+                    <p style="font-size: 11px; color: #6B7280; margin: 4px 0;">{photo_type}</p>
+                </div>
+                """
+        photo_html += "</div></div>"
+    
+    # Dashboard link
+    dashboard_link = f"https://www.fleetshield365.com/dashboard"
+    
     html_content = f"""
     <html>
-    <body style="font-family: Arial, sans-serif; padding: 20px;">
-        <h2 style="color: #DC2626;">FleetShield365 Issue Alert</h2>
-        <p>Hi {company_name} Admin,</p>
-        <p>An issue has been reported during a vehicle inspection:</p>
-        <div style="background-color: #FEF2F2; border: 1px solid #FECACA; padding: 16px; border-radius: 8px; margin: 20px 0;">
-            <p><strong>Vehicle:</strong> {vehicle_name}</p>
-            <p><strong>Driver:</strong> {driver_name}</p>
-            <p><strong>Inspection Type:</strong> {inspection_type}</p>
-            <p><strong>Issue Summary:</strong></p>
-            <p style="color: #DC2626;">{issue_summary}</p>
+    <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+        <div style="background-color: #DC2626; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">🚨 DEFECT ALERT - Immediate Attention Required</h2>
         </div>
-        <p>Please log in to FleetShield365 to review the full inspection report.</p>
-        <p style="color: #64748B; font-size: 12px;">This is an automated message from FleetShield365.</p>
+        
+        <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
+            <p>Hi {company_name} Admin,</p>
+            <p><strong>A defect has been reported and requires your immediate attention:</strong></p>
+            
+            <div style="background-color: #FEF2F2; border-left: 4px solid #DC2626; padding: 16px; margin: 20px 0;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr><td style="padding: 8px 0; color: #6B7280;">Vehicle:</td><td style="padding: 8px 0; font-weight: bold;">{vehicle_name}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #6B7280;">Driver:</td><td style="padding: 8px 0;">{driver_name}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #6B7280;">Inspection Type:</td><td style="padding: 8px 0;">{inspection_type}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #6B7280;">Time:</td><td style="padding: 8px 0;">{datetime.utcnow().strftime('%I:%M %p, %B %d, %Y')}</td></tr>
+                </table>
+                <hr style="border: none; border-top: 1px solid #FECACA; margin: 15px 0;" />
+                <p style="color: #DC2626; font-weight: bold; margin: 0;">⚠️ Issue Reported:</p>
+                <p style="color: #991B1B; margin: 8px 0 0 0;">{issue_summary}</p>
+            </div>
+            
+            {photo_html}
+            
+            <div style="margin-top: 25px; text-align: center;">
+                <a href="{dashboard_link}" style="background-color: #0891B2; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold;">View Full Inspection Report</a>
+            </div>
+            
+            <p style="color: #9CA3AF; font-size: 12px; margin-top: 30px; text-align: center;">
+                This is an automated alert from FleetShield365.<br/>
+                Vehicle may need to be taken off road pending inspection.
+            </p>
+        </div>
     </body>
     </html>
     """
-    return await send_email_notification(admin_email, f"[FleetShield365] Issue Reported: {vehicle_name}", html_content)
+    return await send_email_notification(admin_email, f"🚨 [DEFECT ALERT] {vehicle_name} - {issue_summary[:50]}", html_content)
 
 async def send_missed_inspection_email(admin_email: str, company_name: str, vehicles: List[dict]):
     """Send missed inspection alert email"""
@@ -288,6 +334,51 @@ async def notify_admins(company_id: str, notification_type: str, title: str, bod
         # Send email notification
         if prefs.get("email_enabled", True) and email_func and email_args:
             await email_func(admin.get("email"), company_name, *email_args)
+
+async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict], inspection_id: str):
+    """Send issue alert notifications to admins with photos included"""
+    # Get all admins for this company
+    admins = await db.users.find({
+        "company_id": company_id,
+        "role": {"$in": ["super_admin", "admin"]}
+    }).to_list(100)
+    
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = company.get("name", "Your Company") if company else "Your Company"
+    
+    for admin in admins:
+        # Get notification preferences
+        prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])})
+        if not prefs:
+            prefs = {"push_enabled": True, "email_enabled": True, "issue_alerts": True}
+        
+        # Check if issue alerts are enabled
+        if not prefs.get("issue_alerts", True):
+            continue
+        
+        # Send push notification
+        if prefs.get("push_enabled", True):
+            tokens = await db.push_tokens.find({"user_id": str(admin["_id"])}).to_list(10)
+            push_tokens = [t["token"] for t in tokens if t.get("token")]
+            await send_push_notification(
+                push_tokens, 
+                f"🚨 DEFECT: {vehicle_name}", 
+                f"Driver reported: {issue_summary}",
+                {"inspection_id": inspection_id, "type": "defect_alert"}
+            )
+        
+        # Send email notification WITH PHOTOS
+        if prefs.get("email_enabled", True) and admin.get("email"):
+            await send_issue_alert_email(
+                admin.get("email"),
+                company_name,
+                vehicle_name,
+                driver_name,
+                issue_summary,
+                inspection_type,
+                photos,
+                inspection_id
+            )
 
 # ============== Helper Functions ==============
 
@@ -2013,15 +2104,23 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             str(current_user["_id"])
         )
         
-        # Send notifications to admins
-        await notify_admins(
+        # Fetch photos for the email alert (get damage photo + a few others)
+        photos_for_email = []
+        for photo in inspection.photos:
+            photos_for_email.append({
+                "photo_type": photo.photo_type,
+                "base64_data": photo.base64_data
+            })
+        
+        # Send notifications to admins WITH PHOTOS
+        await notify_admins_with_photos(
             current_user["company_id"],
-            "issue",
-            f"Issue Reported: {vehicle['name']}",
-            f"Driver reported: {', '.join(issue_items)}",
-            {"inspection_id": str(inspection_id), "vehicle_id": inspection.vehicle_id},
-            send_issue_alert_email,
-            (vehicle['name'], current_user.get('full_name', 'Driver'), ', '.join(issue_items), "Pre-start")
+            vehicle['name'],
+            current_user.get('name', current_user.get('full_name', 'Driver')),
+            ', '.join(issue_items),
+            "Pre-start",
+            photos_for_email,
+            str(inspection_id)
         )
     
     # Check for repeated issues (3+ in 7 days)
@@ -2134,6 +2233,54 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             f"New damage reported on {vehicle['name']}: {inspection.damage_comment or 'No details'}",
             inspection.vehicle_id,
             str(current_user["_id"])
+        )
+        
+        # Send instant alert with photos
+        photos_for_email = []
+        for photo in (inspection.photos or []):
+            photos_for_email.append({
+                "photo_type": photo.photo_type,
+                "base64_data": photo.base64_data
+            })
+        
+        issue_summary = f"New damage: {inspection.damage_comment or 'See photos'}"
+        if inspection.incident_today:
+            issue_summary += f" | Incident: {inspection.incident_comment or 'See photos'}"
+        
+        await notify_admins_with_photos(
+            current_user["company_id"],
+            vehicle['name'],
+            current_user.get('name', current_user.get('full_name', 'Driver')),
+            issue_summary,
+            "End-of-shift",
+            photos_for_email,
+            str(inspection_id)
+        )
+    elif inspection.incident_today:
+        # Also alert for incidents without damage
+        await create_alert(
+            current_user["company_id"],
+            "incident",
+            f"Incident reported for {vehicle['name']}: {inspection.incident_comment or 'No details'}",
+            inspection.vehicle_id,
+            str(current_user["_id"])
+        )
+        
+        photos_for_email = []
+        for photo in (inspection.photos or []):
+            photos_for_email.append({
+                "photo_type": photo.photo_type,
+                "base64_data": photo.base64_data
+            })
+        
+        await notify_admins_with_photos(
+            current_user["company_id"],
+            vehicle['name'],
+            current_user.get('name', current_user.get('full_name', 'Driver')),
+            f"Incident reported: {inspection.incident_comment or 'See photos'}",
+            "End-of-shift",
+            photos_for_email,
+            str(inspection_id)
         )
     
     await log_audit_trail(
