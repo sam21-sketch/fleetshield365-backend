@@ -723,6 +723,67 @@ PRICING = {
     "trial_days": 14,
 }
 
+# ============== Trial Status Helpers ==============
+
+async def get_trial_status(company_id: str) -> dict:
+    """Check trial/subscription status for a company"""
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        return {"status": "unknown", "is_active": False}
+    
+    subscription_status = company.get("subscription_status", "trialing")
+    trial_end_str = company.get("trial_end")
+    
+    # If already paid/active subscription
+    if subscription_status == "active":
+        return {
+            "status": "active",
+            "is_active": True,
+            "plan": company.get("subscription_plan", "pro"),
+            "message": "Active subscription"
+        }
+    
+    # Check trial status
+    if trial_end_str:
+        try:
+            trial_end = datetime.fromisoformat(trial_end_str.replace('Z', '+00:00'))
+            if isinstance(trial_end, datetime) and trial_end.tzinfo is None:
+                trial_end = trial_end.replace(tzinfo=None)
+            now = datetime.utcnow()
+            
+            days_left = (trial_end - now).days
+            
+            if days_left > 0:
+                return {
+                    "status": "trialing",
+                    "is_active": True,
+                    "days_left": days_left,
+                    "trial_end": trial_end_str,
+                    "message": f"Trial: {days_left} days remaining"
+                }
+            else:
+                return {
+                    "status": "trial_expired",
+                    "is_active": False,
+                    "days_left": 0,
+                    "trial_end": trial_end_str,
+                    "message": "Trial expired - Please upgrade to continue"
+                }
+        except Exception as e:
+            logger.error(f"Error parsing trial_end: {e}")
+    
+    # Default to expired if no valid trial info
+    return {
+        "status": "trial_expired", 
+        "is_active": False,
+        "message": "Trial expired - Please upgrade to continue"
+    }
+
+async def check_trial_active(company_id: str) -> bool:
+    """Quick check if trial/subscription is active"""
+    status = await get_trial_status(company_id)
+    return status.get("is_active", False)
+
 # ============== PDF Generation ==============
 
 async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict, company: dict) -> str:
@@ -3554,6 +3615,9 @@ async def send_alert_notification(
 async def get_subscription(current_user: dict = Depends(get_current_user)):
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
     
+    # Get trial status
+    trial_status = await get_trial_status(current_user["company_id"])
+    
     plans = {
         "basic": {"max_vehicles": 5, "price": 0},
         "standard": {"max_vehicles": 20, "price": 49},
@@ -3567,7 +3631,12 @@ async def get_subscription(current_user: dict = Depends(get_current_user)):
         "current_plan": current_plan,
         "plan_details": plan_details,
         "active_vehicles": company.get("active_vehicles_count", 0),
-        "billing_history": company.get("billing_history", [])
+        "billing_history": company.get("billing_history", []),
+        "trial_status": trial_status.get("status"),
+        "trial_days_left": trial_status.get("days_left"),
+        "trial_end": trial_status.get("trial_end"),
+        "is_active": trial_status.get("is_active", False),
+        "subscription_message": trial_status.get("message")
     }
 
 
