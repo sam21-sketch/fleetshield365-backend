@@ -16,6 +16,7 @@ import jwt
 from bson import ObjectId
 import base64
 from io import BytesIO
+import zipfile
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -24,6 +25,7 @@ from reportlab.lib.units import inch, cm
 import json
 import stripe
 import httpx
+import asyncio
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
 
@@ -1071,7 +1073,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://fleet-build-lab.preview.emergentagent.com"
+    origin_url: str = "https://fleet-shield-preview.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1606,7 +1608,107 @@ class LicensePhotoUpload(BaseModel):
 class PasswordVerification(BaseModel):
     password: str
 
-@api_router.post("/drivers/{driver_id}/license-photos")
+class DocumentDownloadRequest(BaseModel):
+    operator_ids: List[str]
+    document_types: List[str]  # driver_license, medical, first_aid, forklift, dangerous_goods
+    password: str
+
+@api_router.post("/drivers/download-documents")
+async def download_operator_documents(request: DocumentDownloadRequest, current_user: dict = Depends(get_current_user)):
+    """Download operator documents as ZIP - Owner (super_admin) only"""
+    from fastapi.responses import StreamingResponse
+    import base64
+    import re
+    
+    # Only super_admin can download documents
+    if current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only Company Owners can download documents")
+    
+    # Verify password
+    if not verify_password(request.password, current_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Fetch selected operators
+    operator_ids = [ObjectId(oid) for oid in request.operator_ids]
+    operators = await db.users.find({
+        "_id": {"$in": operator_ids},
+        "company_id": current_user["company_id"]
+    }).to_list(100)
+    
+    if not operators:
+        raise HTTPException(status_code=404, detail="No operators found")
+    
+    # Create ZIP file in memory
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        manifest_lines = ["FleetShield365 Document Export", f"Generated: {datetime.now(timezone.utc).isoformat()}", ""]
+        
+        for operator in operators:
+            op_name = operator.get("name", "Unknown").replace("/", "_").replace("\\", "_")
+            folder_name = re.sub(r'[^\w\s-]', '', op_name).strip().replace(' ', '_')
+            manifest_lines.append(f"\n{op_name}:")
+            
+            # Document type mappings
+            doc_mappings = {
+                "driver_license": [
+                    ("license_photo_front", "driver_license_front.jpg"),
+                    ("license_photo_back", "driver_license_back.jpg")
+                ],
+                "medical": [
+                    ("medical_cert_front", "medical_certificate_front.jpg"),
+                    ("medical_cert_back", "medical_certificate_back.jpg")
+                ],
+                "first_aid": [
+                    ("first_aid_front", "first_aid_front.jpg"),
+                    ("first_aid_back", "first_aid_back.jpg")
+                ],
+                "forklift": [
+                    ("forklift_front", "forklift_license_front.jpg"),
+                    ("forklift_back", "forklift_license_back.jpg")
+                ],
+                "dangerous_goods": [
+                    ("dangerous_goods_front", "dangerous_goods_front.jpg"),
+                    ("dangerous_goods_back", "dangerous_goods_back.jpg")
+                ]
+            }
+            
+            for doc_type in request.document_types:
+                if doc_type not in doc_mappings:
+                    continue
+                    
+                for field_name, file_name in doc_mappings[doc_type]:
+                    photo_data = operator.get(field_name)
+                    if photo_data:
+                        # Handle base64 data
+                        if photo_data.startswith("data:"):
+                            # Extract base64 part after the comma
+                            base64_data = photo_data.split(",", 1)[1] if "," in photo_data else photo_data
+                        else:
+                            base64_data = photo_data
+                        
+                        try:
+                            image_bytes = base64.b64decode(base64_data)
+                            zip_file.writestr(f"{folder_name}/{file_name}", image_bytes)
+                            manifest_lines.append(f"  - {file_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to decode image for {op_name}/{file_name}: {e}")
+                            manifest_lines.append(f"  - {file_name} (ERROR: Could not decode)")
+        
+        # Add manifest
+        zip_file.writestr("manifest.txt", "\n".join(manifest_lines))
+    
+    zip_buffer.seek(0)
+    
+    # Generate filename
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"FleetShield_Documents_{timestamp}.zip"
+    
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, current_user: dict = Depends(get_current_user)):
     """Upload license photos for a driver - Owner (super_admin) only"""
     # Only super_admin can upload license photos
@@ -2635,116 +2737,60 @@ async def get_dashboard_stats(
     company_id = current_user["company_id"]
     
     # Calculate "today" in client's timezone
-    # tz_offset is negative for timezones ahead of UTC (e.g., AEST is UTC+10 = -600 minutes)
     now_utc = datetime.utcnow()
-    client_offset = timedelta(minutes=-tz_offset)  # Convert to timedelta (negate because JS gives opposite sign)
+    client_offset = timedelta(minutes=-tz_offset)
     client_now = now_utc + client_offset
     client_today_start = client_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_utc = client_today_start - client_offset  # Convert back to UTC for query
+    today_utc = client_today_start - client_offset
     
-    # Total vehicles
-    total_vehicles = await db.vehicles.count_documents({"company_id": company_id})
-    
-    # Inspections today (total count)
-    inspections_today = await db.inspections.count_documents({
-        "company_id": company_id,
-        "timestamp": {"$gte": today_utc}
-    })
-    
-    # Active vehicles today (had inspection)
-    active_today = await db.inspections.distinct("vehicle_id", {
-        "company_id": company_id,
-        "timestamp": {"$gte": today_utc}
-    })
-    
-    # Inspections missed = total vehicles - vehicles inspected today
-    inspections_missed = max(0, total_vehicles - len(active_today))
-    
-    # Issues today
-    issues_today = await db.inspections.count_documents({
-        "company_id": company_id,
-        "timestamp": {"$gte": today_utc},
-        "is_safe": False
-    })
-    
-    # Vehicles needing attention (rego expired or safety inspection due)
-    vehicles_needing_attention = await db.vehicles.count_documents({
-        "company_id": company_id,
-        "status": {"$in": [VehicleStatus.REGO_EXPIRED, VehicleStatus.SAFETY_INSPECTION_DUE]}
-    })
-    
-    # Upcoming expiries (30 days) - for "expiring_soon" count
+    # Pre-calculate date strings
     thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()[:10]
+    sixty_days = (datetime.utcnow() + timedelta(days=60)).isoformat()[:10]
     today_str = datetime.utcnow().isoformat()[:10]
-    
-    upcoming_rego = await db.vehicles.count_documents({
-        "company_id": company_id,
-        "rego_expiry": {"$lte": thirty_days, "$gte": today_str}
-    })
-    # Get names of vehicles with expiring rego
-    rego_expiring_vehicles = await db.vehicles.find({
-        "company_id": company_id,
-        "rego_expiry": {"$lte": thirty_days, "$gte": today_str}
-    }, {"name": 1, "rego_expiry": 1, "_id": 0}).to_list(10)
-    
-    upcoming_insurance = await db.vehicles.count_documents({
-        "company_id": company_id,
-        "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}
-    })
-    # Get names of vehicles with expiring insurance
-    insurance_expiring_vehicles = await db.vehicles.find({
-        "company_id": company_id,
-        "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}
-    }, {"name": 1, "insurance_expiry": 1, "_id": 0}).to_list(10)
-    
-    upcoming_safety_cert = await db.vehicles.count_documents({
-        "company_id": company_id,
-        "safety_certificate_expiry": {"$lte": thirty_days, "$gte": today_str}
-    })
-    upcoming_coi = await db.vehicles.count_documents({
-        "company_id": company_id,
-        "coi_expiry": {"$lte": thirty_days, "$gte": today_str}
-    })
-    # Get names of vehicles with expiring COI
-    coi_expiring_vehicles = await db.vehicles.find({
-        "company_id": company_id,
-        "coi_expiry": {"$lte": thirty_days, "$gte": today_str}
-    }, {"name": 1, "coi_expiry": 1, "_id": 0}).to_list(10)
-    
-    # Total expiring soon (all categories)
-    expiring_soon = upcoming_rego + upcoming_insurance + upcoming_safety_cert + upcoming_coi
-    
-    # Fuel this month - sum of all fuel submissions
     month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    fuel_pipeline = [
-        {"$match": {"company_id": company_id, "timestamp": {"$gte": month_start}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]
-    fuel_result = await db.fuel_submissions.aggregate(fuel_pipeline).to_list(1)
+    
+    # Run all queries in parallel for better performance
+    results = await asyncio.gather(
+        # Basic counts
+        db.vehicles.count_documents({"company_id": company_id}),
+        db.inspections.count_documents({"company_id": company_id, "timestamp": {"$gte": today_utc}}),
+        db.inspections.distinct("vehicle_id", {"company_id": company_id, "timestamp": {"$gte": today_utc}}),
+        db.inspections.count_documents({"company_id": company_id, "timestamp": {"$gte": today_utc}, "is_safe": False}),
+        db.vehicles.count_documents({"company_id": company_id, "status": {"$in": [VehicleStatus.REGO_EXPIRED, VehicleStatus.SAFETY_INSPECTION_DUE]}}),
+        # Expiry counts
+        db.vehicles.count_documents({"company_id": company_id, "rego_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "safety_certificate_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "coi_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        # Vehicle names with expiring items
+        db.vehicles.find({"company_id": company_id, "rego_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "rego_expiry": 1, "_id": 0}).to_list(10),
+        db.vehicles.find({"company_id": company_id, "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "insurance_expiry": 1, "_id": 0}).to_list(10),
+        db.vehicles.find({"company_id": company_id, "coi_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "coi_expiry": 1, "_id": 0}).to_list(10),
+        # Fuel and alerts
+        db.fuel_submissions.aggregate([{"$match": {"company_id": company_id, "timestamp": {"$gte": month_start}}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]).to_list(1),
+        db.alerts.count_documents({"company_id": company_id, "is_read": False}),
+        # Drivers
+        db.users.find({"company_id": company_id, "role": UserRole.DRIVER}).to_list(1000),
+    )
+    
+    # Unpack results
+    total_vehicles, inspections_today, active_today, issues_today, vehicles_needing_attention, \
+    upcoming_rego, upcoming_insurance, upcoming_safety_cert, upcoming_coi, \
+    rego_expiring_vehicles, insurance_expiring_vehicles, coi_expiring_vehicles, \
+    fuel_result, unread_alerts, drivers = results
+    
+    # Calculate derived values
+    inspections_missed = max(0, total_vehicles - len(active_today))
+    expiring_soon = upcoming_rego + upcoming_insurance + upcoming_safety_cert + upcoming_coi
     fuel_this_month = fuel_result[0]["total"] if fuel_result else 0
     
-    # Unread alerts
-    unread_alerts = await db.alerts.count_documents({
-        "company_id": company_id,
-        "is_read": False
-    })
-    
-    # Driver expiry stats (60 days)
-    sixty_days = (datetime.utcnow() + timedelta(days=60)).isoformat()[:10]
-    
-    # Get all drivers in company
-    drivers = await db.users.find({
-        "company_id": company_id,
-        "role": UserRole.DRIVER
-    }).to_list(1000)
-    
+    # Process driver expiries
     drivers_license_expiring = 0
     drivers_license_expired = 0
     drivers_training_expiring = 0
     drivers_training_expired = 0
     
     for driver in drivers:
-        # Check license expiry
         license_exp = driver.get("license_expiry")
         if license_exp and license_exp.upper() != "NA":
             if license_exp < today_str:
@@ -2752,7 +2798,6 @@ async def get_dashboard_stats(
             elif license_exp <= sixty_days:
                 drivers_license_expiring += 1
         
-        # Check training/certification expiries
         for field in ["medical_certificate_expiry", "first_aid_expiry", "forklift_license_expiry", "dangerous_goods_expiry"]:
             exp = driver.get(field)
             if exp and exp.upper() != "NA":
@@ -2762,7 +2807,6 @@ async def get_dashboard_stats(
                     drivers_training_expiring += 1
     
     return {
-        # Website frontend expected fields
         "total_vehicles": total_vehicles,
         "total_drivers": len(drivers),
         "inspections_today": inspections_today,
@@ -2770,15 +2814,13 @@ async def get_dashboard_stats(
         "issues_today": issues_today,
         "fuel_this_month": round(fuel_this_month, 2),
         "expiring_soon": expiring_soon,
-        # Additional detailed fields
         "active_today": len(active_today),
-        "active_today_ids": active_today,  # List of vehicle IDs that had inspections today
+        "active_today_ids": active_today,
         "vehicles_needing_attention": vehicles_needing_attention,
         "upcoming_rego_expiry": upcoming_rego,
         "upcoming_insurance_expiry": upcoming_insurance,
         "upcoming_safety_cert_expiry": upcoming_safety_cert,
         "upcoming_coi_expiry": upcoming_coi,
-        # Vehicle names with expiring items
         "rego_expiring_vehicles": rego_expiring_vehicles,
         "insurance_expiring_vehicles": insurance_expiring_vehicles,
         "coi_expiring_vehicles": coi_expiring_vehicles,
