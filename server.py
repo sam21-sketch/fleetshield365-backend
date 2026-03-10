@@ -2431,6 +2431,27 @@ async def get_inspections(
     projection = {"signature_base64": 0, "photos": 0, "pdf_base64": 0, "photo_refs": 0}
     inspections = await db.inspections.find(query, projection).sort("timestamp", -1).to_list(actual_limit)
     
+    # Batch fetch driver and vehicle names for all inspections
+    if inspections:
+        driver_ids = list(set(i.get("driver_id") for i in inspections if i.get("driver_id")))
+        vehicle_ids = list(set(i.get("vehicle_id") for i in inspections if i.get("vehicle_id")))
+        
+        drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}}).to_list(500)
+        vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}}).to_list(500)
+        
+        drivers, vehicles = await asyncio.gather(drivers_task, vehicles_task)
+        
+        driver_map = {str(d["_id"]): d for d in drivers}
+        vehicle_map = {str(v["_id"]): v for v in vehicles}
+        
+        # Enrich inspections with driver and vehicle info
+        for inspection in inspections:
+            driver = driver_map.get(inspection.get("driver_id"))
+            vehicle = vehicle_map.get(inspection.get("vehicle_id"))
+            inspection["driver_name"] = driver.get("name", driver.get("full_name", driver.get("email", "Unknown"))) if driver else "Unknown"
+            inspection["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+            inspection["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+    
     # Optionally include photos (only when viewing single inspection detail)
     if include_photos:
         for inspection in inspections:
@@ -2469,6 +2490,21 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
     # Fetch photos from separate collection
     photos = await fetch_inspection_photos(inspection_id)
     inspection["photos"] = photos
+    
+    # Add driver and vehicle info
+    if inspection.get("driver_id"):
+        driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
+        inspection["driver_name"] = driver.get("name", driver.get("full_name", driver.get("email", "Unknown"))) if driver else "Unknown"
+    else:
+        inspection["driver_name"] = "Unknown"
+    
+    if inspection.get("vehicle_id"):
+        vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
+        inspection["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+        inspection["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+    else:
+        inspection["vehicle_name"] = "Unknown"
+        inspection["vehicle_rego"] = "N/A"
     
     return serialize_doc(inspection)
 
