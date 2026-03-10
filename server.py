@@ -3507,8 +3507,8 @@ async def get_dashboard_chart_data(
     company_id = current_user["company_id"]
     
     # Check cache first
-    cache_key = f"chart_data:{company_id}:{days}"
-    cached = get_cached_stats(company_id, cache_key)
+    cache_key = f"chart_data_{days}"
+    cached = get_cached(cache_key, company_id)
     if cached:
         return cached
     
@@ -3586,7 +3586,8 @@ async def get_dashboard_chart_data(
         })
     
     # Cache for 30 seconds
-    set_cached_stats(company_id, chart_data, cache_key)
+    cache_key = f"chart_data_{days}"
+    set_cached(cache_key, company_id, chart_data)
     
     return chart_data
 
