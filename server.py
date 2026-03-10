@@ -626,6 +626,45 @@ class MaintenanceLogCreate(BaseModel):
     invoice_base64: Optional[str] = None
     notes: Optional[str] = None
 
+# ============== Service Record Models ==============
+
+class ServiceType(str, Enum):
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+    OTHER = "other"
+
+class ServiceRecordCreate(BaseModel):
+    vehicle_id: str
+    service_date: str  # YYYY-MM-DD
+    service_type: ServiceType
+    service_type_other: Optional[str] = None  # For "other" type
+    description: str
+    cost: Optional[float] = None
+    odometer_reading: Optional[int] = None
+    technician_name: Optional[str] = None
+    workshop_name: Optional[str] = None
+    next_service_date: Optional[str] = None  # Scheduled next service
+    next_service_odometer: Optional[int] = None  # Or at this odometer
+    attachments: Optional[List[str]] = []  # Base64 encoded photos/docs
+    warranty_until: Optional[str] = None  # Warranty expiry date
+    warranty_notes: Optional[str] = None  # Warranty details
+
+class ServiceRecordUpdate(BaseModel):
+    service_date: Optional[str] = None
+    service_type: Optional[ServiceType] = None
+    service_type_other: Optional[str] = None
+    description: Optional[str] = None
+    cost: Optional[float] = None
+    odometer_reading: Optional[int] = None
+    technician_name: Optional[str] = None
+    workshop_name: Optional[str] = None
+    next_service_date: Optional[str] = None
+    next_service_odometer: Optional[int] = None
+    attachments: Optional[List[str]] = None
+    warranty_until: Optional[str] = None
+    warranty_notes: Optional[str] = None
+
 # Alert Models
 class AlertCreate(BaseModel):
     type: str  # unsafe_vehicle, repeated_issues, expiry_warning, vehicle_offline
@@ -1277,7 +1316,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://fleet-shield-preview.preview.emergentagent.com"
+    origin_url: str = "https://maintenance-hub-285.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2753,6 +2792,300 @@ async def get_maintenance_stats(vehicle_id: str, current_user: dict = Depends(ge
         "logs": serialize_doc(logs)
     }
 
+# ============== Service Records Routes ==============
+
+@api_router.post("/service-records")
+async def create_service_record(record: ServiceRecordCreate, request: Request, current_user: dict = Depends(get_current_user)):
+    """Create a new service record for a vehicle"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    company_id = current_user["company_id"]
+    
+    # Verify vehicle exists and belongs to company
+    vehicle = await db.vehicles.find_one({
+        "_id": ObjectId(record.vehicle_id),
+        "company_id": company_id
+    })
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    # Create service record
+    service_doc = {
+        "_id": ObjectId(),
+        "company_id": company_id,
+        "vehicle_id": record.vehicle_id,
+        "service_date": record.service_date,
+        "service_type": record.service_type.value,
+        "service_type_other": record.service_type_other if record.service_type == ServiceType.OTHER else None,
+        "description": record.description,
+        "cost": record.cost,
+        "odometer_reading": record.odometer_reading,
+        "technician_name": record.technician_name,
+        "workshop_name": record.workshop_name,
+        "next_service_date": record.next_service_date,
+        "next_service_odometer": record.next_service_odometer,
+        "attachments": record.attachments or [],
+        "warranty_until": record.warranty_until,
+        "warranty_notes": record.warranty_notes,
+        "created_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    await db.service_records.insert_one(service_doc)
+    
+    # If odometer reading provided, update vehicle's current odometer
+    if record.odometer_reading and record.odometer_reading > (vehicle.get("current_odometer") or 0):
+        await db.vehicles.update_one(
+            {"_id": ObjectId(record.vehicle_id)},
+            {"$set": {"current_odometer": record.odometer_reading}}
+        )
+    
+    # Invalidate cache
+    invalidate_cache("service_records", company_id)
+    
+    await log_audit_trail(
+        str(current_user["_id"]), "create", "service_record", str(service_doc["_id"]),
+        request.client.host if request.client else "unknown"
+    )
+    
+    return serialize_doc(service_doc)
+
+@api_router.get("/service-records")
+async def get_service_records(
+    vehicle_id: Optional[str] = None,
+    service_type: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all service records with optional filtering"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    company_id = current_user["company_id"]
+    query = {"company_id": company_id}
+    
+    if vehicle_id:
+        query["vehicle_id"] = vehicle_id
+    
+    if service_type:
+        query["service_type"] = service_type
+    
+    if search:
+        query["$or"] = [
+            {"description": {"$regex": search, "$options": "i"}},
+            {"technician_name": {"$regex": search, "$options": "i"}},
+            {"workshop_name": {"$regex": search, "$options": "i"}},
+            {"service_type_other": {"$regex": search, "$options": "i"}}
+        ]
+    
+    # Get total count for pagination
+    total = await db.service_records.count_documents(query)
+    
+    # Get records sorted by service date (newest first)
+    records = await db.service_records.find(query).sort("service_date", -1).skip(skip).limit(limit).to_list(limit)
+    
+    return {
+        "data": serialize_doc(records),
+        "total": total,
+        "limit": limit,
+        "skip": skip
+    }
+
+@api_router.get("/service-records/summary")
+async def get_service_records_summary(current_user: dict = Depends(get_current_user)):
+    """Get summary statistics for service records"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    company_id = current_user["company_id"]
+    
+    # Get all records for this company
+    records = await db.service_records.find({"company_id": company_id}).to_list(10000)
+    
+    total_cost = sum(r.get("cost", 0) or 0 for r in records)
+    total_records = len(records)
+    
+    # Count by service type
+    by_type = {}
+    for r in records:
+        st = r.get("service_type", "unknown")
+        by_type[st] = by_type.get(st, 0) + 1
+    
+    # Get records from this month
+    now = datetime.utcnow()
+    this_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    this_month_records = [r for r in records if r.get("created_at") and r["created_at"] >= this_month_start]
+    this_month_cost = sum(r.get("cost", 0) or 0 for r in this_month_records)
+    
+    return {
+        "total_records": total_records,
+        "total_cost": total_cost,
+        "this_month_records": len(this_month_records),
+        "this_month_cost": this_month_cost,
+        "by_type": by_type
+    }
+
+@api_router.get("/service-records/export/csv")
+async def export_service_records_csv(
+    vehicle_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Export service records to CSV format"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    import csv
+    from io import StringIO
+    from starlette.responses import StreamingResponse
+    
+    company_id = current_user["company_id"]
+    query = {"company_id": company_id}
+    
+    if vehicle_id:
+        query["vehicle_id"] = vehicle_id
+    
+    records = await db.service_records.find(query).sort("service_date", -1).to_list(10000)
+    
+    # Get vehicles for names
+    vehicles = await db.vehicles.find({"company_id": company_id}).to_list(1000)
+    vehicle_map = {str(v["_id"]): f"{v.get('name', 'Unknown')} ({v.get('registration_number', 'N/A')})" for v in vehicles}
+    
+    # Create CSV
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow([
+        "Date", "Equipment", "Service Type", "Description", "Cost ($)",
+        "Odometer", "Technician", "Workshop", "Next Service Date", "Next Service KM", "Warranty Until", "Warranty Notes"
+    ])
+    
+    # Data rows
+    for r in records:
+        service_type = r.get("service_type", "").title()
+        if r.get("service_type_other"):
+            service_type = f"Other: {r.get('service_type_other')}"
+        
+        writer.writerow([
+            r.get("service_date", ""),
+            vehicle_map.get(r.get("vehicle_id", ""), "Unknown"),
+            service_type,
+            r.get("description", ""),
+            r.get("cost", ""),
+            r.get("odometer_reading", ""),
+            r.get("technician_name", ""),
+            r.get("workshop_name", ""),
+            r.get("next_service_date", ""),
+            r.get("next_service_odometer", ""),
+            r.get("warranty_until", ""),
+            r.get("warranty_notes", "")
+        ])
+    
+    output.seek(0)
+    
+    filename = f"service_records_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+@api_router.get("/service-records/{record_id}")
+async def get_service_record(record_id: str, current_user: dict = Depends(get_current_user)):
+    """Get a single service record by ID"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    record = await db.service_records.find_one({
+        "_id": ObjectId(record_id),
+        "company_id": current_user["company_id"]
+    })
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="Service record not found")
+    
+    return serialize_doc(record)
+
+@api_router.put("/service-records/{record_id}")
+async def update_service_record(
+    record_id: str,
+    update: ServiceRecordUpdate,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a service record"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    company_id = current_user["company_id"]
+    
+    # Check record exists
+    existing = await db.service_records.find_one({
+        "_id": ObjectId(record_id),
+        "company_id": company_id
+    })
+    
+    if not existing:
+        raise HTTPException(status_code=404, detail="Service record not found")
+    
+    # Build update data
+    update_data = {}
+    for key, value in update.dict().items():
+        if value is not None:
+            if key == "service_type":
+                update_data[key] = value.value
+            else:
+                update_data[key] = value
+    
+    if update_data:
+        update_data["updated_at"] = datetime.utcnow()
+        await db.service_records.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": update_data}
+        )
+    
+    # Invalidate cache
+    invalidate_cache("service_records", company_id)
+    
+    await log_audit_trail(
+        str(current_user["_id"]), "update", "service_record", record_id,
+        request.client.host if request.client else "unknown", update_data
+    )
+    
+    updated_record = await db.service_records.find_one({"_id": ObjectId(record_id)})
+    return serialize_doc(updated_record)
+
+@api_router.delete("/service-records/{record_id}")
+async def delete_service_record(record_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Delete a service record"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    company_id = current_user["company_id"]
+    
+    result = await db.service_records.delete_one({
+        "_id": ObjectId(record_id),
+        "company_id": company_id
+    })
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Service record not found")
+    
+    # Invalidate cache
+    invalidate_cache("service_records", company_id)
+    
+    await log_audit_trail(
+        str(current_user["_id"]), "delete", "service_record", record_id,
+        request.client.host if request.client else "unknown"
+    )
+    
+    return {"message": "Service record deleted successfully"}
+
 # ============== Alert Routes ==============
 
 @api_router.get("/alerts")
@@ -2920,7 +3253,7 @@ async def get_incidents(
     limit: int = 50,
     skip: int = 0
 ):
-    """Get all incidents for the company"""
+    """Get all incidents for the company - OPTIMIZED"""
     company_id = current_user["company_id"]
     
     query = {"company_id": company_id}
@@ -2933,10 +3266,25 @@ async def get_incidents(
     
     incidents = await db.incidents.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
+    if not incidents:
+        return []
+    
+    # Batch fetch vehicles and drivers (2 queries instead of N*2)
+    vehicle_ids = list(set(i.get("vehicle_id") for i in incidents if i.get("vehicle_id")))
+    driver_ids = list(set(i.get("driver_id") for i in incidents if i.get("driver_id")))
+    
+    vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}}).to_list(100)
+    drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}}).to_list(100)
+    
+    vehicles, drivers = await asyncio.gather(vehicles_task, drivers_task)
+    
+    vehicle_map = {str(v["_id"]): v for v in vehicles}
+    driver_map = {str(d["_id"]): d for d in drivers}
+    
     # Enrich with vehicle and driver info
     for incident in incidents:
-        vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
-        driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
+        vehicle = vehicle_map.get(incident.get("vehicle_id"))
+        driver = driver_map.get(incident.get("driver_id"))
         incident["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
         incident["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
         incident["driver_name"] = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
@@ -3155,48 +3503,90 @@ async def get_dashboard_chart_data(
     current_user: dict = Depends(get_current_user),
     days: int = 7
 ):
-    """Get weekly inspection and issue data for dashboard charts"""
+    """Get weekly inspection and issue data for dashboard charts - OPTIMIZED"""
     company_id = current_user["company_id"]
+    
+    # Check cache first
+    cache_key = f"chart_data:{company_id}:{days}"
+    cached = get_cached_stats(company_id, cache_key)
+    if cached:
+        return cached
     
     # Limit to reasonable range
     days = min(max(days, 7), 30)
     
-    # Get data for the past N days
+    # Calculate date range
+    end_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    start_date = end_date - timedelta(days=days)
+    
+    # Single aggregation query for inspections grouped by day
+    inspection_pipeline = [
+        {
+            "$match": {
+                "company_id": company_id,
+                "timestamp": {"$gte": start_date, "$lt": end_date}
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
+                },
+                "inspections": {"$sum": 1},
+                "issues": {"$sum": {"$cond": [{"$eq": ["$is_safe", False]}, 1, 0]}}
+            }
+        }
+    ]
+    
+    # Single aggregation for fuel grouped by day
+    fuel_pipeline = [
+        {
+            "$match": {
+                "company_id": company_id,
+                "timestamp": {"$gte": start_date, "$lt": end_date}
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
+                },
+                "fuel": {"$sum": "$amount"}
+            }
+        }
+    ]
+    
+    # Run both queries in parallel
+    inspection_data, fuel_data = await asyncio.gather(
+        db.inspections.aggregate(inspection_pipeline).to_list(days),
+        db.fuel_submissions.aggregate(fuel_pipeline).to_list(days)
+    )
+    
+    # Convert to lookup dictionaries
+    inspection_lookup = {d["_id"]: d for d in inspection_data}
+    fuel_lookup = {d["_id"]: d for d in fuel_data}
+    
+    # Build response with all days
     chart_data = []
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     
     for i in range(days - 1, -1, -1):
-        day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=i)
-        day_end = day_start + timedelta(days=1)
+        day_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=i)
+        date_str = day_date.strftime("%Y-%m-%d")
         
-        # Count inspections for this day
-        inspections = await db.inspections.count_documents({
-            "company_id": company_id,
-            "timestamp": {"$gte": day_start, "$lt": day_end}
-        })
-        
-        # Count issues (unsafe inspections) for this day
-        issues = await db.inspections.count_documents({
-            "company_id": company_id,
-            "timestamp": {"$gte": day_start, "$lt": day_end},
-            "is_safe": False
-        })
-        
-        # Count fuel submissions for this day
-        fuel_pipeline = [
-            {"$match": {"company_id": company_id, "timestamp": {"$gte": day_start, "$lt": day_end}}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]
-        fuel_result = await db.fuel_submissions.aggregate(fuel_pipeline).to_list(1)
-        fuel = round(fuel_result[0]["total"], 2) if fuel_result else 0
+        insp_data = inspection_lookup.get(date_str, {})
+        fuel_amt = fuel_lookup.get(date_str, {}).get("fuel", 0)
         
         chart_data.append({
-            "day": day_names[day_start.weekday()],
-            "date": day_start.strftime("%Y-%m-%d"),
-            "inspections": inspections,
-            "issues": issues,
-            "fuel": fuel
+            "day": day_names[day_date.weekday()],
+            "date": date_str,
+            "inspections": insp_data.get("inspections", 0),
+            "issues": insp_data.get("issues", 0),
+            "fuel": round(fuel_amt, 2) if fuel_amt else 0
         })
+    
+    # Cache for 30 seconds
+    set_cached_stats(company_id, chart_data, cache_key)
     
     return chart_data
 

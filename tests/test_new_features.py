@@ -9,7 +9,7 @@ import requests
 import os
 import base64
 
-BASE_URL = os.environ.get('EXPO_PUBLIC_BACKEND_URL', 'https://fleet-build-lab.preview.emergentagent.com')
+BASE_URL = os.environ.get('EXPO_PUBLIC_BACKEND_URL', 'https://maintenance-hub-285.preview.emergentagent.com')
 
 # Test credentials
 ADMIN_EMAIL = "admin@test.com"
