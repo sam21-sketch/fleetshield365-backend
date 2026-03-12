@@ -4458,6 +4458,16 @@ async def get_developer_stats(key: str):
             else:
                 status = "unknown"
             
+            # Handle created_at - might be string or datetime
+            created_at_val = company.get("created_at")
+            if created_at_val:
+                if isinstance(created_at_val, datetime):
+                    created_at_str = created_at_val.isoformat()
+                else:
+                    created_at_str = str(created_at_val)
+            else:
+                created_at_str = None
+            
             companies.append({
                 "id": company_id,
                 "name": company.get("name", "Unknown"),
@@ -4465,7 +4475,7 @@ async def get_developer_stats(key: str):
                 "vehicles": vehicle_count,
                 "inspections": inspection_count,
                 "status": status,
-                "created_at": company.get("created_at").isoformat() if company.get("created_at") else None
+                "created_at": created_at_str
             })
         
         # Sort by inspections desc
