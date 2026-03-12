@@ -591,12 +591,20 @@ class InspectionPhoto(BaseModel):
     ai_damage_status: str = AIDamageStatus.NO_DAMAGE
 
 # Inspection Models
+class DigitalAgreement(BaseModel):
+    driver_name: str
+    driver_id: Optional[str] = None
+    agreed_at: str  # ISO timestamp
+    declaration_text: str
+    device_info: Optional[str] = None
+
 class PrestartCreate(BaseModel):
     vehicle_id: str
     odometer: int
     checklist_items: List[ChecklistItem]
     photos: List[InspectionPhoto]
-    signature_base64: str
+    signature_base64: Optional[str] = None  # Now optional - replaced by digital agreement
+    digital_agreement: Optional[DigitalAgreement] = None  # New digital consent
     declaration_confirmed: bool = True
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
@@ -611,7 +619,8 @@ class EndShiftCreate(BaseModel):
     damage_comment: Optional[str] = None
     incident_comment: Optional[str] = None
     photos: Optional[List[InspectionPhoto]] = []
-    signature_base64: str
+    signature_base64: Optional[str] = None  # Now optional
+    digital_agreement: Optional[DigitalAgreement] = None  # New digital consent
     declaration_confirmed: bool = True
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
@@ -740,6 +749,14 @@ class IncidentUpdate(BaseModel):
     admin_notes: Optional[str] = None
     insurance_claim_number: Optional[str] = None
     resolution_details: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[str] = None
+    location_address: Optional[str] = None
+    police_report_number: Optional[str] = None
+    # Additional photos - will be appended to existing
+    additional_photos: Optional[List[str]] = None
+    # PDF attachments (base64 encoded)
+    pdf_attachments: Optional[List[dict]] = None  # [{name: str, data: str}]
 
 # Driver Assignment
 class DriverAssignment(BaseModel):
@@ -1316,7 +1333,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://maintenance-hub-285.preview.emergentagent.com"
+    origin_url: str = "https://system-monitor-33.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2165,6 +2182,8 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         "checklist_items": [item.dict() for item in inspection.checklist_items],
         "photo_refs": photo_refs,  # Only store references, not full base64
         "signature_base64": inspection.signature_base64,
+        # Store digital agreement if provided (new checkbox-based consent)
+        "digital_agreement": inspection.digital_agreement.dict() if inspection.digital_agreement else None,
         "declaration_confirmed": inspection.declaration_confirmed,
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
@@ -2298,6 +2317,8 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "incident_comment": inspection.incident_comment,
         "photo_refs": photo_refs,  # Only store references, not full base64
         "signature_base64": inspection.signature_base64,
+        # Store digital agreement if provided (new checkbox-based consent)
+        "digital_agreement": inspection.digital_agreement.dict() if inspection.digital_agreement else None,
         "declaration_confirmed": inspection.declaration_confirmed,
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
@@ -2600,6 +2621,30 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     return submissions
 
 # ============== Driver Update Routes ==============
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+
+@api_router.post("/drivers/{driver_id}/reset-password")
+async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswordRequest, current_user: dict = Depends(get_current_user)):
+    """Admin can reset a driver's password"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    
+    # Hash the new password
+    hashed_password = pwd_context.hash(request.new_password)
+    
+    # Update the driver's password
+    await db.users.update_one(
+        {"_id": ObjectId(driver_id)},
+        {"$set": {"password_hash": hashed_password}}
+    )
+    
+    return {"message": f"Password reset successfully for {driver.get('name', 'driver')}"}
 
 @api_router.put("/drivers/{driver_id}")
 async def update_driver(driver_id: str, update: DriverUpdate, request: Request, current_user: dict = Depends(get_current_user)):
@@ -3361,7 +3406,30 @@ async def update_incident(
     
     company_id = current_user["company_id"]
     
-    update_data = {k: v for k, v in update.dict().items() if v is not None}
+    # Get existing incident to handle photo appending
+    existing = await db.incidents.find_one({"_id": ObjectId(incident_id), "company_id": company_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    
+    update_data = {}
+    
+    # Handle simple field updates
+    for field in ["status", "admin_notes", "insurance_claim_number", "resolution_details", 
+                  "description", "severity", "location_address", "police_report_number"]:
+        value = getattr(update, field, None)
+        if value is not None:
+            update_data[field] = value
+    
+    # Handle additional photos - append to existing damage_photos
+    if update.additional_photos:
+        existing_photos = existing.get("damage_photos", [])
+        update_data["damage_photos"] = existing_photos + update.additional_photos
+    
+    # Handle PDF attachments - append or create
+    if update.pdf_attachments:
+        existing_pdfs = existing.get("pdf_attachments", [])
+        update_data["pdf_attachments"] = existing_pdfs + update.pdf_attachments
+    
     update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await db.incidents.update_one(
@@ -3369,10 +3437,9 @@ async def update_incident(
         {"$set": update_data}
     )
     
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    
-    return {"message": "Incident updated"}
+    # Return updated incident
+    updated = await db.incidents.find_one({"_id": ObjectId(incident_id)})
+    return serialize_doc(updated)
 
 @api_router.get("/incidents/stats/summary")
 async def get_incident_stats(current_user: dict = Depends(get_current_user)):
@@ -4310,6 +4377,153 @@ async def get_faq():
     """Get FAQ data - no auth required"""
     return FAQ_DATA
 
+
+# ============== Developer Dashboard Stats ==============
+
+DEVELOPER_KEY = "fleetshield365-dev-key-2025"
+
+@api_router.get("/developer/stats")
+async def get_developer_stats(key: str):
+    """Get system-wide stats for developer/owner dashboard"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid developer key")
+    
+    start_time = datetime.now(timezone.utc)
+    
+    try:
+        # Get total counts
+        total_companies = await db.companies.count_documents({})
+        total_users = await db.users.count_documents({})
+        total_drivers = await db.users.count_documents({"role": "driver"})
+        total_admins = await db.users.count_documents({"role": {"$in": ["admin", "owner"]}})
+        total_vehicles = await db.vehicles.count_documents({})
+        total_inspections = await db.inspections.count_documents({})
+        total_fuel_logs = await db.fuel_submissions.count_documents({})
+        total_service_records = await db.service_records.count_documents({})
+        total_incidents = await db.incidents.count_documents({})
+        total_photos = await db.inspection_photos.count_documents({})
+        
+        # Estimate photo storage (avg 200KB per photo)
+        estimated_photo_storage_mb = round(total_photos * 0.2, 1)
+        
+        # Today's stats
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_inspections = await db.inspections.count_documents({"timestamp": {"$gte": today_start}})
+        today_fuel_logs = await db.fuel_submissions.count_documents({"timestamp": {"$gte": today_start}})
+        today_new_users = await db.users.count_documents({"created_at": {"$gte": today_start}})
+        today_new_companies = await db.companies.count_documents({"created_at": {"$gte": today_start}})
+        
+        # Active users today (users who logged in or submitted something)
+        active_users_pipeline = [
+            {"$match": {"timestamp": {"$gte": today_start}}},
+            {"$group": {"_id": "$driver_id"}},
+            {"$count": "count"}
+        ]
+        active_users_result = await db.inspections.aggregate(active_users_pipeline).to_list(1)
+        today_active_users = active_users_result[0]["count"] if active_users_result else 0
+        
+        # Pre-start metrics
+        week_start = today_start - timedelta(days=7)
+        month_start = today_start - timedelta(days=30)
+        prestart_today = await db.inspections.count_documents({
+            "timestamp": {"$gte": today_start},
+            "inspection_type": {"$in": ["pre_start", "pre-start", None]}
+        })
+        prestart_week = await db.inspections.count_documents({
+            "timestamp": {"$gte": week_start},
+            "inspection_type": {"$in": ["pre_start", "pre-start", None]}
+        })
+        prestart_month = await db.inspections.count_documents({
+            "timestamp": {"$gte": month_start},
+            "inspection_type": {"$in": ["pre_start", "pre-start", None]}
+        })
+        
+        # Company breakdown
+        companies = []
+        async for company in db.companies.find({}, {"_id": 1, "name": 1, "created_at": 1, "trial_started_at": 1, "subscription_plan": 1}):
+            company_id = str(company["_id"])
+            user_count = await db.users.count_documents({"company_id": company_id})
+            vehicle_count = await db.vehicles.count_documents({"company_id": company_id})
+            inspection_count = await db.inspections.count_documents({"company_id": company_id})
+            
+            # Determine status
+            if company.get("subscription_plan") and company["subscription_plan"] != "trial":
+                status = "active"
+            elif company.get("trial_started_at"):
+                trial_end = company["trial_started_at"] + timedelta(days=14)
+                if datetime.now(timezone.utc) < trial_end:
+                    status = "trialing"
+                else:
+                    status = "trial_expired"
+            else:
+                status = "unknown"
+            
+            companies.append({
+                "id": company_id,
+                "name": company.get("name", "Unknown"),
+                "users": user_count,
+                "vehicles": vehicle_count,
+                "inspections": inspection_count,
+                "status": status,
+                "created_at": company.get("created_at").isoformat() if company.get("created_at") else None
+            })
+        
+        # Sort by inspections desc
+        companies.sort(key=lambda x: x["inspections"], reverse=True)
+        
+        # Calculate response time
+        response_time_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+        
+        # Estimate database size (rough calculation)
+        # Each document ~2KB avg, plus photos stored as base64
+        estimated_db_size_mb = round(
+            (total_users + total_vehicles + total_inspections + total_fuel_logs + 
+             total_service_records + total_incidents + total_companies) * 0.002 + 
+            estimated_photo_storage_mb, 1
+        )
+        
+        return {
+            "system": {
+                "status": "online" if response_time_ms < 1000 else ("slow" if response_time_ms < 3000 else "error"),
+                "status_message": "All systems operational",
+                "response_time_ms": response_time_ms,
+                "errors_24h": 0,  # TODO: Implement error tracking
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            },
+            "totals": {
+                "companies": total_companies,
+                "users": total_users,
+                "drivers": total_drivers,
+                "admins": total_admins,
+                "vehicles": total_vehicles,
+                "inspections": total_inspections,
+                "fuel_logs": total_fuel_logs,
+                "service_records": total_service_records,
+                "incidents": total_incidents,
+                "photos": total_photos,
+                "estimated_photo_storage_mb": estimated_photo_storage_mb
+            },
+            "prestart_metrics": {
+                "today": prestart_today,
+                "week": prestart_week,
+                "month": prestart_month
+            },
+            "today": {
+                "inspections": today_inspections,
+                "fuel_logs": today_fuel_logs,
+                "new_users": today_new_users,
+                "new_companies": today_new_companies,
+                "active_users": today_active_users
+            },
+            "companies": companies,
+            "database": {
+                "estimated_size_mb": estimated_db_size_mb,
+                "max_size_mb": 512  # MongoDB Atlas free tier
+            }
+        }
+    except Exception as e:
+        logger.error(f"Developer stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============== Health Check ==============
 

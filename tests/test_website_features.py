@@ -7,7 +7,7 @@ import requests
 import os
 
 # Get the backend URL from environment
-BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', 'https://maintenance-hub-285.preview.emergentagent.com')
+BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', 'https://system-monitor-33.preview.emergentagent.com')
 
 # Test credentials
 ADMIN_EMAIL = "admin@test.com"

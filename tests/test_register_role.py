@@ -7,7 +7,7 @@ import requests
 import os
 import time
 
-BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', 'https://maintenance-hub-285.preview.emergentagent.com')
+BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', 'https://system-monitor-33.preview.emergentagent.com')
 if BASE_URL.endswith('/api'):
     BASE_URL = BASE_URL.rstrip('/api')
 
@@ -24,7 +24,7 @@ class TestRegistrationWithRole:
             "password": "test123",
             "vehicle_count": 5,
             "role": "super_admin",
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload)
@@ -61,7 +61,7 @@ class TestRegistrationWithRole:
             "password": "test123",
             "vehicle_count": 3,
             "role": "admin",
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload)
@@ -95,7 +95,7 @@ class TestRegistrationWithRole:
             "email": f"roletest_default_{timestamp}@test.com",
             "password": "test123",
             "vehicle_count": 2,
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload)
@@ -125,7 +125,7 @@ class TestRegistrationWithRole:
             "password": "test123",
             "vehicle_count": 5,
             "role": "super_admin",
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response1 = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload1)
@@ -139,7 +139,7 @@ class TestRegistrationWithRole:
             "password": "test123",
             "vehicle_count": 3,
             "role": "admin",
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response2 = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload2)
@@ -160,7 +160,7 @@ class TestRegistrationWithRole:
             "password": "test123",
             "vehicle_count": 5,
             "role": "invalid_role",  # Invalid role
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload)
@@ -194,7 +194,7 @@ class TestAuthMe:
             "password": "test123",
             "vehicle_count": 5,
             "role": "admin",
-            "origin_url": "https://maintenance-hub-285.preview.emergentagent.com"
+            "origin_url": "https://system-monitor-33.preview.emergentagent.com"
         }
         
         response = requests.post(f"{BASE_URL}/api/auth/register-company", json=payload)
