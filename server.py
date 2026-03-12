@@ -2146,11 +2146,12 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     
     inspection_id = ObjectId()
     
-    # Store photos separately first (to avoid document size limit)
+    # Store photos separately using bulk insert for better performance
     photo_refs = []
+    photo_docs = []
     for photo in inspection.photos:
         photo_id = ObjectId()
-        await db.inspection_photos.insert_one({
+        photo_docs.append({
             "_id": photo_id,
             "inspection_id": str(inspection_id),
             "vehicle_id": inspection.vehicle_id,
@@ -2163,7 +2164,6 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             "inspection_type": InspectionType.PRESTART,
             "created_at": datetime.utcnow()
         })
-        # Store only reference in main document
         photo_refs.append({
             "photo_id": str(photo_id),
             "photo_type": photo.photo_type,
@@ -2171,6 +2171,10 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
         })
+    
+    # Bulk insert all photos at once (much faster than individual inserts)
+    if photo_docs:
+        await db.inspection_photos.insert_many(photo_docs)
     
     inspection_doc = {
         "_id": inspection_id,
@@ -2277,11 +2281,12 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     
     inspection_id = ObjectId()
     
-    # Store photos separately first (to avoid document size limit)
+    # Store photos using bulk insert for better performance
     photo_refs = []
+    photo_docs = []
     for photo in (inspection.photos or []):
         photo_id = ObjectId()
-        await db.inspection_photos.insert_one({
+        photo_docs.append({
             "_id": photo_id,
             "inspection_id": str(inspection_id),
             "vehicle_id": inspection.vehicle_id,
@@ -2301,6 +2306,10 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
         })
+    
+    # Bulk insert all photos at once
+    if photo_docs:
+        await db.inspection_photos.insert_many(photo_docs)
     
     inspection_doc = {
         "_id": inspection_id,
@@ -3286,7 +3295,7 @@ async def create_incident(
     }
     await db.alerts.insert_one(alert_doc)
     
-    # Send email notification to admins
+    # Send email notification to admins - OPTIMIZED: batch fetch notification preferences
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
     admin_users = await db.users.find({
         "company_id": company_id,
@@ -3296,9 +3305,21 @@ async def create_incident(
     vehicle_name = f"{vehicle.get('name', 'Unknown')} ({vehicle.get('registration_number', 'N/A')})"
     driver_name = current_user.get("name", current_user.get("email", "Unknown"))
     
+    # Batch fetch all notification preferences and push tokens
+    admin_ids = [str(admin["_id"]) for admin in admin_users]
+    all_prefs = await db.notification_preferences.find({"user_id": {"$in": admin_ids}}).to_list(100)
+    prefs_map = {p["user_id"]: p for p in all_prefs}
+    
+    all_tokens = await db.push_tokens.find({"user_id": {"$in": admin_ids}}).to_list(100)
+    tokens_map = {}
+    for t in all_tokens:
+        if t["user_id"] not in tokens_map:
+            tokens_map[t["user_id"]] = []
+        tokens_map[t["user_id"]].append(t["token"])
+    
     for admin in admin_users:
-        prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])})
-        if prefs and prefs.get("email_issue_alerts", True):
+        prefs = prefs_map.get(str(admin["_id"]), {})
+        if prefs.get("email_issue_alerts", True):
             background_tasks.add_task(
                 send_incident_alert_email,
                 admin["email"],
@@ -3310,9 +3331,8 @@ async def create_incident(
     
     # Send push notification to admins
     push_tokens = []
-    for admin in admin_users:
-        tokens = await db.push_tokens.find({"user_id": str(admin["_id"])}).to_list(10)
-        push_tokens.extend([t["token"] for t in tokens])
+    for admin_id in admin_ids:
+        push_tokens.extend(tokens_map.get(admin_id, []))
     
     if push_tokens:
         background_tasks.add_task(
