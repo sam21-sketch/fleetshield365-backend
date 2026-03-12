@@ -1333,7 +1333,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://system-monitor-33.preview.emergentagent.com"
+    origin_url: str = "https://fleet-shield-preview-1.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -4450,13 +4450,30 @@ async def get_developer_stats(key: str):
             if company.get("subscription_plan") and company["subscription_plan"] != "trial":
                 status = "active"
             elif company.get("trial_started_at"):
-                trial_end = company["trial_started_at"] + timedelta(days=14)
+                # Handle both datetime and string formats
+                trial_started = company["trial_started_at"]
+                if isinstance(trial_started, str):
+                    try:
+                        trial_started = datetime.fromisoformat(trial_started.replace('Z', '+00:00'))
+                    except:
+                        trial_started = datetime.now(timezone.utc)
+                trial_end = trial_started + timedelta(days=14)
                 if datetime.now(timezone.utc) < trial_end:
                     status = "trialing"
                 else:
                     status = "trial_expired"
             else:
                 status = "unknown"
+            
+            # Handle created_at - could be datetime or string
+            created_at_val = company.get("created_at")
+            if created_at_val:
+                if isinstance(created_at_val, datetime):
+                    created_at_str = created_at_val.isoformat()
+                else:
+                    created_at_str = str(created_at_val)
+            else:
+                created_at_str = None
             
             companies.append({
                 "id": company_id,
@@ -4465,7 +4482,7 @@ async def get_developer_stats(key: str):
                 "vehicles": vehicle_count,
                 "inspections": inspection_count,
                 "status": status,
-                "created_at": company.get("created_at").isoformat() if company.get("created_at") else None
+                "created_at": created_at_str
             })
         
         # Sort by inspections desc
