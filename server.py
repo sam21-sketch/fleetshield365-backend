@@ -4458,16 +4458,6 @@ async def get_developer_stats(key: str):
             else:
                 status = "unknown"
             
-            # Handle created_at - might be string or datetime
-            created_at_val = company.get("created_at")
-            if created_at_val:
-                if isinstance(created_at_val, datetime):
-                    created_at_str = created_at_val.isoformat()
-                else:
-                    created_at_str = str(created_at_val)
-            else:
-                created_at_str = None
-            
             companies.append({
                 "id": company_id,
                 "name": company.get("name", "Unknown"),
@@ -4475,7 +4465,7 @@ async def get_developer_stats(key: str):
                 "vehicles": vehicle_count,
                 "inspections": inspection_count,
                 "status": status,
-                "created_at": created_at_str
+                "created_at": company.get("created_at").isoformat() if company.get("created_at") else None
             })
         
         # Sort by inspections desc
@@ -4533,6 +4523,140 @@ async def get_developer_stats(key: str):
         }
     except Exception as e:
         logger.error(f"Developer stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/developer/company/{company_id}")
+async def get_developer_company_details(company_id: str, key: str):
+    """Get detailed company info for developer dashboard"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid developer key")
+    
+    try:
+        company = await db.companies.find_one({"_id": ObjectId(company_id)})
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
+        
+        # Get all users in this company
+        users = []
+        async for user in db.users.find({"company_id": company_id}, {"password": 0}):
+            users.append({
+                "id": str(user["_id"]),
+                "username": user.get("username", ""),
+                "email": user.get("email", ""),
+                "role": user.get("role", "driver"),
+                "is_frozen": user.get("is_frozen", False),
+                "created_at": user.get("created_at").isoformat() if isinstance(user.get("created_at"), datetime) else str(user.get("created_at", ""))
+            })
+        
+        # Get vehicles
+        vehicles = []
+        async for vehicle in db.vehicles.find({"company_id": company_id}):
+            vehicles.append({
+                "id": str(vehicle["_id"]),
+                "name": vehicle.get("name", ""),
+                "registration_number": vehicle.get("registration_number", ""),
+                "type": vehicle.get("type", "")
+            })
+        
+        # Get recent activity
+        recent_inspections = await db.inspections.count_documents({
+            "company_id": company_id,
+            "timestamp": {"$gte": datetime.now(timezone.utc) - timedelta(days=7)}
+        })
+        
+        return {
+            "id": str(company["_id"]),
+            "name": company.get("name", "Unknown"),
+            "email": company.get("email", ""),
+            "created_at": company.get("created_at").isoformat() if isinstance(company.get("created_at"), datetime) else str(company.get("created_at", "")),
+            "subscription_plan": company.get("subscription_plan", "trial"),
+            "users": users,
+            "vehicles": vehicles,
+            "stats": {
+                "total_users": len(users),
+                "total_vehicles": len(vehicles),
+                "inspections_this_week": recent_inspections
+            }
+        }
+    except Exception as e:
+        logger.error(f"Developer company details error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/developer/users")
+async def get_developer_all_users(key: str):
+    """Get all users across all companies for developer dashboard"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid developer key")
+    
+    try:
+        users = []
+        async for user in db.users.find({}, {"password": 0}):
+            # Get company name
+            company_name = "Unknown"
+            if user.get("company_id"):
+                company = await db.companies.find_one({"_id": ObjectId(user["company_id"])})
+                if company:
+                    company_name = company.get("name", "Unknown")
+            
+            users.append({
+                "id": str(user["_id"]),
+                "username": user.get("username", ""),
+                "email": user.get("email", ""),
+                "role": user.get("role", "driver"),
+                "company_id": user.get("company_id", ""),
+                "company_name": company_name,
+                "is_frozen": user.get("is_frozen", False),
+                "created_at": user.get("created_at").isoformat() if isinstance(user.get("created_at"), datetime) else str(user.get("created_at", ""))
+            })
+        
+        return {"users": users}
+    except Exception as e:
+        logger.error(f"Developer users error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.put("/developer/users/{user_id}/freeze")
+async def toggle_user_freeze(user_id: str, key: str, freeze: bool = True):
+    """Freeze or unfreeze a user account"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid developer key")
+    
+    try:
+        result = await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"is_frozen": freeze, "updated_at": datetime.now(timezone.utc)}}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return {"message": f"User {'frozen' if freeze else 'unfrozen'} successfully"}
+    except Exception as e:
+        logger.error(f"Developer freeze user error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.put("/developer/users/{user_id}/reset-password")
+async def reset_user_password(user_id: str, key: str, new_password: str = "temp123"):
+    """Reset a user's password (developer emergency access)"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid developer key")
+    
+    try:
+        hashed_password = pwd_context.hash(new_password)
+        result = await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "password": hashed_password,
+                "is_frozen": False,
+                "updated_at": datetime.now(timezone.utc)
+            }}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return {"message": "Password reset successfully", "temp_password": new_password}
+    except Exception as e:
+        logger.error(f"Developer reset password error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============== Health Check ==============
