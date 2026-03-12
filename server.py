@@ -3345,7 +3345,9 @@ async def get_incidents(
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
     
-    incidents = await db.incidents.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    # Exclude large base64 data from list query for performance
+    projection = {"photos": 0, "pdf_attachments": 0}
+    incidents = await db.incidents.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     if not incidents:
         return []
@@ -4725,6 +4727,10 @@ async def startup_event():
     await db.alerts.create_index([("company_id", 1), ("created_at", -1)])
     await db.maintenance_logs.create_index([("company_id", 1), ("service_date", -1)])
     await db.fuel_submissions.create_index([("company_id", 1), ("timestamp", -1)])
+    await db.incidents.create_index([("company_id", 1), ("created_at", -1)])
+    await db.incidents.create_index([("company_id", 1), ("status", 1)])
+    await db.service_records.create_index([("company_id", 1), ("service_date", -1)])
+    await db.service_records.create_index([("company_id", 1), ("vehicle_id", 1)])
     # Indexes for expiry date queries (dashboard performance)
     await db.vehicles.create_index([("company_id", 1), ("rego_expiry", 1)])
     await db.vehicles.create_index([("company_id", 1), ("insurance_expiry", 1)])
