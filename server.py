@@ -641,6 +641,7 @@ class ServiceType(str, Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
+    WARRANTY = "warranty"
     OTHER = "other"
 
 class ServiceRecordCreate(BaseModel):
