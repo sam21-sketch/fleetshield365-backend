@@ -1321,12 +1321,22 @@ async def login(credentials: UserLogin, request: Request):
 async def get_me(current_user: dict = Depends(get_current_user)):
     # Get company info if user has a company
     company = None
-    if current_user.get("company_id"):
-        company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
+    company_id = current_user.get("company_id")
+    if company_id:
+        # Fetch company and dynamic vehicle count in parallel
+        company_doc, vehicle_count = await asyncio.gather(
+            db.companies.find_one({"_id": ObjectId(company_id)}),
+            db.vehicles.count_documents({"company_id": company_id})
+        )
+        if company_doc:
+            company = serialize_doc(company_doc)
+            # Override with dynamic vehicle count
+            company["vehicle_count"] = vehicle_count
+            company["active_vehicles_count"] = vehicle_count
     
     return {
         "user": serialize_doc(current_user),
-        "company": serialize_doc(company) if company else None
+        "company": company
     }
 
 # ============== Password Reset ==============
