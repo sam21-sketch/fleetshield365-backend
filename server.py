@@ -1465,8 +1465,22 @@ async def test_email(request: TestEmailRequest, current_user: dict = Depends(get
 async def get_company(current_user: dict = Depends(get_current_user)):
     if not current_user.get("company_id"):
         raise HTTPException(status_code=404, detail="No company associated")
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    return serialize_doc(company)
+    company_id = current_user["company_id"]
+    
+    # Fetch company and dynamically calculate vehicle count
+    company, vehicle_count = await asyncio.gather(
+        db.companies.find_one({"_id": ObjectId(company_id)}),
+        db.vehicles.count_documents({"company_id": company_id})
+    )
+    
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    
+    # Serialize and override vehicle_count with actual count
+    result = serialize_doc(company)
+    result["vehicle_count"] = vehicle_count
+    result["active_vehicles_count"] = vehicle_count
+    return result
 
 @api_router.put("/company")
 async def update_company(update: CompanyUpdate, current_user: dict = Depends(get_current_user)):
