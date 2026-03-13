@@ -3573,10 +3573,17 @@ async def get_dashboard_stats(
     )
     
     # Unpack results
-    total_vehicles, inspections_today, active_today, issues_today, vehicles_needing_attention, \
+    total_vehicles, inspections_today, active_today_raw, issues_today, vehicles_needing_attention, \
     upcoming_rego, upcoming_insurance, upcoming_safety_cert, upcoming_coi, \
     rego_expiring_vehicles, insurance_expiring_vehicles, coi_expiring_vehicles, \
     fuel_result, unread_alerts, drivers = results
+    
+    # Get actual existing vehicle IDs to filter out deleted vehicles from active_today
+    existing_vehicle_ids = await db.vehicles.distinct("_id", {"company_id": company_id})
+    existing_vehicle_id_strs = [str(vid) for vid in existing_vehicle_ids]
+    
+    # Filter active_today to only include vehicles that still exist
+    active_today = [vid for vid in active_today_raw if vid in existing_vehicle_id_strs]
     
     # Calculate derived values
     inspections_missed = max(0, total_vehicles - len(active_today))
