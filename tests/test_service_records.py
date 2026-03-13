@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta
 
 # API URL from environment - this is the production/preview URL
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://fleet-shield-preview-1.preview.emergentagent.com").rstrip('/')
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://fleet-ops-test-2.preview.emergentagent.com").rstrip('/')
 
 # Test credentials
 ADMIN_EMAIL = "admin@test.com"

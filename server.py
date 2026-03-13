@@ -1333,7 +1333,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://fleet-shield-preview-1.preview.emergentagent.com"
+    origin_url: str = "https://fleet-ops-test-2.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -3517,10 +3517,9 @@ async def get_dashboard_stats(
 ):
     company_id = current_user["company_id"]
     
-    # Check cache first for faster response
-    cached = get_cached_stats(company_id)
-    if cached:
-        return cached
+    # NOTE: Cache disabled to ensure fresh "Active Today" counts
+    # The 30-second cache was causing mismatches between dashboard cards
+    # and filtered pages that make fresh API calls
     
     # Calculate "today" in client's timezone
     now_utc = datetime.utcnow()
@@ -3617,8 +3616,8 @@ async def get_dashboard_stats(
         "drivers_training_expired": drivers_training_expired,
     }
     
-    # Cache the result
-    set_cached_stats(company_id, result)
+    # NOTE: Caching disabled to ensure fresh data consistency
+    # set_cached_stats(company_id, result)
     
     return result
 
