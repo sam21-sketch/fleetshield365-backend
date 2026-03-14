@@ -2694,8 +2694,8 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
     if update_data:
         await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
         
-        # Check for expiring documents and create alerts
-        await check_driver_expiry_alerts(driver_id, current_user["company_id"])
+        # Check for expiring documents in background (don't block response)
+        asyncio.create_task(check_driver_expiry_alerts(driver_id, current_user["company_id"]))
     
     return {"message": "Driver updated successfully"}
 
