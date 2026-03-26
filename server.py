@@ -928,6 +928,7 @@ class CompanyRegister(BaseModel):
     vehicle_count: int = 5
     origin_url: Optional[str] = None
     role: Optional[str] = None  # 'super_admin' for Company Owner, 'admin' for Admin
+    timezone: Optional[str] = "Australia/Sydney"  # Company timezone for timestamps
 
 # Pricing Configuration
 PRICING = {
@@ -4266,6 +4267,7 @@ async def register_company(data: CompanyRegister):
         "trial_end": (datetime.utcnow() + timedelta(days=PRICING["trial_days"])).isoformat(),
         "stripe_customer_id": None,
         "stripe_subscription_id": None,
+        "timezone": data.timezone or DEFAULT_TIMEZONE,
         "created_at": datetime.utcnow().isoformat(),
     }
     company_result = await db.companies.insert_one(company_doc)
