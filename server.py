@@ -50,13 +50,69 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
-# Sydney timezone helper for consistent "today" calculations
+# Timezone helpers for consistent date/time handling
 from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
 UTC_TZ = ZoneInfo('UTC')
+DEFAULT_TIMEZONE = 'Australia/Sydney'
 
-def format_timestamp_sydney(timestamp_str: str) -> str:
-    """Convert ISO timestamp to Sydney timezone formatted string (DD/MM/YYYY HH:MM)"""
+# List of supported timezones
+SUPPORTED_TIMEZONES = [
+    # Australia
+    "Australia/Sydney",
+    "Australia/Brisbane", 
+    "Australia/Melbourne",
+    "Australia/Perth",
+    "Australia/Adelaide",
+    "Australia/Darwin",
+    "Australia/Hobart",
+    # New Zealand
+    "Pacific/Auckland",
+    # Asia
+    "Asia/Singapore",
+    "Asia/Hong_Kong",
+    "Asia/Tokyo",
+    "Asia/Seoul",
+    "Asia/Kolkata",
+    "Asia/Dubai",
+    "Asia/Jakarta",
+    "Asia/Manila",
+    "Asia/Bangkok",
+    "Asia/Shanghai",
+    # Europe
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Amsterdam",
+    "Europe/Rome",
+    "Europe/Madrid",
+    "Europe/Dublin",
+    # Americas
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Toronto",
+    "America/Vancouver",
+    "America/Mexico_City",
+    "America/Sao_Paulo",
+    # Africa
+    "Africa/Johannesburg",
+    "Africa/Cairo",
+    "Africa/Lagos",
+    # UTC
+    "UTC",
+]
+
+def get_timezone(tz_name: str) -> ZoneInfo:
+    """Get ZoneInfo for a timezone name, with fallback to Sydney"""
+    try:
+        return ZoneInfo(tz_name) if tz_name else SYDNEY_TZ
+    except:
+        return SYDNEY_TZ
+
+def format_timestamp(timestamp_str: str, timezone: str = DEFAULT_TIMEZONE) -> str:
+    """Convert ISO timestamp to specified timezone formatted string (DD/MM/YYYY HH:MM)"""
     try:
         if not timestamp_str:
             return 'N/A'
@@ -74,11 +130,40 @@ def format_timestamp_sydney(timestamp_str: str) -> str:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC_TZ)
         
-        # Convert to Sydney timezone
-        sydney_dt = dt.astimezone(SYDNEY_TZ)
-        return sydney_dt.strftime('%d/%m/%Y %H:%M')
+        # Convert to specified timezone
+        tz = get_timezone(timezone)
+        local_dt = dt.astimezone(tz)
+        return local_dt.strftime('%d/%m/%Y %H:%M')
     except Exception as e:
         return str(timestamp_str)[:16] if timestamp_str else 'N/A'
+
+# Keep old function name for backward compatibility
+def format_timestamp_sydney(timestamp_str: str) -> str:
+    """Legacy function - use format_timestamp with timezone parameter instead"""
+    return format_timestamp(timestamp_str, DEFAULT_TIMEZONE)
+
+async def get_company_timezone(db, company_id: str) -> str:
+    """Get the timezone setting for a company"""
+    try:
+        if not company_id:
+            return DEFAULT_TIMEZONE
+        company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
+        return company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    except:
+        return DEFAULT_TIMEZONE
+
+def get_today_range_for_timezone(timezone: str = DEFAULT_TIMEZONE):
+    """Get start and end of 'today' in specified timezone, returned as UTC datetimes."""
+    tz = get_timezone(timezone)
+    now_local = datetime.now(tz)
+    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end_local = today_start_local + timedelta(days=1)
+    
+    # Convert to UTC (naive datetime for MongoDB)
+    today_start_utc = today_start_local.astimezone(UTC_TZ).replace(tzinfo=None)
+    today_end_utc = today_end_local.astimezone(UTC_TZ).replace(tzinfo=None)
+    
+    return today_start_utc, today_end_utc
 
 def get_sydney_today_range():
     """Get start and end of 'today' in Sydney timezone, returned as UTC datetimes.
@@ -609,11 +694,13 @@ class TokenResponse(BaseModel):
 class CompanyCreate(BaseModel):
     name: str
     logo_base64: Optional[str] = None
+    timezone: Optional[str] = "Australia/Sydney"
 
 class CompanyUpdate(BaseModel):
     name: Optional[str] = None
     logo_base64: Optional[str] = None
     subscription_plan: Optional[str] = None
+    timezone: Optional[str] = None
 
 # Vehicle Models
 class VehicleCreate(BaseModel):
@@ -919,6 +1006,9 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     elements = []
     styles = getSampleStyleSheet()
     
+    # Get company timezone
+    company_tz = company.get('timezone', DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    
     # Title Style
     title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1a365d'), spaceAfter=12)
     heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor('#2d3748'), spaceAfter=8)
@@ -939,9 +1029,12 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     elements.append(Paragraph(inspection_type, title_style))
     elements.append(Spacer(1, 12))
     
+    # Get timezone display name
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
+    
     # Basic Info Table
     info_data = [
-        ['Date/Time:', format_timestamp_sydney(inspection.get('timestamp', 'N/A'))],
+        ['Date/Time:', f"{format_timestamp(inspection.get('timestamp', 'N/A'), company_tz)} ({tz_display})"],
         ['Vehicle:', f"{vehicle.get('name', 'N/A')} ({vehicle.get('registration_number', 'N/A')})"],
         ['Driver:', driver.get('name', 'N/A')],
         ['Odometer:', f"{inspection.get('odometer', 'N/A')} km"],
@@ -1384,10 +1477,22 @@ async def login(credentials: UserLogin, request: Request):
     expires_delta = timedelta(days=30) if credentials.remember_me else timedelta(days=1)
     token = create_access_token({"sub": str(user["_id"])}, expires_delta=expires_delta)
     
+    # Get company timezone if user has a company
+    company_timezone = DEFAULT_TIMEZONE
+    company_id = user.get("company_id")
+    if company_id:
+        company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
+        if company:
+            company_timezone = company.get("timezone", DEFAULT_TIMEZONE)
+    
+    # Add company timezone to user data
+    user_data = serialize_doc(user)
+    user_data["company_timezone"] = company_timezone
+    
     return {
         "access_token": token,
         "token_type": "bearer",
-        "user": serialize_doc(user)
+        "user": user_data
     }
 
 @api_router.get("/auth/me")
@@ -1563,7 +1668,17 @@ async def get_company(current_user: dict = Depends(get_current_user)):
     result = serialize_doc(company)
     result["vehicle_count"] = vehicle_count
     result["active_vehicles_count"] = vehicle_count
+    # Ensure timezone has a default value
+    result["timezone"] = result.get("timezone", DEFAULT_TIMEZONE)
     return result
+
+@api_router.get("/timezones")
+async def get_timezones():
+    """Get list of supported timezones for company settings"""
+    return {
+        "timezones": SUPPORTED_TIMEZONES,
+        "default": DEFAULT_TIMEZONE
+    }
 
 @api_router.put("/company")
 async def update_company(update: CompanyUpdate, current_user: dict = Depends(get_current_user)):
@@ -3371,6 +3486,8 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
     # Get company info
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
     company_name = company.get("name", "FleetShield365") if company else "FleetShield365"
+    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
     
     # Generate PDF
     buffer = BytesIO()
@@ -3439,7 +3556,7 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
     elements.append(Spacer(1, 30))
     footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
     elements.append(Paragraph(f"Generated by {company_name} via FleetShield365", footer_style))
-    elements.append(Paragraph(f"Report generated: {datetime.now(SYDNEY_TZ).strftime('%d/%m/%Y %H:%M')} (Sydney)", footer_style))
+    elements.append(Paragraph(f"Report generated: {datetime.now(get_timezone(company_tz)).strftime('%d/%m/%Y %H:%M')} ({tz_display})", footer_style))
     
     doc.build(elements)
     pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
@@ -3711,6 +3828,8 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     vehicle_rego = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
     driver_name = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
     company_name = company.get("name", "FleetShield365") if company else "FleetShield365"
+    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
     
     # Generate PDF
     buffer = BytesIO()
@@ -3724,13 +3843,13 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
     elements.append(Paragraph(f"Incident Report - {severity.upper()}", title_style))
     
-    # Incident date in Australian format (Sydney timezone)
-    incident_date = format_timestamp_sydney(incident.get("created_at", ""))
+    # Incident date in company timezone
+    incident_date = format_timestamp(incident.get("created_at", ""), company_tz)
     
     # Details table
     data = [
         ["Incident ID:", str(incident.get("_id", ""))[:8] + "..."],
-        ["Date/Time:", incident_date],
+        ["Date/Time:", f"{incident_date} ({tz_display})"],
         ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
         ["Driver:", driver_name],
         ["Severity:", severity.title()],
@@ -3782,7 +3901,7 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     elements.append(Spacer(1, 30))
     footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
     elements.append(Paragraph(f"Generated by {company_name} via FleetShield365", footer_style))
-    elements.append(Paragraph(f"Report generated: {datetime.now(SYDNEY_TZ).strftime('%d/%m/%Y %H:%M')} (Sydney)", footer_style))
+    elements.append(Paragraph(f"Report generated: {datetime.now(get_timezone(company_tz)).strftime('%d/%m/%Y %H:%M')} ({tz_display})", footer_style))
     
     doc.build(elements)
     pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
