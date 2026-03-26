@@ -68,17 +68,33 @@ SUPPORTED_TIMEZONES = [
     "Australia/Hobart",
     # New Zealand
     "Pacific/Auckland",
-    # Asia
+    "Pacific/Fiji",
+    # Asia - South
+    "Asia/Kolkata",       # India (IST)
+    "Asia/Karachi",       # Pakistan (PKT)
+    "Asia/Dhaka",         # Bangladesh (BST)
+    "Asia/Colombo",       # Sri Lanka
+    "Asia/Kathmandu",     # Nepal
+    # Asia - Southeast
     "Asia/Singapore",
+    "Asia/Bangkok",       # Thailand
+    "Asia/Jakarta",       # Indonesia
+    "Asia/Manila",        # Philippines
+    "Asia/Kuala_Lumpur",  # Malaysia
+    "Asia/Ho_Chi_Minh",   # Vietnam
+    # Asia - East
     "Asia/Hong_Kong",
-    "Asia/Tokyo",
-    "Asia/Seoul",
-    "Asia/Kolkata",
-    "Asia/Dubai",
-    "Asia/Jakarta",
-    "Asia/Manila",
-    "Asia/Bangkok",
-    "Asia/Shanghai",
+    "Asia/Shanghai",      # China
+    "Asia/Tokyo",         # Japan
+    "Asia/Seoul",         # South Korea
+    "Asia/Taipei",        # Taiwan
+    # Asia - Middle East
+    "Asia/Dubai",         # UAE
+    "Asia/Riyadh",        # Saudi Arabia
+    "Asia/Qatar",         # Qatar
+    "Asia/Kuwait",        # Kuwait
+    "Asia/Jerusalem",     # Israel
+    "Asia/Tehran",        # Iran
     # Europe
     "Europe/London",
     "Europe/Paris",
@@ -87,19 +103,33 @@ SUPPORTED_TIMEZONES = [
     "Europe/Rome",
     "Europe/Madrid",
     "Europe/Dublin",
-    # Americas
+    "Europe/Brussels",
+    "Europe/Vienna",
+    "Europe/Stockholm",
+    "Europe/Warsaw",
+    "Europe/Moscow",
+    "Europe/Istanbul",
+    # Americas - North
     "America/New_York",
     "America/Chicago",
     "America/Denver",
     "America/Los_Angeles",
     "America/Toronto",
     "America/Vancouver",
+    "America/Phoenix",
+    # Americas - Central/South
     "America/Mexico_City",
     "America/Sao_Paulo",
+    "America/Buenos_Aires",
+    "America/Lima",
+    "America/Bogota",
+    "America/Santiago",
     # Africa
     "Africa/Johannesburg",
     "Africa/Cairo",
     "Africa/Lagos",
+    "Africa/Nairobi",
+    "Africa/Casablanca",
     # UTC
     "UTC",
 ]
