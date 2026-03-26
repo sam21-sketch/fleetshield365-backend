@@ -17,7 +17,7 @@ import os
 # Get BASE_URL from environment - NO DEFAULT to fail fast if not set
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 if not BASE_URL:
-    BASE_URL = "https://fleet-ops-test-2.preview.emergentagent.com"
+    BASE_URL = "https://shield-driver-test.preview.emergentagent.com"
 
 # Test credentials from request
 TEST_EMAIL = "sam21@y7mail.com"

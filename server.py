@@ -50,6 +50,44 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
+# Sydney timezone helper for consistent "today" calculations
+from zoneinfo import ZoneInfo
+SYDNEY_TZ = ZoneInfo('Australia/Sydney')
+UTC_TZ = ZoneInfo('UTC')
+
+def get_sydney_today_range():
+    """Get start and end of 'today' in Sydney timezone, returned as UTC datetimes.
+    Use this for ALL 'today' queries to ensure dashboard and detail views match."""
+    now_sydney = datetime.now(SYDNEY_TZ)
+    today_start_sydney = now_sydney.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end_sydney = today_start_sydney + timedelta(days=1)
+    
+    # Convert to UTC (naive datetime for MongoDB)
+    today_start_utc = today_start_sydney.astimezone(UTC_TZ).replace(tzinfo=None)
+    today_end_utc = today_end_sydney.astimezone(UTC_TZ).replace(tzinfo=None)
+    
+    return today_start_utc, today_end_utc
+
+def get_sydney_date_as_utc(date_str: str, is_end_of_day: bool = False):
+    """Convert a date string (YYYY-MM-DD) to UTC datetime, treating it as Sydney timezone.
+    Use this when clients pass date filters to ensure consistent interpretation."""
+    try:
+        # Parse the date
+        date_parts = date_str.split('-')
+        year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
+        
+        # Create datetime in Sydney timezone
+        if is_end_of_day:
+            sydney_dt = datetime(year, month, day, 23, 59, 59, tzinfo=SYDNEY_TZ)
+        else:
+            sydney_dt = datetime(year, month, day, 0, 0, 0, tzinfo=SYDNEY_TZ)
+        
+        # Convert to UTC (naive for MongoDB)
+        return sydney_dt.astimezone(UTC_TZ).replace(tzinfo=None)
+    except:
+        # Fallback to direct parse if format is different
+        return datetime.fromisoformat(date_str)
+
 # Universal in-memory cache for API responses
 api_cache: Dict[str, Any] = {}
 CACHE_TTL = {
@@ -533,6 +571,9 @@ class FuelSubmission(BaseModel):
     odometer: Optional[int] = None
     fuel_station: Optional[str] = None
     notes: Optional[str] = None
+    gps_latitude: Optional[float] = None
+    gps_longitude: Optional[float] = None
+    location_address: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -588,6 +629,7 @@ class InspectionPhoto(BaseModel):
     timestamp: str
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
+    location_address: Optional[str] = None
     ai_damage_status: str = AIDamageStatus.NO_DAMAGE
 
 # Inspection Models
@@ -608,6 +650,7 @@ class PrestartCreate(BaseModel):
     declaration_confirmed: bool = True
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
+    location_address: Optional[str] = None
 
 class EndShiftCreate(BaseModel):
     vehicle_id: str
@@ -624,6 +667,7 @@ class EndShiftCreate(BaseModel):
     declaration_confirmed: bool = True
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
+    location_address: Optional[str] = None
 
 # Maintenance Models
 class MaintenanceLogCreate(BaseModel):
@@ -878,7 +922,10 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
         ['Odometer:', f"{inspection.get('odometer', 'N/A')} km"],
     ]
     
-    if inspection.get('gps_latitude') and inspection.get('gps_longitude'):
+    # Show address if available, otherwise show GPS coordinates
+    if inspection.get('location_address'):
+        info_data.append(['Location:', inspection['location_address']])
+    elif inspection.get('gps_latitude') and inspection.get('gps_longitude'):
         info_data.append(['GPS Location:', f"{inspection['gps_latitude']:.6f}, {inspection['gps_longitude']:.6f}"])
     
     info_table = Table(info_data, colWidths=[100, 350])
@@ -1344,7 +1391,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://fleet-ops-test-2.preview.emergentagent.com"
+    origin_url: str = "https://shield-driver-test.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1703,17 +1750,13 @@ async def get_vehicles(current_user: dict = Depends(get_current_user)):
 @api_router.get("/vehicles/active-today")
 async def get_active_vehicles_today(
     current_user: dict = Depends(get_current_user),
-    tz_offset: int = 0
+    tz_offset: int = 0  # Kept for backwards compatibility, but ignored
 ):
     """Lightweight endpoint to get just the IDs of vehicles that had inspections today"""
     company_id = current_user["company_id"]
     
-    # Calculate "today" in client's timezone
-    now_utc = datetime.utcnow()
-    client_offset = timedelta(minutes=-tz_offset)
-    client_now = now_utc + client_offset
-    client_today_start = client_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_utc = client_today_start - client_offset
+    # Use shared Sydney timezone helper (same as dashboard)
+    today_utc, _ = get_sydney_today_range()
     
     # Get active vehicle IDs
     active_ids = await db.inspections.distinct("vehicle_id", {
@@ -2148,6 +2191,78 @@ async def check_license_photos(driver_id: str, current_user: dict = Depends(get_
         "uploaded_at": driver.get("license_photos_updated_at")
     }
 
+# ============== Photo Upload Routes (Upload during capture) ==============
+
+class PhotoUploadRequest(BaseModel):
+    base64_data: str
+    photo_type: str
+    vehicle_id: str
+    timestamp: Optional[str] = None
+    gps_latitude: Optional[float] = None
+    gps_longitude: Optional[float] = None
+
+@api_router.post("/photos/upload")
+async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Upload a single photo immediately after capture.
+    Returns a photo_id that can be referenced in inspection submission.
+    Photos are stored in temp_photos collection with 24h TTL.
+    """
+    try:
+        photo_id = ObjectId()
+        
+        photo_doc = {
+            "_id": photo_id,
+            "company_id": current_user["company_id"],
+            "uploaded_by": current_user["id"],
+            "vehicle_id": photo.vehicle_id,
+            "photo_type": photo.photo_type,
+            "base64_data": photo.base64_data,
+            "timestamp": photo.timestamp or datetime.utcnow().isoformat(),
+            "gps_latitude": photo.gps_latitude,
+            "gps_longitude": photo.gps_longitude,
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(hours=24),  # Auto-delete after 24h if not used
+            "used": False  # Will be set to True when linked to an inspection
+        }
+        
+        await db.temp_photos.insert_one(photo_doc)
+        
+        return {
+            "success": True,
+            "photo_id": str(photo_id),
+            "message": "Photo uploaded successfully"
+        }
+    except Exception as e:
+        logger.error(f"Photo upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload photo")
+
+@api_router.get("/photos/{photo_id}")
+async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user)):
+    """Get a previously uploaded photo by ID"""
+    try:
+        photo = await db.temp_photos.find_one({
+            "_id": ObjectId(photo_id),
+            "company_id": current_user["company_id"]
+        })
+        
+        if not photo:
+            raise HTTPException(status_code=404, detail="Photo not found")
+        
+        return {
+            "photo_id": str(photo["_id"]),
+            "photo_type": photo["photo_type"],
+            "base64_data": photo["base64_data"],
+            "timestamp": photo.get("timestamp"),
+            "gps_latitude": photo.get("gps_latitude"),
+            "gps_longitude": photo.get("gps_longitude")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get photo failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get photo")
+
 # ============== Inspection Routes ==============
 
 @api_router.post("/inspections/prestart")
@@ -2216,6 +2331,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         "declaration_confirmed": inspection.declaration_confirmed,
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
+        "location_address": inspection.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None,
@@ -2356,6 +2472,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "declaration_confirmed": inspection.declaration_confirmed,
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
+        "location_address": inspection.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None
@@ -2471,13 +2588,17 @@ async def get_inspections(
         query["type"] = inspection_type
     if has_issues is not None:
         query["is_safe"] = not has_issues
+    
+    # Use Sydney timezone for date filtering (same as dashboard)
     if start_date:
-        query["timestamp"] = {"$gte": datetime.fromisoformat(start_date)}
+        start_utc = get_sydney_date_as_utc(start_date, is_end_of_day=False)
+        query["timestamp"] = {"$gte": start_utc}
     if end_date:
+        end_utc = get_sydney_date_as_utc(end_date, is_end_of_day=True)
         if "timestamp" in query:
-            query["timestamp"]["$lte"] = datetime.fromisoformat(end_date)
+            query["timestamp"]["$lte"] = end_utc
         else:
-            query["timestamp"] = {"$lte": datetime.fromisoformat(end_date)}
+            query["timestamp"] = {"$lte": end_utc}
     
     # Cap at 500 for performance
     actual_limit = min(limit, 500)
@@ -2617,6 +2738,9 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
         "odometer": fuel.odometer,
         "fuel_station": fuel.fuel_station,
         "notes": fuel.notes,
+        "gps_latitude": fuel.gps_latitude,
+        "gps_longitude": fuel.gps_longitude,
+        "location_address": fuel.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown"
     }
@@ -3201,6 +3325,105 @@ async def delete_service_record(record_id: str, request: Request, current_user: 
     
     return {"message": "Service record deleted successfully"}
 
+@api_router.get("/service-records/{record_id}/pdf")
+async def get_service_record_pdf(record_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate and return PDF for a service record"""
+    company_id = current_user["company_id"]
+    
+    record = await db.service_records.find_one({
+        "_id": ObjectId(record_id),
+        "company_id": company_id
+    })
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="Service record not found")
+    
+    # Get vehicle info
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(record["vehicle_id"])})
+    vehicle_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+    vehicle_rego = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+    
+    # Get company info
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = company.get("name", "FleetShield365") if company else "FleetShield365"
+    
+    # Generate PDF
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=40, rightMargin=40)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
+    elements.append(Paragraph(f"Service Record - {vehicle_name}", title_style))
+    
+    # Service date in Australian format
+    service_date = record.get("service_date", "")
+    if service_date:
+        try:
+            date_obj = datetime.fromisoformat(service_date.replace("Z", "+00:00")) if "T" in service_date else datetime.strptime(service_date, "%Y-%m-%d")
+            service_date = date_obj.strftime("%d/%m/%Y")
+        except:
+            pass
+    
+    # Details table
+    data = [
+        ["Vehicle:", vehicle_name],
+        ["Registration:", vehicle_rego],
+        ["Service Date:", service_date],
+        ["Service Type:", record.get("service_type", "N/A").replace("_", " ").title()],
+        ["Odometer:", f"{record.get('odometer_reading', 'N/A')} km"],
+        ["Cost:", f"${record.get('cost', 0):.2f}"],
+        ["Workshop:", record.get("workshop_name", "N/A")],
+        ["Technician:", record.get("technician_name", "N/A")],
+    ]
+    
+    table = Table(data, colWidths=[120, 350])
+    table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 20))
+    
+    # Description
+    if record.get("description"):
+        elements.append(Paragraph("<b>Description:</b>", styles['Normal']))
+        elements.append(Paragraph(record.get("description", ""), styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Next service info
+    if record.get("next_service_date") or record.get("next_service_odometer"):
+        elements.append(Paragraph("<b>Next Service Due:</b>", styles['Normal']))
+        if record.get("next_service_date"):
+            next_date = record.get("next_service_date", "")
+            try:
+                date_obj = datetime.fromisoformat(next_date.replace("Z", "+00:00")) if "T" in next_date else datetime.strptime(next_date, "%Y-%m-%d")
+                next_date = date_obj.strftime("%d/%m/%Y")
+            except:
+                pass
+            elements.append(Paragraph(f"Date: {next_date}", styles['Normal']))
+        if record.get("next_service_odometer"):
+            elements.append(Paragraph(f"Odometer: {record.get('next_service_odometer')} km", styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Footer
+    elements.append(Spacer(1, 30))
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
+    elements.append(Paragraph(f"Generated by {company_name} via FleetShield365", footer_style))
+    elements.append(Paragraph(f"Report generated: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC", footer_style))
+    
+    doc.build(elements)
+    pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    
+    return {
+        "pdf_base64": pdf_base64,
+        "filename": f"service_record_{vehicle_rego}_{service_date.replace('/', '-')}.pdf"
+    }
+
 # ============== Alert Routes ==============
 
 @api_router.get("/alerts")
@@ -3441,6 +3664,118 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
     
     return serialize_doc(incident)
 
+@api_router.get("/incidents/{incident_id}/pdf")
+async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate and return PDF for an incident report"""
+    company_id = current_user["company_id"]
+    
+    incident = await db.incidents.find_one({
+        "_id": ObjectId(incident_id),
+        "company_id": company_id
+    })
+    
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    
+    # Get related info
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
+    driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    
+    vehicle_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+    vehicle_rego = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+    driver_name = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+    company_name = company.get("name", "FleetShield365") if company else "FleetShield365"
+    
+    # Generate PDF
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=40, rightMargin=40)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title with severity color
+    severity_colors = {"minor": "#f59e0b", "moderate": "#ef4444", "major": "#dc2626", "critical": "#7f1d1d"}
+    severity = incident.get("severity", "unknown")
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
+    elements.append(Paragraph(f"Incident Report - {severity.upper()}", title_style))
+    
+    # Incident date in Australian format
+    incident_date = incident.get("created_at", "")
+    if incident_date:
+        try:
+            if isinstance(incident_date, datetime):
+                incident_date = incident_date.strftime("%d/%m/%Y %H:%M")
+            else:
+                date_obj = datetime.fromisoformat(str(incident_date).replace("Z", "+00:00"))
+                incident_date = date_obj.strftime("%d/%m/%Y %H:%M")
+        except:
+            pass
+    
+    # Details table
+    data = [
+        ["Incident ID:", str(incident.get("_id", ""))[:8] + "..."],
+        ["Date/Time:", incident_date],
+        ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
+        ["Driver:", driver_name],
+        ["Severity:", severity.title()],
+        ["Status:", incident.get("status", "pending").replace("_", " ").title()],
+        ["Location:", incident.get("location_address", "N/A")],
+    ]
+    
+    table = Table(data, colWidths=[120, 350])
+    table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 20))
+    
+    # Description
+    if incident.get("description"):
+        elements.append(Paragraph("<b>Description:</b>", styles['Normal']))
+        elements.append(Paragraph(incident.get("description", ""), styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Other party info
+    other_party = incident.get("other_party", {})
+    if other_party and any(other_party.values()):
+        elements.append(Paragraph("<b>Other Party Information:</b>", styles['Normal']))
+        if other_party.get("name"):
+            elements.append(Paragraph(f"Name: {other_party.get('name')}", styles['Normal']))
+        if other_party.get("phone"):
+            elements.append(Paragraph(f"Phone: {other_party.get('phone')}", styles['Normal']))
+        if other_party.get("vehicle_rego"):
+            elements.append(Paragraph(f"Vehicle Rego: {other_party.get('vehicle_rego')}", styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Admin notes
+    if incident.get("admin_notes"):
+        elements.append(Paragraph("<b>Admin Notes:</b>", styles['Normal']))
+        elements.append(Paragraph(incident.get("admin_notes", ""), styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Insurance info
+    if incident.get("insurance_claim_number"):
+        elements.append(Paragraph(f"<b>Insurance Claim #:</b> {incident.get('insurance_claim_number')}", styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Footer
+    elements.append(Spacer(1, 30))
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
+    elements.append(Paragraph(f"Generated by {company_name} via FleetShield365", footer_style))
+    elements.append(Paragraph(f"Report generated: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC", footer_style))
+    
+    doc.build(elements)
+    pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    
+    return {
+        "pdf_base64": pdf_base64,
+        "filename": f"incident_report_{vehicle_rego}_{incident_date.replace('/', '-').replace(':', '-').replace(' ', '_')}.pdf"
+    }
+
 @api_router.put("/incidents/{incident_id}")
 async def update_incident(
     incident_id: str,
@@ -3538,7 +3873,7 @@ async def get_incident_stats(current_user: dict = Depends(get_current_user)):
 @api_router.get("/dashboard/stats")
 async def get_dashboard_stats(
     current_user: dict = Depends(get_current_user),
-    tz_offset: int = 0  # Timezone offset in minutes from UTC (e.g., -600 for AEST)
+    tz_offset: int = 0  # Kept for backwards compatibility, but ignored
 ):
     company_id = current_user["company_id"]
     
@@ -3546,12 +3881,8 @@ async def get_dashboard_stats(
     # The 30-second cache was causing mismatches between dashboard cards
     # and filtered pages that make fresh API calls
     
-    # Calculate "today" in client's timezone
-    now_utc = datetime.utcnow()
-    client_offset = timedelta(minutes=-tz_offset)
-    client_now = now_utc + client_offset
-    client_today_start = client_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_utc = client_today_start - client_offset
+    # Use shared Sydney timezone helper for consistent "today" calculation
+    today_utc, _ = get_sydney_today_range()
     
     # Pre-calculate date strings
     thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()[:10]

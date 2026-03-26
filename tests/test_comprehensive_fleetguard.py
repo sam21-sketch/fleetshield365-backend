@@ -7,7 +7,7 @@ import requests
 import os
 import time
 
-BASE_URL = os.environ.get('REACT_APP_API_URL', 'https://fleet-ops-test-2.preview.emergentagent.com/api')
+BASE_URL = os.environ.get('REACT_APP_API_URL', 'https://shield-driver-test.preview.emergentagent.com/api')
 
 # Test credentials
 ADMIN_EMAIL = "admin@test.com"
