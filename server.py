@@ -55,6 +55,31 @@ from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
 UTC_TZ = ZoneInfo('UTC')
 
+def format_timestamp_sydney(timestamp_str: str) -> str:
+    """Convert ISO timestamp to Sydney timezone formatted string (DD/MM/YYYY HH:MM)"""
+    try:
+        if not timestamp_str:
+            return 'N/A'
+        # Parse the timestamp
+        if isinstance(timestamp_str, datetime):
+            dt = timestamp_str
+        else:
+            # Handle various ISO formats
+            timestamp_str = str(timestamp_str).replace('Z', '+00:00')
+            if '+' not in timestamp_str and 'T' in timestamp_str:
+                timestamp_str += '+00:00'
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        
+        # If naive datetime, assume UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC_TZ)
+        
+        # Convert to Sydney timezone
+        sydney_dt = dt.astimezone(SYDNEY_TZ)
+        return sydney_dt.strftime('%d/%m/%Y %H:%M')
+    except Exception as e:
+        return str(timestamp_str)[:16] if timestamp_str else 'N/A'
+
 def get_sydney_today_range():
     """Get start and end of 'today' in Sydney timezone, returned as UTC datetimes.
     Use this for ALL 'today' queries to ensure dashboard and detail views match."""
@@ -916,7 +941,7 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     
     # Basic Info Table
     info_data = [
-        ['Date/Time:', inspection.get('timestamp', 'N/A')],
+        ['Date/Time:', format_timestamp_sydney(inspection.get('timestamp', 'N/A'))],
         ['Vehicle:', f"{vehicle.get('name', 'N/A')} ({vehicle.get('registration_number', 'N/A')})"],
         ['Driver:', driver.get('name', 'N/A')],
         ['Odometer:', f"{inspection.get('odometer', 'N/A')} km"],
