@@ -568,7 +568,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 import re
 async def generate_unique_username(name: str, company_id: str) -> str:
-    """Generate a unique username from the person's name with random numbers"""
+    """Generate a GLOBALLY unique username from the person's name with random numbers"""
     import random
     
     # Clean the name: lowercase, remove special chars, keep only first name
@@ -582,7 +582,8 @@ async def generate_unique_username(name: str, company_id: str) -> str:
     attempts = 0
     max_attempts = 50
     
-    while await db.users.find_one({"username": username, "company_id": company_id}):
+    # Check GLOBALLY (all companies) to avoid login confusion
+    while await db.users.find_one({"username": username}):
         # Generate random 1-2 digit number (1-99)
         random_num = random.randint(1, 99)
         username = f"{clean_name}{random_num}"
@@ -2088,8 +2089,8 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     # Generate unique username
     username = user.username or await generate_unique_username(user.name, current_user["company_id"])
     
-    # Check if username already exists in this company
-    if await db.users.find_one({"username": username, "company_id": current_user["company_id"]}):
+    # Check if username already exists GLOBALLY
+    if await db.users.find_one({"username": username}):
         username = await generate_unique_username(user.name, current_user["company_id"])
     
     driver_doc = {
@@ -5231,6 +5232,32 @@ async def reset_user_password(user_id: str, key: str, new_password: str = "temp1
         return {"message": "Password reset successfully", "temp_password": new_password}
     except Exception as e:
         logger.error(f"Developer reset password error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.delete("/developer/company/{company_id}")
+async def delete_company(company_id: str, key: str):
+    """Delete a company and all associated data (Developer only)"""
+    if key != DEVELOPER_KEY:
+        raise HTTPException(status_code=401, detail="Invalid developer key")
+    
+    try:
+        deleted = {
+            "users": (await db.users.delete_many({"company_id": company_id})).deleted_count,
+            "vehicles": (await db.vehicles.delete_many({"company_id": company_id})).deleted_count,
+            "inspections": (await db.inspections.delete_many({"company_id": company_id})).deleted_count,
+            "inspection_photos": (await db.inspection_photos.delete_many({"company_id": company_id})).deleted_count,
+            "fuel_submissions": (await db.fuel_submissions.delete_many({"company_id": company_id})).deleted_count,
+            "incidents": (await db.incidents.delete_many({"company_id": company_id})).deleted_count,
+            "alerts": (await db.alerts.delete_many({"company_id": company_id})).deleted_count,
+            "service_records": (await db.service_records.delete_many({"company_id": company_id})).deleted_count,
+        }
+        
+        result = await db.companies.delete_one({"_id": ObjectId(company_id)})
+        deleted["company"] = result.deleted_count
+        
+        return {"message": "Company deleted", "deleted": deleted}
+    except Exception as e:
+        logger.error(f"Developer delete company error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============== Health Check ==============
