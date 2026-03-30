@@ -2759,7 +2759,18 @@ async def get_inspections(
     if inspection_type:
         query["type"] = inspection_type
     if has_issues is not None:
-        query["is_safe"] = not has_issues
+        if has_issues:
+            # Show inspections with issues: is_safe=False OR new_damage=True OR incident_today=True
+            query["$or"] = [
+                {"is_safe": False},
+                {"new_damage": True},
+                {"incident_today": True}
+            ]
+        else:
+            # Show safe inspections only
+            query["is_safe"] = True
+            query["new_damage"] = {"$ne": True}
+            query["incident_today"] = {"$ne": True}
     
     # Use Sydney timezone for date filtering (same as dashboard)
     if start_date:
