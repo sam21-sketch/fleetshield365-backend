@@ -739,18 +739,21 @@ class VehicleCreate(BaseModel):
     registration_number: str
     trailer_attached: Optional[str] = None
     status: str = VehicleStatus.ACTIVE
+    type: Optional[str] = "truck"
     rego_expiry: Optional[str] = None
     insurance_expiry: Optional[str] = None
     safety_certificate_expiry: Optional[str] = None
     coi_expiry: Optional[str] = None
     service_due_km: Optional[int] = None
     current_odometer: Optional[int] = 0
+    assigned_driver_ids: Optional[List[str]] = None
 
 class VehicleUpdate(BaseModel):
     name: Optional[str] = None
     registration_number: Optional[str] = None
     trailer_attached: Optional[str] = None
     status: Optional[str] = None
+    type: Optional[str] = None
     rego_expiry: Optional[str] = None
     insurance_expiry: Optional[str] = None
     safety_certificate_expiry: Optional[str] = None
@@ -1865,13 +1868,14 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         "registration_number": vehicle.registration_number,
         "trailer_attached": vehicle.trailer_attached,
         "status": vehicle.status,
+        "type": vehicle.type or "truck",
         "rego_expiry": vehicle.rego_expiry,
         "insurance_expiry": vehicle.insurance_expiry,
         "safety_certificate_expiry": vehicle.safety_certificate_expiry,
         "coi_expiry": vehicle.coi_expiry,
         "service_due_km": vehicle.service_due_km,
         "current_odometer": vehicle.current_odometer or 0,
-        "assigned_driver_ids": [],
+        "assigned_driver_ids": vehicle.assigned_driver_ids or [],
         "created_at": datetime.utcnow()
     }
     await db.vehicles.insert_one(vehicle_doc)
