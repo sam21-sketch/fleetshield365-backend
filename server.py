@@ -3033,7 +3033,7 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     # Get driver names
     driver_ids = list(set(s["driver_id"] for s in submissions))
     drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(100)
-    driver_map = {str(d["_id"]): d["name"] for d in drivers}
+    driver_map = {str(d["_id"]): d.get("name", d.get("email", "Unknown")) for d in drivers}
     
     for s in submissions:
         s["id"] = str(s.pop("_id"))
