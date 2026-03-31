@@ -2516,7 +2516,7 @@ async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user
 # ============== Inspection Routes ==============
 
 @api_router.post("/inspections/prestart")
-async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_prestart(inspection: PrestartCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     # Get vehicle
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
@@ -2626,8 +2626,9 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
                 "base64_data": photo.base64_data
             })
         
-        # Send notifications to admins WITH PHOTOS
-        await notify_admins_with_photos(
+        # Send notifications to admins WITH PHOTOS (in background for faster response)
+        background_tasks.add_task(
+            notify_admins_with_photos,
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
@@ -2661,7 +2662,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     return serialize_doc(inspection_doc)
 
 @api_router.post("/inspections/end-shift")
-async def create_end_shift(inspection: EndShiftCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_end_shift(inspection: EndShiftCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -2769,7 +2770,9 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         if inspection.incident_today:
             issue_summary += f" | Incident: {inspection.incident_comment or 'See photos'}"
         
-        await notify_admins_with_photos(
+        # Send notifications in background for faster response
+        background_tasks.add_task(
+            notify_admins_with_photos,
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
@@ -2795,7 +2798,9 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
                 "base64_data": photo.base64_data
             })
         
-        await notify_admins_with_photos(
+        # Send notifications in background for faster response
+        background_tasks.add_task(
+            notify_admins_with_photos,
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
