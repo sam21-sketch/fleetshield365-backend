@@ -2991,7 +2991,7 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
         raise HTTPException(status_code=404, detail="Driver not found")
     
     # Hash the new password
-    hashed_password = pwd_context.hash(request.new_password)
+    hashed_password = get_password_hash(request.new_password)
     
     # Update the driver's password
     await db.users.update_one(
@@ -5250,11 +5250,11 @@ async def reset_user_password(user_id: str, key: str, new_password: str = "temp1
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
-        hashed_password = pwd_context.hash(new_password)
+        hashed_password = get_password_hash(new_password)
         result = await db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {
-                "password": hashed_password,
+                "password_hash": hashed_password,
                 "is_frozen": False,
                 "updated_at": datetime.now(timezone.utc)
             }}
