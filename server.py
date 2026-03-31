@@ -2030,6 +2030,16 @@ async def assign_drivers(vehicle_id: str, assignment: DriverAssignment, request:
 
 # ============== Driver Routes ==============
 
+@api_router.get("/drivers/generate-username")
+async def generate_username_preview(name: str, current_user: dict = Depends(get_current_user)):
+    """Generate a globally unique username preview for the frontend"""
+    if not name or not name.strip():
+        return {"username": "user"}
+    
+    # Use the same logic as create_driver
+    username = await generate_unique_username(name, current_user["company_id"])
+    return {"username": username}
+
 @api_router.get("/drivers")
 async def get_drivers(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
