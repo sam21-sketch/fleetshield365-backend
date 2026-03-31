@@ -4088,7 +4088,16 @@ async def get_dashboard_stats(
         db.vehicles.count_documents({"company_id": company_id}),
         db.inspections.count_documents({"company_id": company_id, "timestamp": {"$gte": today_utc}}),
         db.inspections.distinct("vehicle_id", {"company_id": company_id, "timestamp": {"$gte": today_utc}}),
-        db.inspections.count_documents({"company_id": company_id, "timestamp": {"$gte": today_utc}, "is_safe": False}),
+        # Issues today: is_safe=False OR new_damage=True OR incident_today=True
+        db.inspections.count_documents({
+            "company_id": company_id, 
+            "timestamp": {"$gte": today_utc}, 
+            "$or": [
+                {"is_safe": False},
+                {"new_damage": True},
+                {"incident_today": True}
+            ]
+        }),
         # Vehicles needing attention: expired or expiring within 30 days (any doc type)
         db.vehicles.count_documents({"company_id": company_id, "$or": [
             {"rego_expiry": {"$lte": thirty_days}},
