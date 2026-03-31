@@ -50,6 +50,32 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
+# ============== Input Validation Helpers ==============
+
+def validate_object_id(id_string: str, field_name: str = "ID") -> ObjectId:
+    """
+    Validate and convert a string to ObjectId.
+    Raises HTTPException 400 if invalid format.
+    """
+    if not id_string:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: cannot be empty")
+    try:
+        return ObjectId(id_string)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name} format: {id_string}")
+
+def validate_object_id_optional(id_string: Optional[str], field_name: str = "ID") -> Optional[ObjectId]:
+    """
+    Validate and convert an optional string to ObjectId.
+    Returns None if input is None/empty, raises HTTPException 400 if invalid format.
+    """
+    if not id_string:
+        return None
+    try:
+        return ObjectId(id_string)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name} format: {id_string}")
+
 # Timezone helpers for consistent date/time handling
 from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
@@ -607,15 +633,26 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        # Validate user_id format
+        try:
+            user_oid = ObjectId(user_id)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token: malformed user ID")
+        user = await db.users.find_one({"_id": user_oid})
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         user['id'] = str(user['_id'])
         return user
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict"""
@@ -1556,7 +1593,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://shield-driver-test.preview.emergentagent.com"
+    origin_url: str = "https://shield-preview-3.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1816,9 +1853,11 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    user_oid = validate_object_id(user_id, "user_id")
+    
     # Verify user belongs to same company
     user = await db.users.find_one({
-        "_id": ObjectId(user_id),
+        "_id": user_oid,
         "company_id": current_user["company_id"]
     })
     if not user:
@@ -1826,9 +1865,9 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
     
     update_data = {k: v for k, v in user_data.dict().items() if v is not None}
     if update_data:
-        await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
+        await db.users.update_one({"_id": user_oid}, {"$set": update_data})
     
-    updated_user = await db.users.find_one({"_id": ObjectId(user_id)})
+    updated_user = await db.users.find_one({"_id": user_oid})
     updated_user.pop("hashed_password", None)
     return serialize_doc(updated_user)
 
@@ -1841,15 +1880,17 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     if str(current_user["_id"]) == user_id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     
+    user_oid = validate_object_id(user_id, "user_id")
+    
     # Verify user belongs to same company
     user = await db.users.find_one({
-        "_id": ObjectId(user_id),
+        "_id": user_oid,
         "company_id": current_user["company_id"]
     })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    await db.users.delete_one({"_id": ObjectId(user_id)})
+    await db.users.delete_one({"_id": user_oid})
     return {"message": "User deleted"}
 
 # ============== Vehicle Routes ==============
@@ -1944,8 +1985,9 @@ async def get_active_vehicles_today(
 
 @api_router.get("/vehicles/{vehicle_id}")
 async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_user)):
+    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
     vehicle = await db.vehicles.find_one({
-        "_id": ObjectId(vehicle_id),
+        "_id": vehicle_oid,
         "company_id": current_user["company_id"]
     })
     if not vehicle:
@@ -1957,14 +1999,16 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
+    
     update_data = {k: v for k, v in update.dict().items() if v is not None}
     if update_data:
         await db.vehicles.update_one(
-            {"_id": ObjectId(vehicle_id), "company_id": current_user["company_id"]},
+            {"_id": vehicle_oid, "company_id": current_user["company_id"]},
             {"$set": update_data}
         )
     
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
+    vehicle = await db.vehicles.find_one({"_id": vehicle_oid})
     
     # Invalidate cache
     invalidate_cache("vehicles", current_user["company_id"])
@@ -1982,10 +2026,11 @@ async def delete_vehicle(vehicle_id: str, request: Request, current_user: dict =
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
     company_id = current_user["company_id"]
     
     result = await db.vehicles.delete_one({
-        "_id": ObjectId(vehicle_id),
+        "_id": vehicle_oid,
         "company_id": company_id
     })
     
@@ -2013,19 +2058,27 @@ async def assign_drivers(vehicle_id: str, assignment: DriverAssignment, request:
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
+    
+    # Validate all driver IDs
+    validated_driver_ids = []
+    for driver_id in assignment.driver_ids:
+        driver_oid = validate_object_id(driver_id, "driver_id")
+        validated_driver_ids.append(driver_oid)
+    
     await db.vehicles.update_one(
-        {"_id": ObjectId(vehicle_id), "company_id": current_user["company_id"]},
+        {"_id": vehicle_oid, "company_id": current_user["company_id"]},
         {"$set": {"assigned_driver_ids": assignment.driver_ids}}
     )
     
     # Update drivers' assigned vehicles
-    for driver_id in assignment.driver_ids:
+    for driver_oid in validated_driver_ids:
         await db.users.update_one(
-            {"_id": ObjectId(driver_id)},
+            {"_id": driver_oid},
             {"$addToSet": {"assigned_vehicles": vehicle_id}}
         )
     
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
+    vehicle = await db.vehicles.find_one({"_id": vehicle_oid})
     return serialize_doc(vehicle)
 
 # ============== Driver Routes ==============
@@ -2145,9 +2198,10 @@ async def delete_driver(driver_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
+    driver_oid = validate_object_id(driver_id, "driver_id")
     
     result = await db.users.delete_one({
-        "_id": ObjectId(driver_id),
+        "_id": driver_oid,
         "company_id": company_id,
         "role": UserRole.DRIVER
     })
@@ -2190,8 +2244,8 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
     if not verify_password(request.password, current_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
     
-    # Fetch selected operators
-    operator_ids = [ObjectId(oid) for oid in request.operator_ids]
+    # Fetch selected operators - validate each ID
+    operator_ids = [validate_object_id(oid, "operator_id") for oid in request.operator_ids]
     operators = await db.users.find({
         "_id": {"$in": operator_ids},
         "company_id": current_user["company_id"]
@@ -2277,9 +2331,11 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can upload license photos")
     
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": ObjectId(driver_id),
+        "_id": driver_oid,
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2296,7 +2352,7 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
         update_data["license_photos_updated_at"] = datetime.utcnow()
         update_data["license_photos_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
-            {"_id": ObjectId(driver_id)},
+            {"_id": driver_oid},
             {"$set": update_data}
         )
     
@@ -2313,9 +2369,11 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     if not verify_password(verification.password, current_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
     
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": ObjectId(driver_id),
+        "_id": driver_oid,
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2336,16 +2394,18 @@ async def delete_license_photos(driver_id: str, current_user: dict = Depends(get
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can delete license photos")
     
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": ObjectId(driver_id),
+        "_id": driver_oid,
         "company_id": current_user["company_id"]
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
     await db.users.update_one(
-        {"_id": ObjectId(driver_id)},
+        {"_id": driver_oid},
         {"$unset": {
             "license_photo_front": "",
             "license_photo_back": "",
@@ -2363,9 +2423,11 @@ async def check_license_photos(driver_id: str, current_user: dict = Depends(get_
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can access license photo information")
     
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": ObjectId(driver_id),
+        "_id": driver_oid,
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2427,8 +2489,10 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
 async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user)):
     """Get a previously uploaded photo by ID"""
     try:
+        photo_oid = validate_object_id(photo_id, "photo_id")
+        
         photo = await db.temp_photos.find_one({
-            "_id": ObjectId(photo_id),
+            "_id": photo_oid,
             "company_id": current_user["company_id"]
         })
         
@@ -2853,8 +2917,10 @@ async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
 
 @api_router.get("/inspections/{inspection_id}")
 async def get_inspection(inspection_id: str, current_user: dict = Depends(get_current_user)):
+    inspection_oid = validate_object_id(inspection_id, "inspection_id")
+    
     inspection = await db.inspections.find_one({
-        "_id": ObjectId(inspection_id),
+        "_id": inspection_oid,
         "company_id": current_user["company_id"]
     })
     if not inspection:
@@ -2883,8 +2949,10 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
 
 @api_router.get("/inspections/{inspection_id}/pdf")
 async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, current_user: dict = Depends(get_current_user)):
+    inspection_oid = validate_object_id(inspection_id, "inspection_id")
+    
     inspection = await db.inspections.find_one({
-        "_id": ObjectId(inspection_id),
+        "_id": inspection_oid,
         "company_id": current_user["company_id"]
     })
     if not inspection:
@@ -2906,7 +2974,7 @@ async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, curre
         
         # Update stored PDF
         await db.inspections.update_one(
-            {"_id": ObjectId(inspection_id)},
+            {"_id": inspection_oid},
             {"$set": {"pdf_base64": pdf_base64}}
         )
         
@@ -2986,7 +3054,9 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
+    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
@@ -2995,7 +3065,7 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     
     # Update the driver's password
     await db.users.update_one(
-        {"_id": ObjectId(driver_id)},
+        {"_id": driver_oid},
         {"$set": {"password_hash": hashed_password}}
     )
     
@@ -3007,13 +3077,15 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
+    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
     update_data = {k: v for k, v in update.dict().items() if v is not None}
     if update_data:
-        await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
+        await db.users.update_one({"_id": driver_oid}, {"$set": update_data})
         
         # Check for expiring documents in background (don't block response)
         asyncio.create_task(check_driver_expiry_alerts(driver_id, current_user["company_id"]))
@@ -3026,7 +3098,9 @@ async def send_driver_credentials(driver_id: str, current_user: dict = Depends(g
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
+    driver_oid = validate_object_id(driver_id, "driver_id")
+    
+    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
@@ -3437,8 +3511,10 @@ async def get_service_record(record_id: str, current_user: dict = Depends(get_cu
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    record_oid = validate_object_id(record_id, "record_id")
+    
     record = await db.service_records.find_one({
-        "_id": ObjectId(record_id),
+        "_id": record_oid,
         "company_id": current_user["company_id"]
     })
     
@@ -3459,10 +3535,11 @@ async def update_service_record(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
+    record_oid = validate_object_id(record_id, "record_id")
     
     # Check record exists
     existing = await db.service_records.find_one({
-        "_id": ObjectId(record_id),
+        "_id": record_oid,
         "company_id": company_id
     })
     
@@ -3481,7 +3558,7 @@ async def update_service_record(
     if update_data:
         update_data["updated_at"] = datetime.utcnow()
         await db.service_records.update_one(
-            {"_id": ObjectId(record_id)},
+            {"_id": record_oid},
             {"$set": update_data}
         )
     
@@ -3493,7 +3570,7 @@ async def update_service_record(
         request.client.host if request.client else "unknown", update_data
     )
     
-    updated_record = await db.service_records.find_one({"_id": ObjectId(record_id)})
+    updated_record = await db.service_records.find_one({"_id": record_oid})
     return serialize_doc(updated_record)
 
 @api_router.delete("/service-records/{record_id}")
@@ -3503,9 +3580,10 @@ async def delete_service_record(record_id: str, request: Request, current_user: 
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
+    record_oid = validate_object_id(record_id, "record_id")
     
     result = await db.service_records.delete_one({
-        "_id": ObjectId(record_id),
+        "_id": record_oid,
         "company_id": company_id
     })
     
@@ -3526,9 +3604,10 @@ async def delete_service_record(record_id: str, request: Request, current_user: 
 async def get_service_record_pdf(record_id: str, current_user: dict = Depends(get_current_user)):
     """Generate and return PDF for a service record"""
     company_id = current_user["company_id"]
+    record_oid = validate_object_id(record_id, "record_id")
     
     record = await db.service_records.find_one({
-        "_id": ObjectId(record_id),
+        "_id": record_oid,
         "company_id": company_id
     })
     
@@ -3642,8 +3721,10 @@ async def mark_alert_read(alert_id: str, current_user: dict = Depends(get_curren
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    alert_oid = validate_object_id(alert_id, "alert_id")
+    
     await db.alerts.update_one(
-        {"_id": ObjectId(alert_id), "company_id": current_user["company_id"]},
+        {"_id": alert_oid, "company_id": current_user["company_id"]},
         {"$set": {"is_read": True}}
     )
     return {"message": "Alert marked as read"}
@@ -3844,10 +3925,11 @@ async def get_incidents(
 @api_router.get("/incidents/{incident_id}")
 async def get_incident(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Get a specific incident by ID"""
+    incident_oid = validate_object_id(incident_id, "incident_id")
     company_id = current_user["company_id"]
     
     incident = await db.incidents.find_one({
-        "_id": ObjectId(incident_id),
+        "_id": incident_oid,
         "company_id": company_id
     })
     
@@ -3855,8 +3937,11 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Incident not found")
     
     # Enrich with vehicle and driver info
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
-    driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
+    vehicle_oid = validate_object_id_optional(incident.get("vehicle_id"), "vehicle_id")
+    driver_oid = validate_object_id_optional(incident.get("driver_id"), "driver_id")
+    
+    vehicle = await db.vehicles.find_one({"_id": vehicle_oid}) if vehicle_oid else None
+    driver = await db.users.find_one({"_id": driver_oid}) if driver_oid else None
     incident["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
     incident["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
     incident["driver_name"] = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
@@ -3866,10 +3951,11 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
 @api_router.get("/incidents/{incident_id}/pdf")
 async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Generate and return PDF for an incident report"""
+    incident_oid = validate_object_id(incident_id, "incident_id")
     company_id = current_user["company_id"]
     
     incident = await db.incidents.find_one({
-        "_id": ObjectId(incident_id),
+        "_id": incident_oid,
         "company_id": company_id
     })
     
@@ -3877,8 +3963,10 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="Incident not found")
     
     # Get related info
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
-    driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
+    vehicle_oid = validate_object_id_optional(incident.get("vehicle_id"), "vehicle_id")
+    driver_oid = validate_object_id_optional(incident.get("driver_id"), "driver_id")
+    vehicle = await db.vehicles.find_one({"_id": vehicle_oid}) if vehicle_oid else None
+    driver = await db.users.find_one({"_id": driver_oid}) if driver_oid else None
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
     
     vehicle_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
@@ -3979,9 +4067,10 @@ async def update_incident(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
+    incident_oid = validate_object_id(incident_id, "incident_id")
     
     # Get existing incident to handle photo appending
-    existing = await db.incidents.find_one({"_id": ObjectId(incident_id), "company_id": company_id})
+    existing = await db.incidents.find_one({"_id": incident_oid, "company_id": company_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Incident not found")
     
@@ -4007,12 +4096,12 @@ async def update_incident(
     update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await db.incidents.update_one(
-        {"_id": ObjectId(incident_id), "company_id": company_id},
+        {"_id": incident_oid, "company_id": company_id},
         {"$set": update_data}
     )
     
     # Return updated incident
-    updated = await db.incidents.find_one({"_id": ObjectId(incident_id)})
+    updated = await db.incidents.find_one({"_id": incident_oid})
     return serialize_doc(updated)
 
 @api_router.get("/incidents/stats/summary")
@@ -4821,7 +4910,9 @@ async def get_support_request(
     current_user: dict = Depends(get_current_user)
 ):
     """Get a single support request"""
-    request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
+    request_oid = validate_object_id(request_id, "request_id")
+    
+    request = await db.support_requests.find_one({"_id": request_oid})
     
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
@@ -4860,7 +4951,9 @@ async def update_support_request(
     if current_user.get("role") not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
+    request_oid = validate_object_id(request_id, "request_id")
+    
+    request = await db.support_requests.find_one({"_id": request_oid})
     
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
@@ -4879,7 +4972,7 @@ async def update_support_request(
         update_fields["admin_response"] = update_data.admin_response
     
     await db.support_requests.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": request_oid},
         {"$set": update_fields}
     )
     
@@ -5141,7 +5234,8 @@ async def get_developer_company_details(company_id: str, key: str):
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
-        company = await db.companies.find_one({"_id": ObjectId(company_id)})
+        company_oid = validate_object_id(company_id, "company_id")
+        company = await db.companies.find_one({"_id": company_oid})
         if not company:
             raise HTTPException(status_code=404, detail="Company not found")
         
@@ -5230,8 +5324,9 @@ async def toggle_user_freeze(user_id: str, key: str, freeze: bool = True):
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
+        user_oid = validate_object_id(user_id, "user_id")
         result = await db.users.update_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             {"$set": {"is_frozen": freeze, "updated_at": datetime.now(timezone.utc)}}
         )
         
@@ -5250,9 +5345,10 @@ async def reset_user_password(user_id: str, key: str, new_password: str = "temp1
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
+        user_oid = validate_object_id(user_id, "user_id")
         hashed_password = get_password_hash(new_password)
         result = await db.users.update_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             {"$set": {
                 "password_hash": hashed_password,
                 "is_frozen": False,
