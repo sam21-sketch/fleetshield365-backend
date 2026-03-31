@@ -2825,6 +2825,7 @@ async def get_inspections(
     has_issues: Optional[bool] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    date: Optional[str] = None,  # Single date filter (sets both start and end)
     include_photos: Optional[bool] = False,
     limit: int = 100,
     current_user: dict = Depends(get_current_user)
@@ -2855,7 +2856,13 @@ async def get_inspections(
             query["new_damage"] = {"$ne": True}
             query["incident_today"] = {"$ne": True}
     
+    # Single date filter (for "today" queries from dashboard)
+    if date:
+        start_date = date
+        end_date = date
+    
     # Use Sydney timezone for date filtering (same as dashboard)
+    if start_date:
     if start_date:
         start_utc = get_sydney_date_as_utc(start_date, is_end_of_day=False)
         query["timestamp"] = {"$gte": start_utc}
