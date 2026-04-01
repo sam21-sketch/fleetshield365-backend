@@ -2863,7 +2863,6 @@ async def get_inspections(
     
     # Use Sydney timezone for date filtering (same as dashboard)
     if start_date:
-    if start_date:
         start_utc = get_sydney_date_as_utc(start_date, is_end_of_day=False)
         query["timestamp"] = {"$gte": start_utc}
     if end_date:
