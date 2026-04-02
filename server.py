@@ -1995,8 +1995,10 @@ async def get_active_vehicles_today(
     """Lightweight endpoint to get just the IDs of vehicles that had inspections today"""
     company_id = current_user["company_id"]
     
-    # Use shared Sydney timezone helper (same as dashboard)
-    today_utc, _ = get_sydney_today_range()
+    # Get company's configured timezone for accurate "today" calculation
+    company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
+    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    today_utc, _ = get_today_range_for_timezone(company_tz)
     
     # Get active vehicle IDs
     active_ids = await db.inspections.distinct("vehicle_id", {
