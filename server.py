@@ -254,6 +254,29 @@ def get_sydney_date_as_utc(date_str: str, is_end_of_day: bool = False):
         # Fallback to direct parse if format is different
         return datetime.fromisoformat(date_str)
 
+def get_date_as_utc_for_timezone(date_str: str, timezone_name: str, is_end_of_day: bool = False):
+    """Convert a date string (YYYY-MM-DD) to UTC datetime, using specified timezone.
+    Use this when clients pass date filters with company timezone."""
+    try:
+        # Parse the date
+        date_parts = date_str.split('-')
+        year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
+        
+        # Get the timezone
+        tz = get_timezone(timezone_name)
+        
+        # Create datetime in specified timezone
+        if is_end_of_day:
+            local_dt = datetime(year, month, day, 23, 59, 59, tzinfo=tz)
+        else:
+            local_dt = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
+        
+        # Convert to UTC (naive for MongoDB)
+        return local_dt.astimezone(UTC_TZ).replace(tzinfo=None)
+    except:
+        # Fallback to direct parse if format is different
+        return datetime.fromisoformat(date_str)
+
 # Universal in-memory cache for API responses
 api_cache: Dict[str, Any] = {}
 CACHE_TTL = {
@@ -1593,7 +1616,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://shield-preview-3.preview.emergentagent.com"
+    origin_url: str = "https://checkpoint-preview.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2861,12 +2884,16 @@ async def get_inspections(
         start_date = date
         end_date = date
     
-    # Use Sydney timezone for date filtering (same as dashboard)
+    # Get company's configured timezone for accurate date filtering
+    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])}, {"timezone": 1})
+    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    
+    # Use company timezone for date filtering (consistent with dashboard stats)
     if start_date:
-        start_utc = get_sydney_date_as_utc(start_date, is_end_of_day=False)
+        start_utc = get_date_as_utc_for_timezone(start_date, company_tz, is_end_of_day=False)
         query["timestamp"] = {"$gte": start_utc}
     if end_date:
-        end_utc = get_sydney_date_as_utc(end_date, is_end_of_day=True)
+        end_utc = get_date_as_utc_for_timezone(end_date, company_tz, is_end_of_day=True)
         if "timestamp" in query:
             query["timestamp"]["$lte"] = end_utc
         else:
@@ -4180,8 +4207,10 @@ async def get_dashboard_stats(
     if cached:
         return cached
     
-    # Use shared Sydney timezone helper for consistent "today" calculation
-    today_utc, _ = get_sydney_today_range()
+    # Get company's configured timezone for accurate "today" calculation
+    company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
+    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
+    today_utc, _ = get_today_range_for_timezone(company_tz)
     
     # Pre-calculate date strings
     thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()[:10]
