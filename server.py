@@ -2751,7 +2751,8 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, backgro
         "location_address": inspection.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
-        "pdf_base64": None
+        "pdf_base64": None,
+        "is_safe": not (inspection.new_damage or inspection.incident_today)
     }
     
     await db.inspections.insert_one(inspection_doc)
