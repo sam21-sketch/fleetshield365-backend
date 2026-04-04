@@ -2822,9 +2822,13 @@ async def get_inspections(
         for inspection in inspections:
             driver = driver_map.get(inspection.get("driver_id"))
             vehicle = vehicle_map.get(inspection.get("vehicle_id"))
-            inspection["driver_name"] = driver.get("name", driver.get("full_name", driver.get("email", "Unknown"))) if driver else "Unknown"
-            inspection["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
-            inspection["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+            d_name = driver.get("name", driver.get("full_name", "Unknown")) if driver else "Unknown"
+            d_user = driver.get("username", "") if driver else ""
+            inspection["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+            v_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+            v_rego = vehicle.get("registration_number", "") if vehicle else ""
+            inspection["vehicle_name"] = f"{v_name} ({v_rego})" if v_rego else v_name
+            inspection["vehicle_rego"] = v_rego or "N/A"
     
     # Optionally include photos (only when viewing single inspection detail)
     if include_photos:
@@ -2868,14 +2872,18 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
     # Add driver and vehicle info
     if inspection.get("driver_id"):
         driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
-        inspection["driver_name"] = driver.get("name", driver.get("full_name", driver.get("email", "Unknown"))) if driver else "Unknown"
+        d_name = driver.get("name", driver.get("full_name", "Unknown")) if driver else "Unknown"
+        d_user = driver.get("username", "") if driver else ""
+        inspection["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
     else:
         inspection["driver_name"] = "Unknown"
     
     if inspection.get("vehicle_id"):
         vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
-        inspection["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
-        inspection["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
+        v_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+        v_rego = vehicle.get("registration_number", "") if vehicle else ""
+        inspection["vehicle_name"] = f"{v_name} ({v_rego})" if v_rego else v_name
+        inspection["vehicle_rego"] = v_rego or "N/A"
     else:
         inspection["vehicle_name"] = "Unknown"
         inspection["vehicle_rego"] = "N/A"
@@ -2961,17 +2969,23 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     # Get vehicle names
     vehicle_ids = list(set(s["vehicle_id"] for s in submissions))
     vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids]}}).to_list(100)
-    vehicle_map = {str(v["_id"]): v["name"] for v in vehicles}
+    vehicle_map = {str(v["_id"]): f"{v['name']} ({v.get('registration_number', '')})" if v.get('registration_number') else v['name'] for v in vehicles}
     
     # Get driver names
     driver_ids = list(set(s["driver_id"] for s in submissions))
     drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(100)
-    driver_map = {str(d["_id"]): d["name"] for d in drivers}
+    driver_map = {str(d["_id"]): d for d in drivers}
     
     for s in submissions:
         s["id"] = str(s.pop("_id"))
         s["vehicle_name"] = vehicle_map.get(s["vehicle_id"], "Unknown")
-        s["driver_name"] = driver_map.get(s["driver_id"], "Unknown")
+        d = driver_map.get(s["driver_id"])
+        if d:
+            d_name = d.get("name", "Unknown")
+            d_user = d.get("username", "")
+            s["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+        else:
+            s["driver_name"] = "Unknown"
         s["has_receipt"] = True  # Indicate receipt exists but not included
     
     return submissions
@@ -3838,9 +3852,13 @@ async def get_incidents(
     for incident in incidents:
         vehicle = vehicle_map.get(incident.get("vehicle_id"))
         driver = driver_map.get(incident.get("driver_id"))
-        incident["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
-        incident["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
-        incident["driver_name"] = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+        v_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
+        v_rego = vehicle.get("registration_number", "") if vehicle else ""
+        incident["vehicle_name"] = f"{v_name} ({v_rego})" if v_rego else v_name
+        incident["vehicle_rego"] = v_rego or "N/A"
+        d_name = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+        d_user = driver.get("username", "") if driver else ""
+        incident["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
     
     return serialize_doc(incidents)
 
