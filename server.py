@@ -3086,6 +3086,8 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
         return
     
     driver_name = driver.get("name", "Unknown Driver")
+    driver_username = driver.get("username", "")
+    display_name = f"{driver_name} ({driver_username})" if driver_username and driver_username != driver_name else driver_name
     now = datetime.utcnow()
     
     # Reminder intervals: 60, 30, 14, 7 days
@@ -3114,9 +3116,9 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                         "message": {"$regex": f"{label}.*EXPIRED"}
                     })
                     if not existing:
-                        message = f"🚨 {label} for {driver_name} has EXPIRED! (was due {expiry_str})"
+                        message = f"🚨 {label} for {display_name} has EXPIRED! (was due {expiry_str})"
                         await create_alert(company_id, "driver_expiry_critical", message, driver_id=driver_id)
-                        await send_driver_expiry_email(company_id, driver_name, label, days_until, expiry_str, expired=True)
+                        await send_driver_expiry_email(company_id, display_name, label, days_until, expiry_str, expired=True)
                 
                 # Check each reminder interval
                 else:
@@ -3144,13 +3146,13 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                             existing = await db.alerts.find_one({
                                 "driver_id": driver_id,
                                 "type": alert_type,
-                                "message": {"$regex": f"{label}.*{driver_name}.*{reminder_day}"}
+                                "message": {"$regex": f"{label}.*{reminder_day}"}
                             })
                             
                             if not existing:
-                                message = f"{emoji} [{urgency}] {label} for {driver_name} expires in {days_until} days ({expiry_str})"
+                                message = f"{emoji} [{urgency}] {label} for {display_name} expires in {days_until} days ({expiry_str})"
                                 await create_alert(company_id, alert_type, message, driver_id=driver_id)
-                                await send_driver_expiry_email(company_id, driver_name, label, days_until, expiry_str)
+                                await send_driver_expiry_email(company_id, display_name, label, days_until, expiry_str)
                             
                             break  # Only create alert for the most urgent matching interval
                             
