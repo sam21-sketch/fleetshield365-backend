@@ -2962,9 +2962,15 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
     
-    # Exclude large base64 images from list query for performance
-    projection = {"receipt_photo_base64": 0}
-    submissions = await db.fuel_submissions.find(query, projection).sort("timestamp", -1).to_list(100)
+    # Exclude large base64 images from list query for performance, but include has_receipt flag
+    pipeline = [
+        {"$match": query},
+        {"$sort": {"timestamp": -1}},
+        {"$limit": 100},
+        {"$addFields": {"has_receipt": {"$cond": [{"$ifNull": ["$receipt_photo_base64", False]}, True, False]}}},
+        {"$project": {"receipt_photo_base64": 0}}
+    ]
+    submissions = await db.fuel_submissions.aggregate(pipeline).to_list(100)
     
     # Get vehicle names
     vehicle_ids = list(set(s["vehicle_id"] for s in submissions))
@@ -2986,9 +2992,25 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
             s["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
         else:
             s["driver_name"] = "Unknown"
-        s["has_receipt"] = True  # Indicate receipt exists but not included
+        s["has_receipt"] = s.get("has_receipt", False)
     
     return submissions
+
+@api_router.get("/fuel/{fuel_id}/receipt")
+async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_current_user)):
+    """Get receipt photo for a specific fuel submission"""
+    submission = await db.fuel_submissions.find_one(
+        {"_id": ObjectId(fuel_id), "company_id": current_user["company_id"]},
+        {"receipt_photo_base64": 1}
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Fuel submission not found")
+    
+    receipt = submission.get("receipt_photo_base64")
+    if not receipt:
+        raise HTTPException(status_code=404, detail="No receipt photo for this submission")
+    
+    return {"receipt_photo_base64": receipt}
 
 # ============== Driver Update Routes ==============
 
