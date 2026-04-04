@@ -2661,7 +2661,8 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "location_address": inspection.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
-        "pdf_base64": None
+        "pdf_base64": None,
+        "is_safe": not (inspection.new_damage or inspection.incident_today)
     }
     
     await db.inspections.insert_one(inspection_doc)
@@ -5353,6 +5354,23 @@ async def startup_event():
     await db.vehicles.create_index([("company_id", 1), ("safety_certificate_expiry", 1)])
     await db.vehicles.create_index([("company_id", 1), ("coi_expiry", 1)])
     logger.info("Database indexes created")
+    
+    # One-time migration: backfill is_safe for end_shift inspections missing it
+    end_shift_missing = await db.inspections.count_documents({
+        "type": "end_shift",
+        "is_safe": {"$exists": False}
+    })
+    if end_shift_missing > 0:
+        # Safe if no new_damage AND no incident_today
+        await db.inspections.update_many(
+            {"type": "end_shift", "is_safe": {"$exists": False}, "new_damage": {"$ne": True}, "incident_today": {"$ne": True}},
+            {"$set": {"is_safe": True}}
+        )
+        await db.inspections.update_many(
+            {"type": "end_shift", "is_safe": {"$exists": False}},
+            {"$set": {"is_safe": False}}
+        )
+        logger.info(f"Migration: Backfilled is_safe for {end_shift_missing} end-shift inspections")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
