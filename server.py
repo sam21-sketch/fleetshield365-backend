@@ -1556,7 +1556,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://checkpoint-preview.preview.emergentagent.com"
+    origin_url: str = "https://fleet-mgmt-stage.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
