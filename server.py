@@ -50,32 +50,6 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
-# ============== Input Validation Helpers ==============
-
-def validate_object_id(id_string: str, field_name: str = "ID") -> ObjectId:
-    """
-    Validate and convert a string to ObjectId.
-    Raises HTTPException 400 if invalid format.
-    """
-    if not id_string:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: cannot be empty")
-    try:
-        return ObjectId(id_string)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name} format: {id_string}")
-
-def validate_object_id_optional(id_string: Optional[str], field_name: str = "ID") -> Optional[ObjectId]:
-    """
-    Validate and convert an optional string to ObjectId.
-    Returns None if input is None/empty, raises HTTPException 400 if invalid format.
-    """
-    if not id_string:
-        return None
-    try:
-        return ObjectId(id_string)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name} format: {id_string}")
-
 # Timezone helpers for consistent date/time handling
 from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
@@ -254,33 +228,10 @@ def get_sydney_date_as_utc(date_str: str, is_end_of_day: bool = False):
         # Fallback to direct parse if format is different
         return datetime.fromisoformat(date_str)
 
-def get_date_as_utc_for_timezone(date_str: str, timezone_name: str, is_end_of_day: bool = False):
-    """Convert a date string (YYYY-MM-DD) to UTC datetime, using specified timezone.
-    Use this when clients pass date filters with company timezone."""
-    try:
-        # Parse the date
-        date_parts = date_str.split('-')
-        year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
-        
-        # Get the timezone
-        tz = get_timezone(timezone_name)
-        
-        # Create datetime in specified timezone
-        if is_end_of_day:
-            local_dt = datetime(year, month, day, 23, 59, 59, tzinfo=tz)
-        else:
-            local_dt = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
-        
-        # Convert to UTC (naive for MongoDB)
-        return local_dt.astimezone(UTC_TZ).replace(tzinfo=None)
-    except:
-        # Fallback to direct parse if format is different
-        return datetime.fromisoformat(date_str)
-
 # Universal in-memory cache for API responses
 api_cache: Dict[str, Any] = {}
 CACHE_TTL = {
-    "dashboard": 15,    # Dashboard stats: 15 seconds (optimized for fast loads)
+    "dashboard": 30,    # Dashboard stats: 30 seconds
     "vehicles": 30,     # Vehicles list: 30 seconds
     "drivers": 30,      # Drivers list: 30 seconds
     "inspections": 15,  # Inspections: 15 seconds (more dynamic)
@@ -656,26 +607,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        # Validate user_id format
-        try:
-            user_oid = ObjectId(user_id)
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid token: malformed user ID")
-        user = await db.users.find_one({"_id": user_oid})
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         user['id'] = str(user['_id'])
         return user
-    except HTTPException:
-        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+    except jwt.JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Authentication failed")
 
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict"""
@@ -1876,11 +1816,9 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    user_oid = validate_object_id(user_id, "user_id")
-    
     # Verify user belongs to same company
     user = await db.users.find_one({
-        "_id": user_oid,
+        "_id": ObjectId(user_id),
         "company_id": current_user["company_id"]
     })
     if not user:
@@ -1888,9 +1826,9 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
     
     update_data = {k: v for k, v in user_data.dict().items() if v is not None}
     if update_data:
-        await db.users.update_one({"_id": user_oid}, {"$set": update_data})
+        await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
     
-    updated_user = await db.users.find_one({"_id": user_oid})
+    updated_user = await db.users.find_one({"_id": ObjectId(user_id)})
     updated_user.pop("hashed_password", None)
     return serialize_doc(updated_user)
 
@@ -1903,17 +1841,15 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     if str(current_user["_id"]) == user_id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     
-    user_oid = validate_object_id(user_id, "user_id")
-    
     # Verify user belongs to same company
     user = await db.users.find_one({
-        "_id": user_oid,
+        "_id": ObjectId(user_id),
         "company_id": current_user["company_id"]
     })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    await db.users.delete_one({"_id": user_oid})
+    await db.users.delete_one({"_id": ObjectId(user_id)})
     return {"message": "User deleted"}
 
 # ============== Vehicle Routes ==============
@@ -1995,10 +1931,8 @@ async def get_active_vehicles_today(
     """Lightweight endpoint to get just the IDs of vehicles that had inspections today"""
     company_id = current_user["company_id"]
     
-    # Get company's configured timezone for accurate "today" calculation
-    company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
-    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
-    today_utc, _ = get_today_range_for_timezone(company_tz)
+    # Use shared Sydney timezone helper (same as dashboard)
+    today_utc, _ = get_sydney_today_range()
     
     # Get active vehicle IDs
     active_ids = await db.inspections.distinct("vehicle_id", {
@@ -2010,9 +1944,8 @@ async def get_active_vehicles_today(
 
 @api_router.get("/vehicles/{vehicle_id}")
 async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_user)):
-    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
     vehicle = await db.vehicles.find_one({
-        "_id": vehicle_oid,
+        "_id": ObjectId(vehicle_id),
         "company_id": current_user["company_id"]
     })
     if not vehicle:
@@ -2024,16 +1957,14 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
-    
     update_data = {k: v for k, v in update.dict().items() if v is not None}
     if update_data:
         await db.vehicles.update_one(
-            {"_id": vehicle_oid, "company_id": current_user["company_id"]},
+            {"_id": ObjectId(vehicle_id), "company_id": current_user["company_id"]},
             {"$set": update_data}
         )
     
-    vehicle = await db.vehicles.find_one({"_id": vehicle_oid})
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
     
     # Invalidate cache
     invalidate_cache("vehicles", current_user["company_id"])
@@ -2051,11 +1982,10 @@ async def delete_vehicle(vehicle_id: str, request: Request, current_user: dict =
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
     company_id = current_user["company_id"]
     
     result = await db.vehicles.delete_one({
-        "_id": vehicle_oid,
+        "_id": ObjectId(vehicle_id),
         "company_id": company_id
     })
     
@@ -2083,27 +2013,19 @@ async def assign_drivers(vehicle_id: str, assignment: DriverAssignment, request:
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    vehicle_oid = validate_object_id(vehicle_id, "vehicle_id")
-    
-    # Validate all driver IDs
-    validated_driver_ids = []
-    for driver_id in assignment.driver_ids:
-        driver_oid = validate_object_id(driver_id, "driver_id")
-        validated_driver_ids.append(driver_oid)
-    
     await db.vehicles.update_one(
-        {"_id": vehicle_oid, "company_id": current_user["company_id"]},
+        {"_id": ObjectId(vehicle_id), "company_id": current_user["company_id"]},
         {"$set": {"assigned_driver_ids": assignment.driver_ids}}
     )
     
     # Update drivers' assigned vehicles
-    for driver_oid in validated_driver_ids:
+    for driver_id in assignment.driver_ids:
         await db.users.update_one(
-            {"_id": driver_oid},
+            {"_id": ObjectId(driver_id)},
             {"$addToSet": {"assigned_vehicles": vehicle_id}}
         )
     
-    vehicle = await db.vehicles.find_one({"_id": vehicle_oid})
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
     return serialize_doc(vehicle)
 
 # ============== Driver Routes ==============
@@ -2223,10 +2145,9 @@ async def delete_driver(driver_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
-    driver_oid = validate_object_id(driver_id, "driver_id")
     
     result = await db.users.delete_one({
-        "_id": driver_oid,
+        "_id": ObjectId(driver_id),
         "company_id": company_id,
         "role": UserRole.DRIVER
     })
@@ -2269,8 +2190,8 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
     if not verify_password(request.password, current_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
     
-    # Fetch selected operators - validate each ID
-    operator_ids = [validate_object_id(oid, "operator_id") for oid in request.operator_ids]
+    # Fetch selected operators
+    operator_ids = [ObjectId(oid) for oid in request.operator_ids]
     operators = await db.users.find({
         "_id": {"$in": operator_ids},
         "company_id": current_user["company_id"]
@@ -2356,11 +2277,9 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can upload license photos")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": driver_oid,
+        "_id": ObjectId(driver_id),
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2377,7 +2296,7 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
         update_data["license_photos_updated_at"] = datetime.utcnow()
         update_data["license_photos_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
-            {"_id": driver_oid},
+            {"_id": ObjectId(driver_id)},
             {"$set": update_data}
         )
     
@@ -2394,11 +2313,9 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     if not verify_password(verification.password, current_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": driver_oid,
+        "_id": ObjectId(driver_id),
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2419,18 +2336,16 @@ async def delete_license_photos(driver_id: str, current_user: dict = Depends(get
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can delete license photos")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": driver_oid,
+        "_id": ObjectId(driver_id),
         "company_id": current_user["company_id"]
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
     await db.users.update_one(
-        {"_id": driver_oid},
+        {"_id": ObjectId(driver_id)},
         {"$unset": {
             "license_photo_front": "",
             "license_photo_back": "",
@@ -2448,11 +2363,9 @@ async def check_license_photos(driver_id: str, current_user: dict = Depends(get_
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can access license photo information")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
-        "_id": driver_oid,
+        "_id": ObjectId(driver_id),
         "company_id": current_user["company_id"]
     })
     if not driver:
@@ -2514,10 +2427,8 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
 async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user)):
     """Get a previously uploaded photo by ID"""
     try:
-        photo_oid = validate_object_id(photo_id, "photo_id")
-        
         photo = await db.temp_photos.find_one({
-            "_id": photo_oid,
+            "_id": ObjectId(photo_id),
             "company_id": current_user["company_id"]
         })
         
@@ -2541,7 +2452,7 @@ async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user
 # ============== Inspection Routes ==============
 
 @api_router.post("/inspections/prestart")
-async def create_prestart(inspection: PrestartCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(get_current_user)):
     # Get vehicle
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
@@ -2651,9 +2562,8 @@ async def create_prestart(inspection: PrestartCreate, request: Request, backgrou
                 "base64_data": photo.base64_data
             })
         
-        # Send notifications to admins WITH PHOTOS (in background for faster response)
-        background_tasks.add_task(
-            notify_admins_with_photos,
+        # Send notifications to admins WITH PHOTOS
+        await notify_admins_with_photos(
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
@@ -2687,7 +2597,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, backgrou
     return serialize_doc(inspection_doc)
 
 @api_router.post("/inspections/end-shift")
-async def create_end_shift(inspection: EndShiftCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+async def create_end_shift(inspection: EndShiftCreate, request: Request, current_user: dict = Depends(get_current_user)):
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -2751,8 +2661,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, backgro
         "location_address": inspection.location_address,
         "timestamp": datetime.utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
-        "pdf_base64": None,
-        "is_safe": not (inspection.new_damage or inspection.incident_today)
+        "pdf_base64": None
     }
     
     await db.inspections.insert_one(inspection_doc)
@@ -2796,9 +2705,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, backgro
         if inspection.incident_today:
             issue_summary += f" | Incident: {inspection.incident_comment or 'See photos'}"
         
-        # Send notifications in background for faster response
-        background_tasks.add_task(
-            notify_admins_with_photos,
+        await notify_admins_with_photos(
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
@@ -2824,9 +2731,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, backgro
                 "base64_data": photo.base64_data
             })
         
-        # Send notifications in background for faster response
-        background_tasks.add_task(
-            notify_admins_with_photos,
+        await notify_admins_with_photos(
             current_user["company_id"],
             vehicle['name'],
             current_user.get('name', current_user.get('full_name', 'Driver')),
@@ -2851,7 +2756,6 @@ async def get_inspections(
     has_issues: Optional[bool] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    date: Optional[str] = None,  # Single date filter (sets both start and end)
     include_photos: Optional[bool] = False,
     limit: int = 100,
     current_user: dict = Depends(get_current_user)
@@ -2882,21 +2786,12 @@ async def get_inspections(
             query["new_damage"] = {"$ne": True}
             query["incident_today"] = {"$ne": True}
     
-    # Single date filter (for "today" queries from dashboard)
-    if date:
-        start_date = date
-        end_date = date
-    
-    # Get company's configured timezone for accurate date filtering
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])}, {"timezone": 1})
-    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
-    
-    # Use company timezone for date filtering (consistent with dashboard stats)
+    # Use Sydney timezone for date filtering (same as dashboard)
     if start_date:
-        start_utc = get_date_as_utc_for_timezone(start_date, company_tz, is_end_of_day=False)
+        start_utc = get_sydney_date_as_utc(start_date, is_end_of_day=False)
         query["timestamp"] = {"$gte": start_utc}
     if end_date:
-        end_utc = get_date_as_utc_for_timezone(end_date, company_tz, is_end_of_day=True)
+        end_utc = get_sydney_date_as_utc(end_date, is_end_of_day=True)
         if "timestamp" in query:
             query["timestamp"]["$lte"] = end_utc
         else:
@@ -2958,10 +2853,8 @@ async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
 
 @api_router.get("/inspections/{inspection_id}")
 async def get_inspection(inspection_id: str, current_user: dict = Depends(get_current_user)):
-    inspection_oid = validate_object_id(inspection_id, "inspection_id")
-    
     inspection = await db.inspections.find_one({
-        "_id": inspection_oid,
+        "_id": ObjectId(inspection_id),
         "company_id": current_user["company_id"]
     })
     if not inspection:
@@ -2990,10 +2883,8 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
 
 @api_router.get("/inspections/{inspection_id}/pdf")
 async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, current_user: dict = Depends(get_current_user)):
-    inspection_oid = validate_object_id(inspection_id, "inspection_id")
-    
     inspection = await db.inspections.find_one({
-        "_id": inspection_oid,
+        "_id": ObjectId(inspection_id),
         "company_id": current_user["company_id"]
     })
     if not inspection:
@@ -3015,7 +2906,7 @@ async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, curre
         
         # Update stored PDF
         await db.inspections.update_one(
-            {"_id": inspection_oid},
+            {"_id": ObjectId(inspection_id)},
             {"$set": {"pdf_base64": pdf_base64}}
         )
         
@@ -3074,7 +2965,7 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     # Get driver names
     driver_ids = list(set(s["driver_id"] for s in submissions))
     drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(100)
-    driver_map = {str(d["_id"]): d.get("name", d.get("email", "Unknown")) for d in drivers}
+    driver_map = {str(d["_id"]): d["name"] for d in drivers}
     
     for s in submissions:
         s["id"] = str(s.pop("_id"))
@@ -3095,9 +2986,7 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
-    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
+    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
@@ -3106,7 +2995,7 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     
     # Update the driver's password
     await db.users.update_one(
-        {"_id": driver_oid},
+        {"_id": ObjectId(driver_id)},
         {"$set": {"password_hash": hashed_password}}
     )
     
@@ -3118,15 +3007,13 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
-    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
+    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
     update_data = {k: v for k, v in update.dict().items() if v is not None}
     if update_data:
-        await db.users.update_one({"_id": driver_oid}, {"$set": update_data})
+        await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
         
         # Check for expiring documents in background (don't block response)
         asyncio.create_task(check_driver_expiry_alerts(driver_id, current_user["company_id"]))
@@ -3139,9 +3026,7 @@ async def send_driver_credentials(driver_id: str, current_user: dict = Depends(g
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    driver_oid = validate_object_id(driver_id, "driver_id")
-    
-    driver = await db.users.find_one({"_id": driver_oid, "company_id": current_user["company_id"]})
+    driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
@@ -3552,10 +3437,8 @@ async def get_service_record(record_id: str, current_user: dict = Depends(get_cu
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    record_oid = validate_object_id(record_id, "record_id")
-    
     record = await db.service_records.find_one({
-        "_id": record_oid,
+        "_id": ObjectId(record_id),
         "company_id": current_user["company_id"]
     })
     
@@ -3576,11 +3459,10 @@ async def update_service_record(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
-    record_oid = validate_object_id(record_id, "record_id")
     
     # Check record exists
     existing = await db.service_records.find_one({
-        "_id": record_oid,
+        "_id": ObjectId(record_id),
         "company_id": company_id
     })
     
@@ -3599,7 +3481,7 @@ async def update_service_record(
     if update_data:
         update_data["updated_at"] = datetime.utcnow()
         await db.service_records.update_one(
-            {"_id": record_oid},
+            {"_id": ObjectId(record_id)},
             {"$set": update_data}
         )
     
@@ -3611,7 +3493,7 @@ async def update_service_record(
         request.client.host if request.client else "unknown", update_data
     )
     
-    updated_record = await db.service_records.find_one({"_id": record_oid})
+    updated_record = await db.service_records.find_one({"_id": ObjectId(record_id)})
     return serialize_doc(updated_record)
 
 @api_router.delete("/service-records/{record_id}")
@@ -3621,10 +3503,9 @@ async def delete_service_record(record_id: str, request: Request, current_user: 
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
-    record_oid = validate_object_id(record_id, "record_id")
     
     result = await db.service_records.delete_one({
-        "_id": record_oid,
+        "_id": ObjectId(record_id),
         "company_id": company_id
     })
     
@@ -3645,10 +3526,9 @@ async def delete_service_record(record_id: str, request: Request, current_user: 
 async def get_service_record_pdf(record_id: str, current_user: dict = Depends(get_current_user)):
     """Generate and return PDF for a service record"""
     company_id = current_user["company_id"]
-    record_oid = validate_object_id(record_id, "record_id")
     
     record = await db.service_records.find_one({
-        "_id": record_oid,
+        "_id": ObjectId(record_id),
         "company_id": company_id
     })
     
@@ -3762,10 +3642,8 @@ async def mark_alert_read(alert_id: str, current_user: dict = Depends(get_curren
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    alert_oid = validate_object_id(alert_id, "alert_id")
-    
     await db.alerts.update_one(
-        {"_id": alert_oid, "company_id": current_user["company_id"]},
+        {"_id": ObjectId(alert_id), "company_id": current_user["company_id"]},
         {"$set": {"is_read": True}}
     )
     return {"message": "Alert marked as read"}
@@ -3966,11 +3844,10 @@ async def get_incidents(
 @api_router.get("/incidents/{incident_id}")
 async def get_incident(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Get a specific incident by ID"""
-    incident_oid = validate_object_id(incident_id, "incident_id")
     company_id = current_user["company_id"]
     
     incident = await db.incidents.find_one({
-        "_id": incident_oid,
+        "_id": ObjectId(incident_id),
         "company_id": company_id
     })
     
@@ -3978,11 +3855,8 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Incident not found")
     
     # Enrich with vehicle and driver info
-    vehicle_oid = validate_object_id_optional(incident.get("vehicle_id"), "vehicle_id")
-    driver_oid = validate_object_id_optional(incident.get("driver_id"), "driver_id")
-    
-    vehicle = await db.vehicles.find_one({"_id": vehicle_oid}) if vehicle_oid else None
-    driver = await db.users.find_one({"_id": driver_oid}) if driver_oid else None
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
+    driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
     incident["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
     incident["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
     incident["driver_name"] = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
@@ -3992,11 +3866,10 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
 @api_router.get("/incidents/{incident_id}/pdf")
 async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Generate and return PDF for an incident report"""
-    incident_oid = validate_object_id(incident_id, "incident_id")
     company_id = current_user["company_id"]
     
     incident = await db.incidents.find_one({
-        "_id": incident_oid,
+        "_id": ObjectId(incident_id),
         "company_id": company_id
     })
     
@@ -4004,10 +3877,8 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="Incident not found")
     
     # Get related info
-    vehicle_oid = validate_object_id_optional(incident.get("vehicle_id"), "vehicle_id")
-    driver_oid = validate_object_id_optional(incident.get("driver_id"), "driver_id")
-    vehicle = await db.vehicles.find_one({"_id": vehicle_oid}) if vehicle_oid else None
-    driver = await db.users.find_one({"_id": driver_oid}) if driver_oid else None
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident["vehicle_id"])})
+    driver = await db.users.find_one({"_id": ObjectId(incident["driver_id"])})
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
     
     vehicle_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
@@ -4108,10 +3979,9 @@ async def update_incident(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
-    incident_oid = validate_object_id(incident_id, "incident_id")
     
     # Get existing incident to handle photo appending
-    existing = await db.incidents.find_one({"_id": incident_oid, "company_id": company_id})
+    existing = await db.incidents.find_one({"_id": ObjectId(incident_id), "company_id": company_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Incident not found")
     
@@ -4137,12 +4007,12 @@ async def update_incident(
     update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await db.incidents.update_one(
-        {"_id": incident_oid, "company_id": company_id},
+        {"_id": ObjectId(incident_id), "company_id": company_id},
         {"$set": update_data}
     )
     
     # Return updated incident
-    updated = await db.incidents.find_one({"_id": incident_oid})
+    updated = await db.incidents.find_one({"_id": ObjectId(incident_id)})
     return serialize_doc(updated)
 
 @api_router.get("/incidents/stats/summary")
@@ -4197,23 +4067,14 @@ async def get_dashboard_stats(
     current_user: dict = Depends(get_current_user),
     tz_offset: int = 0  # Kept for backwards compatibility, but ignored
 ):
-    """
-    OPTIMIZED: Dashboard stats with smart caching and efficient queries.
-    - 15-second cache for fast page loads (cache is invalidated on data changes)
-    - Single aggregation pipeline where possible
-    - All queries run in parallel
-    """
     company_id = current_user["company_id"]
     
-    # Check cache first (15-second TTL for dashboard - balances freshness with performance)
-    cached = get_cached("dashboard", company_id)
-    if cached:
-        return cached
+    # NOTE: Cache disabled to ensure fresh "Active Today" counts
+    # The 30-second cache was causing mismatches between dashboard cards
+    # and filtered pages that make fresh API calls
     
-    # Get company's configured timezone for accurate "today" calculation
-    company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
-    company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
-    today_utc, _ = get_today_range_for_timezone(company_tz)
+    # Use shared Sydney timezone helper for consistent "today" calculation
+    today_utc, _ = get_sydney_today_range()
     
     # Pre-calculate date strings
     thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()[:10]
@@ -4221,79 +4082,10 @@ async def get_dashboard_stats(
     today_str = datetime.utcnow().isoformat()[:10]
     month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
-    # OPTIMIZED: Use aggregation pipeline for vehicle stats (single query instead of 6)
-    vehicle_stats_pipeline = [
-        {"$match": {"company_id": company_id}},
-        {"$facet": {
-            "total": [{"$count": "count"}],
-            "existing_ids": [{"$project": {"_id": 1}}],
-            "needing_attention": [
-                {"$match": {"$or": [
-                    {"rego_expiry": {"$lte": thirty_days}},
-                    {"insurance_expiry": {"$lte": thirty_days}},
-                    {"safety_certificate_expiry": {"$lte": thirty_days}},
-                    {"coi_expiry": {"$lte": thirty_days}},
-                ]}},
-                {"$count": "count"}
-            ],
-            "rego_expiring": [
-                {"$match": {"rego_expiry": {"$lte": thirty_days, "$gte": today_str}}},
-                {"$project": {"name": 1, "rego_expiry": 1}}
-            ],
-            "insurance_expiring": [
-                {"$match": {"insurance_expiry": {"$lte": thirty_days, "$gte": today_str}}},
-                {"$project": {"name": 1, "insurance_expiry": 1}}
-            ],
-            "safety_cert_expiring": [
-                {"$match": {"safety_certificate_expiry": {"$lte": thirty_days, "$gte": today_str}}},
-                {"$count": "count"}
-            ],
-            "coi_expiring": [
-                {"$match": {"coi_expiry": {"$lte": thirty_days, "$gte": today_str}}},
-                {"$project": {"name": 1, "coi_expiry": 1}}
-            ]
-        }}
-    ]
-    
-    # OPTIMIZED: Use aggregation for driver expiry counts (instead of loading all drivers)
-    driver_stats_pipeline = [
-        {"$match": {"company_id": company_id, "role": UserRole.DRIVER}},
-        {"$facet": {
-            "total": [{"$count": "count"}],
-            "license_expired": [
-                {"$match": {"license_expiry": {"$lt": today_str, "$ne": "NA", "$ne": "na"}}},
-                {"$count": "count"}
-            ],
-            "license_expiring": [
-                {"$match": {"license_expiry": {"$gte": today_str, "$lte": sixty_days, "$ne": "NA", "$ne": "na"}}},
-                {"$count": "count"}
-            ],
-            "training_expired": [
-                {"$match": {"$or": [
-                    {"medical_certificate_expiry": {"$lt": today_str, "$ne": "NA", "$ne": "na"}},
-                    {"first_aid_expiry": {"$lt": today_str, "$ne": "NA", "$ne": "na"}},
-                    {"forklift_license_expiry": {"$lt": today_str, "$ne": "NA", "$ne": "na"}},
-                    {"dangerous_goods_expiry": {"$lt": today_str, "$ne": "NA", "$ne": "na"}}
-                ]}},
-                {"$count": "count"}
-            ],
-            "training_expiring": [
-                {"$match": {"$or": [
-                    {"medical_certificate_expiry": {"$gte": today_str, "$lte": sixty_days, "$ne": "NA", "$ne": "na"}},
-                    {"first_aid_expiry": {"$gte": today_str, "$lte": sixty_days, "$ne": "NA", "$ne": "na"}},
-                    {"forklift_license_expiry": {"$gte": today_str, "$lte": sixty_days, "$ne": "NA", "$ne": "na"}},
-                    {"dangerous_goods_expiry": {"$gte": today_str, "$lte": sixty_days, "$ne": "NA", "$ne": "na"}}
-                ]}},
-                {"$count": "count"}
-            ]
-        }}
-    ]
-    
-    # Run all queries in parallel (reduced from 15+ queries to 6)
+    # Run all queries in parallel for better performance
     results = await asyncio.gather(
-        # Vehicle aggregation (combines 6 queries into 1)
-        db.vehicles.aggregate(vehicle_stats_pipeline).to_list(1),
-        # Inspection counts for today
+        # Basic counts
+        db.vehicles.count_documents({"company_id": company_id}),
         db.inspections.count_documents({"company_id": company_id, "timestamp": {"$gte": today_utc}}),
         db.inspections.distinct("vehicle_id", {"company_id": company_id, "timestamp": {"$gte": today_utc}}),
         # Issues today: is_safe=False OR new_damage=True OR incident_today=True
@@ -4306,64 +4098,72 @@ async def get_dashboard_stats(
                 {"incident_today": True}
             ]
         }),
-        # Fuel this month
-        db.fuel_submissions.aggregate([
-            {"$match": {"company_id": company_id, "timestamp": {"$gte": month_start}}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1),
-        # Unread alerts
+        # Vehicles needing attention: expired or expiring within 30 days (any doc type)
+        db.vehicles.count_documents({"company_id": company_id, "$or": [
+            {"rego_expiry": {"$lte": thirty_days}},
+            {"insurance_expiry": {"$lte": thirty_days}},
+            {"safety_certificate_expiry": {"$lte": thirty_days}},
+            {"coi_expiry": {"$lte": thirty_days}},
+        ]}),
+        # Expiry counts
+        db.vehicles.count_documents({"company_id": company_id, "rego_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "safety_certificate_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        db.vehicles.count_documents({"company_id": company_id, "coi_expiry": {"$lte": thirty_days, "$gte": today_str}}),
+        # Vehicle names with expiring items
+        db.vehicles.find({"company_id": company_id, "rego_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "rego_expiry": 1, "_id": 0}).to_list(10),
+        db.vehicles.find({"company_id": company_id, "insurance_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "insurance_expiry": 1, "_id": 0}).to_list(10),
+        db.vehicles.find({"company_id": company_id, "coi_expiry": {"$lte": thirty_days, "$gte": today_str}}, {"name": 1, "coi_expiry": 1, "_id": 0}).to_list(10),
+        # Fuel and alerts
+        db.fuel_submissions.aggregate([{"$match": {"company_id": company_id, "timestamp": {"$gte": month_start}}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]).to_list(1),
         db.alerts.count_documents({"company_id": company_id, "is_read": False}),
-        # Driver aggregation (combines loading all drivers + looping into 1 query)
-        db.users.aggregate(driver_stats_pipeline).to_list(1),
+        # Drivers
+        db.users.find({"company_id": company_id, "role": UserRole.DRIVER}).to_list(1000),
     )
     
     # Unpack results
-    vehicle_stats = results[0][0] if results[0] else {}
-    inspections_today = results[1]
-    active_today_raw = results[2]
-    issues_today = results[3]
-    fuel_result = results[4]
-    unread_alerts = results[5]
-    driver_stats = results[6][0] if results[6] else {}
+    total_vehicles, inspections_today, active_today_raw, issues_today, vehicles_needing_attention, \
+    upcoming_rego, upcoming_insurance, upcoming_safety_cert, upcoming_coi, \
+    rego_expiring_vehicles, insurance_expiring_vehicles, coi_expiring_vehicles, \
+    fuel_result, unread_alerts, drivers = results
     
-    # Helper to safely extract count from facet results
-    def get_facet_count(facet_result, default=0):
-        if facet_result and len(facet_result) > 0:
-            return facet_result[0].get("count", default)
-        return default
-    
-    # Extract vehicle stats
-    total_vehicles = get_facet_count(vehicle_stats.get("total", []))
-    existing_vehicle_ids = [str(v["_id"]) for v in vehicle_stats.get("existing_ids", [])]
-    vehicles_needing_attention = get_facet_count(vehicle_stats.get("needing_attention", []))
-    
-    rego_expiring = vehicle_stats.get("rego_expiring", [])
-    insurance_expiring = vehicle_stats.get("insurance_expiring", [])
-    coi_expiring = vehicle_stats.get("coi_expiring", [])
-    upcoming_safety_cert = get_facet_count(vehicle_stats.get("safety_cert_expiring", []))
-    
-    upcoming_rego = len(rego_expiring)
-    upcoming_insurance = len(insurance_expiring)
-    upcoming_coi = len(coi_expiring)
+    # Get actual existing vehicle IDs to filter out deleted vehicles from active_today
+    existing_vehicle_ids = await db.vehicles.distinct("_id", {"company_id": company_id})
+    existing_vehicle_id_strs = [str(vid) for vid in existing_vehicle_ids]
     
     # Filter active_today to only include vehicles that still exist
-    active_today = [vid for vid in active_today_raw if vid in existing_vehicle_ids]
+    active_today = [vid for vid in active_today_raw if vid in existing_vehicle_id_strs]
     
     # Calculate derived values
     inspections_missed = max(0, total_vehicles - len(active_today))
     expiring_soon = upcoming_rego + upcoming_insurance + upcoming_safety_cert + upcoming_coi
     fuel_this_month = fuel_result[0]["total"] if fuel_result else 0
     
-    # Extract driver stats
-    total_drivers = get_facet_count(driver_stats.get("total", []))
-    drivers_license_expired = get_facet_count(driver_stats.get("license_expired", []))
-    drivers_license_expiring = get_facet_count(driver_stats.get("license_expiring", []))
-    drivers_training_expired = get_facet_count(driver_stats.get("training_expired", []))
-    drivers_training_expiring = get_facet_count(driver_stats.get("training_expiring", []))
+    # Process driver expiries
+    drivers_license_expiring = 0
+    drivers_license_expired = 0
+    drivers_training_expiring = 0
+    drivers_training_expired = 0
+    
+    for driver in drivers:
+        license_exp = driver.get("license_expiry")
+        if license_exp and license_exp.upper() != "NA":
+            if license_exp < today_str:
+                drivers_license_expired += 1
+            elif license_exp <= sixty_days:
+                drivers_license_expiring += 1
+        
+        for field in ["medical_certificate_expiry", "first_aid_expiry", "forklift_license_expiry", "dangerous_goods_expiry"]:
+            exp = driver.get(field)
+            if exp and exp.upper() != "NA":
+                if exp < today_str:
+                    drivers_training_expired += 1
+                elif exp <= sixty_days:
+                    drivers_training_expiring += 1
     
     result = {
         "total_vehicles": total_vehicles,
-        "total_drivers": total_drivers,
+        "total_drivers": len(drivers),
         "inspections_today": inspections_today,
         "inspections_missed": inspections_missed,
         "issues_today": issues_today,
@@ -4376,9 +4176,9 @@ async def get_dashboard_stats(
         "upcoming_insurance_expiry": upcoming_insurance,
         "upcoming_safety_cert_expiry": upcoming_safety_cert,
         "upcoming_coi_expiry": upcoming_coi,
-        "rego_expiring_vehicles": [{"name": v.get("name"), "rego_expiry": v.get("rego_expiry")} for v in rego_expiring[:10]],
-        "insurance_expiring_vehicles": [{"name": v.get("name"), "insurance_expiry": v.get("insurance_expiry")} for v in insurance_expiring[:10]],
-        "coi_expiring_vehicles": [{"name": v.get("name"), "coi_expiry": v.get("coi_expiry")} for v in coi_expiring[:10]],
+        "rego_expiring_vehicles": rego_expiring_vehicles,
+        "insurance_expiring_vehicles": insurance_expiring_vehicles,
+        "coi_expiring_vehicles": coi_expiring_vehicles,
         "unread_alerts": unread_alerts,
         "drivers_license_expiring": drivers_license_expiring,
         "drivers_license_expired": drivers_license_expired,
@@ -4386,8 +4186,8 @@ async def get_dashboard_stats(
         "drivers_training_expired": drivers_training_expired,
     }
     
-    # Cache for 15 seconds (invalidated on data changes via invalidate_cache calls)
-    set_cached("dashboard", company_id, result)
+    # NOTE: Caching disabled to ensure fresh data consistency
+    # set_cached_stats(company_id, result)
     
     return result
 
@@ -5021,9 +4821,7 @@ async def get_support_request(
     current_user: dict = Depends(get_current_user)
 ):
     """Get a single support request"""
-    request_oid = validate_object_id(request_id, "request_id")
-    
-    request = await db.support_requests.find_one({"_id": request_oid})
+    request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
     
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
@@ -5062,9 +4860,7 @@ async def update_support_request(
     if current_user.get("role") not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    request_oid = validate_object_id(request_id, "request_id")
-    
-    request = await db.support_requests.find_one({"_id": request_oid})
+    request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
     
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
@@ -5083,7 +4879,7 @@ async def update_support_request(
         update_fields["admin_response"] = update_data.admin_response
     
     await db.support_requests.update_one(
-        {"_id": request_oid},
+        {"_id": ObjectId(request_id)},
         {"$set": update_fields}
     )
     
@@ -5345,8 +5141,7 @@ async def get_developer_company_details(company_id: str, key: str):
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
-        company_oid = validate_object_id(company_id, "company_id")
-        company = await db.companies.find_one({"_id": company_oid})
+        company = await db.companies.find_one({"_id": ObjectId(company_id)})
         if not company:
             raise HTTPException(status_code=404, detail="Company not found")
         
@@ -5435,9 +5230,8 @@ async def toggle_user_freeze(user_id: str, key: str, freeze: bool = True):
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
-        user_oid = validate_object_id(user_id, "user_id")
         result = await db.users.update_one(
-            {"_id": user_oid},
+            {"_id": ObjectId(user_id)},
             {"$set": {"is_frozen": freeze, "updated_at": datetime.now(timezone.utc)}}
         )
         
@@ -5456,10 +5250,9 @@ async def reset_user_password(user_id: str, key: str, new_password: str = "temp1
         raise HTTPException(status_code=403, detail="Invalid developer key")
     
     try:
-        user_oid = validate_object_id(user_id, "user_id")
         hashed_password = get_password_hash(new_password)
         result = await db.users.update_one(
-            {"_id": user_oid},
+            {"_id": ObjectId(user_id)},
             {"$set": {
                 "password_hash": hashed_password,
                 "is_frozen": False,
