@@ -4024,7 +4024,9 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     
     vehicle_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
     vehicle_rego = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
-    driver_name = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+    d_name = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+    d_user = driver.get("username", "") if driver else ""
+    driver_name = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
     company_name = company.get("name", "FleetShield365") if company else "FleetShield365"
     company_tz = company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
     tz_display = company_tz.split('/')[-1].replace('_', ' ')
@@ -4090,9 +4092,63 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         elements.append(Paragraph(incident.get("admin_notes", ""), styles['Normal']))
         elements.append(Spacer(1, 15))
     
+    # Police report
+    if incident.get("police_report_number"):
+        elements.append(Paragraph(f"<b>Police Report #:</b> {incident.get('police_report_number')}", styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
     # Insurance info
     if incident.get("insurance_claim_number"):
         elements.append(Paragraph(f"<b>Insurance Claim #:</b> {incident.get('insurance_claim_number')}", styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Injuries
+    if incident.get("injuries_occurred"):
+        injury_style = ParagraphStyle('Injury', parent=styles['Normal'], textColor=colors.red)
+        elements.append(Paragraph("<b>⚠ INJURIES REPORTED</b>", injury_style))
+        elements.append(Paragraph(incident.get("injury_description", "No details provided"), styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Resolution details
+    if incident.get("resolution_details"):
+        elements.append(Paragraph("<b>Resolution Details:</b>", styles['Normal']))
+        elements.append(Paragraph(incident.get("resolution_details", ""), styles['Normal']))
+        elements.append(Spacer(1, 15))
+    
+    # Photos
+    photo_sections = [
+        ("Damage Photos", incident.get("damage_photos", [])),
+        ("Other Vehicle Photos", incident.get("other_vehicle_photos", [])),
+        ("Scene Photos", incident.get("scene_photos", [])),
+    ]
+    
+    has_any_photos = any(photos for _, photos in photo_sections)
+    if has_any_photos:
+        elements.append(Paragraph("<b>Photo Evidence:</b>", styles['Normal']))
+        elements.append(Spacer(1, 8))
+        
+        for section_name, photos in photo_sections:
+            if photos:
+                elements.append(Paragraph(f"<i>{section_name} ({len(photos)})</i>", styles['Normal']))
+                elements.append(Spacer(1, 5))
+                for i, photo_data in enumerate(photos):
+                    try:
+                        if isinstance(photo_data, str) and photo_data.startswith('data:'):
+                            img_data = photo_data.split(',', 1)[1]
+                        elif isinstance(photo_data, str):
+                            img_data = photo_data
+                        else:
+                            continue
+                        
+                        img_bytes = base64.b64decode(img_data)
+                        img_buffer = BytesIO(img_bytes)
+                        img = RLImage(img_buffer, width=250, height=180)
+                        elements.append(img)
+                        elements.append(Spacer(1, 10))
+                    except Exception as e:
+                        elements.append(Paragraph(f"[Photo {i+1} could not be rendered]", styles['Normal']))
+                        elements.append(Spacer(1, 5))
+        
         elements.append(Spacer(1, 15))
     
     # Footer
