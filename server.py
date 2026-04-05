@@ -3061,8 +3061,8 @@ async def export_fuel_csv(
     
     # Header
     writer.writerow([
-        "Date", "Time", "Driver", "Vehicle", "Fuel Type", "Litres", 
-        "Cost ($)", "Odometer (km)", "Station", "Has Receipt"
+        "Date", "Time", "Driver", "Vehicle", "Notes", "Litres", 
+        "Cost ($)", "Price/L ($)", "Odometer (km)", "Station", "Has Receipt"
     ])
     
     # Data rows
@@ -3086,9 +3086,10 @@ async def export_fuel_csv(
             time_str,
             driver_map.get(s.get("driver_id", ""), "Unknown"),
             vehicle_map.get(s.get("vehicle_id", ""), "Unknown"),
-            s.get("fuel_type", ""),
-            s.get("litres", ""),
-            s.get("total_cost", ""),
+            s.get("notes", ""),
+            s.get("liters", s.get("litres", "")),
+            s.get("amount", s.get("total_cost", "")),
+            s.get("price_per_liter", ""),
             s.get("odometer", ""),
             s.get("fuel_station", ""),
             "Yes" if s.get("receipt_photo_base64") is not None or s.get("has_receipt") else "No"
@@ -3982,6 +3983,108 @@ async def get_incidents(
     
     return serialize_doc(incidents)
 
+@api_router.get("/incidents/export/csv")
+async def export_incidents_csv(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Export incidents to CSV"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    import csv
+    from io import StringIO
+    from starlette.responses import StreamingResponse
+    
+    company_id = current_user["company_id"]
+    query: dict = {"company_id": company_id}
+    
+    if status:
+        query["status"] = status
+    if severity:
+        query["severity"] = severity
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to + "T23:59:59"
+        query["created_at"] = date_filter
+    
+    incidents = await db.incidents.find(query, {"_id": 0, "damage_photos": 0, "scene_photos": 0, "other_vehicle_photos": 0}).sort("created_at", -1).to_list(10000)
+    
+    # Maps
+    vehicle_ids = list(set(i.get("vehicle_id") for i in incidents if i.get("vehicle_id")))
+    driver_ids = list(set(i.get("driver_id") for i in incidents if i.get("driver_id")))
+    vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(v) for v in vehicle_ids]}}).to_list(1000) if vehicle_ids else []
+    drivers = await db.users.find({"_id": {"$in": [ObjectId(d) for d in driver_ids]}}).to_list(1000) if driver_ids else []
+    
+    vehicle_map = {}
+    for v in vehicles:
+        v_name = v.get("name", "Unknown")
+        v_rego = v.get("registration_number", "")
+        vehicle_map[str(v["_id"])] = f"{v_name} ({v_rego})" if v_rego else v_name
+    
+    driver_map = {}
+    for d in drivers:
+        d_name = d.get("name", "Unknown")
+        d_user = d.get("username", "")
+        driver_map[str(d["_id"])] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    writer.writerow([
+        "Date", "Time", "Driver", "Vehicle", "Severity", "Status",
+        "Description", "Location", "Police Report #", "Insurance Claim #",
+        "Injuries", "Injury Description", "Other Party Name", "Other Party Phone",
+        "Other Party Rego", "Damage Photos", "Scene Photos", "Other Vehicle Photos"
+    ])
+    
+    for inc in incidents:
+        ts = inc.get("created_at", "")
+        try:
+            from datetime import datetime as dt
+            parsed = dt.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else ts
+            date_str = parsed.strftime("%Y-%m-%d")
+            time_str = parsed.strftime("%H:%M")
+        except Exception:
+            date_str = str(ts)[:10]
+            time_str = str(ts)[11:16]
+        
+        writer.writerow([
+            date_str,
+            time_str,
+            driver_map.get(inc.get("driver_id", ""), "Unknown"),
+            vehicle_map.get(inc.get("vehicle_id", ""), "Unknown"),
+            inc.get("severity", "").title(),
+            inc.get("status", "").replace("_", " ").title(),
+            inc.get("description", ""),
+            inc.get("location_address", ""),
+            inc.get("police_report_number", ""),
+            inc.get("insurance_claim_number", ""),
+            "Yes" if inc.get("injuries_occurred") else "No",
+            inc.get("injury_description", ""),
+            inc.get("other_party_name", ""),
+            inc.get("other_party_phone", ""),
+            inc.get("other_party_rego", ""),
+            len(inc.get("damage_photos", [])) if "damage_photos" in inc else 0,
+            len(inc.get("scene_photos", [])) if "scene_photos" in inc else 0,
+            len(inc.get("other_vehicle_photos", [])) if "other_vehicle_photos" in inc else 0,
+        ])
+    
+    output.seek(0)
+    filename = f"incidents_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 @api_router.get("/incidents/{incident_id}")
 async def get_incident(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Get a specific incident by ID"""
@@ -4181,6 +4284,7 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         "pdf_base64": pdf_base64,
         "filename": f"incident_report_{vehicle_rego}_{incident_date.replace('/', '-').replace(':', '-').replace(' ', '_')}.pdf"
     }
+
 
 @api_router.put("/incidents/{incident_id}")
 async def update_incident(
