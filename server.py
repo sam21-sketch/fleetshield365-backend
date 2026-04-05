@@ -4046,6 +4046,16 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     # Incident date in company timezone
     incident_date = format_timestamp(incident.get("created_at", ""), company_tz)
     
+    # Color maps
+    severity_bg = {"minor": "#fef3c7", "moderate": "#fed7aa", "major": "#fecaca", "critical": "#fecdd3"}
+    severity_text = {"minor": "#92400e", "moderate": "#c2410c", "major": "#dc2626", "critical": "#9f1239"}
+    status_colors = {"reported": "#dc2626", "under_review": "#d97706", "resolved": "#16a34a", "closed": "#6b7280"}
+    
+    status_val = incident.get("status", "pending").replace("_", " ").title()
+    status_color = status_colors.get(incident.get("status", ""), "#6b7280")
+    sev_bg = severity_bg.get(severity, "#f3f4f6")
+    sev_txt = severity_text.get(severity, "#1f2937")
+    
     # Details table
     data = [
         ["Incident ID:", str(incident.get("_id", ""))[:8] + "..."],
@@ -4053,7 +4063,7 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
         ["Driver:", driver_name],
         ["Severity:", severity.title()],
-        ["Status:", incident.get("status", "pending").replace("_", " ").title()],
+        ["Status:", status_val],
         ["Location:", incident.get("location_address", "N/A")],
     ]
     
@@ -4064,6 +4074,13 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
         ('TOPPADDING', (0, 0), (-1, -1), 8),
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        # Severity row (row index 4) - colored background
+        ('BACKGROUND', (1, 4), (1, 4), colors.HexColor(sev_bg)),
+        ('TEXTCOLOR', (1, 4), (1, 4), colors.HexColor(sev_txt)),
+        ('FONTNAME', (1, 4), (1, 4), 'Helvetica-Bold'),
+        # Status row (row index 5) - colored text
+        ('TEXTCOLOR', (1, 5), (1, 5), colors.HexColor(status_color)),
+        ('FONTNAME', (1, 5), (1, 5), 'Helvetica-Bold'),
     ]))
     elements.append(table)
     elements.append(Spacer(1, 20))
