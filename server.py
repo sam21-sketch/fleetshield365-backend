@@ -3012,6 +3012,104 @@ async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_curren
     
     return {"receipt_photo_base64": receipt}
 
+@api_router.get("/fuel/export/csv")
+async def export_fuel_csv(
+    vehicle_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Export fuel logs to CSV format with optional date range and vehicle filters"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    import csv
+    from io import StringIO
+    from starlette.responses import StreamingResponse
+    
+    company_id = current_user["company_id"]
+    query: dict = {"company_id": company_id}
+    
+    if vehicle_id:
+        query["vehicle_id"] = vehicle_id
+    
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to + "T23:59:59"
+        query["timestamp"] = date_filter
+    
+    submissions = await db.fuel_submissions.find(query, {"receipt_photo_base64": 0}).sort("timestamp", -1).to_list(10000)
+    
+    # Get vehicle and driver maps
+    vehicles = await db.vehicles.find({"company_id": company_id}).to_list(1000)
+    vehicle_map = {str(v["_id"]): f"{v.get('name', 'Unknown')} ({v.get('registration_number', 'N/A')})" for v in vehicles}
+    
+    driver_ids = list(set(s.get("driver_id") for s in submissions if s.get("driver_id")))
+    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(1000) if driver_ids else []
+    driver_map = {}
+    for d in drivers:
+        d_name = d.get("name", "Unknown")
+        d_user = d.get("username", "")
+        driver_map[str(d["_id"])] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+    
+    # Create CSV
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow([
+        "Date", "Time", "Driver", "Vehicle", "Fuel Type", "Litres", 
+        "Cost ($)", "Odometer (km)", "Station", "Has Receipt"
+    ])
+    
+    # Data rows
+    for s in submissions:
+        ts = s.get("timestamp", "")
+        if ts:
+            try:
+                from datetime import datetime as dt
+                parsed = dt.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else ts
+                date_str = parsed.strftime("%Y-%m-%d")
+                time_str = parsed.strftime("%H:%M")
+            except Exception:
+                date_str = str(ts)[:10]
+                time_str = str(ts)[11:16]
+        else:
+            date_str = ""
+            time_str = ""
+        
+        writer.writerow([
+            date_str,
+            time_str,
+            driver_map.get(s.get("driver_id", ""), "Unknown"),
+            vehicle_map.get(s.get("vehicle_id", ""), "Unknown"),
+            s.get("fuel_type", ""),
+            s.get("litres", ""),
+            s.get("total_cost", ""),
+            s.get("odometer", ""),
+            s.get("fuel_station", ""),
+            "Yes" if s.get("receipt_photo_base64") is not None or s.get("has_receipt") else "No"
+        ])
+    
+    output.seek(0)
+    
+    date_suffix = ""
+    if date_from:
+        date_suffix += f"_from_{date_from}"
+    if date_to:
+        date_suffix += f"_to_{date_to}"
+    filename = f"fuel_logs{date_suffix}_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 # ============== Driver Update Routes ==============
 
 class AdminResetPasswordRequest(BaseModel):
