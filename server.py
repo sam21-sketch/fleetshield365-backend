@@ -797,6 +797,7 @@ class PrestartCreate(BaseModel):
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
 
 class EndShiftCreate(BaseModel):
     vehicle_id: str
@@ -814,6 +815,7 @@ class EndShiftCreate(BaseModel):
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
 
 # Maintenance Models
 class MaintenanceLogCreate(BaseModel):
@@ -1556,7 +1558,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://fleet-mgmt-stage.preview.emergentagent.com"
+    origin_url: str = "https://onboard-fleet-check.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2502,6 +2504,18 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     if photo_docs:
         await db.inspection_photos.insert_many(photo_docs)
     
+    # Parse timestamp from mobile app (for offline submissions)
+    if inspection.timestamp:
+        try:
+            inspection_timestamp = datetime.fromisoformat(inspection.timestamp.replace('Z', '+00:00'))
+            # Convert to UTC if needed
+            if inspection_timestamp.tzinfo:
+                inspection_timestamp = inspection_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        except:
+            inspection_timestamp = datetime.utcnow()
+    else:
+        inspection_timestamp = datetime.utcnow()
+    
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
@@ -2518,7 +2532,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
         "location_address": inspection.location_address,
-        "timestamp": datetime.utcnow(),
+        "timestamp": inspection_timestamp,
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None,
         "is_safe": not has_issues
@@ -2638,6 +2652,18 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     if photo_docs:
         await db.inspection_photos.insert_many(photo_docs)
     
+    # Parse timestamp from mobile app (for offline submissions)
+    if inspection.timestamp:
+        try:
+            inspection_timestamp = datetime.fromisoformat(inspection.timestamp.replace('Z', '+00:00'))
+            # Convert to UTC if needed
+            if inspection_timestamp.tzinfo:
+                inspection_timestamp = inspection_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        except:
+            inspection_timestamp = datetime.utcnow()
+    else:
+        inspection_timestamp = datetime.utcnow()
+    
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
@@ -2659,7 +2685,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "gps_latitude": inspection.gps_latitude,
         "gps_longitude": inspection.gps_longitude,
         "location_address": inspection.location_address,
-        "timestamp": datetime.utcnow(),
+        "timestamp": inspection_timestamp,
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None,
         "is_safe": not (inspection.new_damage or inspection.incident_today)
