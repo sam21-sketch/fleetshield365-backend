@@ -715,6 +715,7 @@ class FuelSubmission(BaseModel):
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -936,6 +937,7 @@ class IncidentCreate(BaseModel):
     damage_photos: List[str] = []  # Base64 encoded photos
     other_vehicle_photos: List[str] = []  # Base64 encoded photos
     scene_photos: List[str] = []  # Base64 encoded photos
+    timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
 
 class IncidentUpdate(BaseModel):
     status: Optional[str] = None  # reported, under_review, resolved, closed
@@ -2958,6 +2960,17 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
+    # Parse timestamp from mobile app (for offline submissions)
+    if fuel.timestamp:
+        try:
+            fuel_timestamp = datetime.fromisoformat(fuel.timestamp.replace('Z', '+00:00'))
+            if fuel_timestamp.tzinfo:
+                fuel_timestamp = fuel_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        except:
+            fuel_timestamp = datetime.utcnow()
+    else:
+        fuel_timestamp = datetime.utcnow()
+    
     fuel_doc = {
         "_id": ObjectId(),
         "company_id": current_user["company_id"],
@@ -2973,7 +2986,7 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
         "gps_latitude": fuel.gps_latitude,
         "gps_longitude": fuel.gps_longitude,
         "location_address": fuel.location_address,
-        "timestamp": datetime.utcnow(),
+        "timestamp": fuel_timestamp,
         "ip_address": request.client.host if request.client else "unknown"
     }
     
@@ -3867,6 +3880,17 @@ async def create_incident(
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
+    # Parse timestamp from mobile app (for offline submissions)
+    if incident.timestamp:
+        try:
+            incident_timestamp = datetime.fromisoformat(incident.timestamp.replace('Z', '+00:00'))
+            if incident_timestamp.tzinfo:
+                incident_timestamp = incident_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        except:
+            incident_timestamp = datetime.now(timezone.utc)
+    else:
+        incident_timestamp = datetime.now(timezone.utc)
+    
     incident_doc = {
         "company_id": company_id,
         "vehicle_id": incident.vehicle_id,
@@ -3885,7 +3909,7 @@ async def create_incident(
         "other_vehicle_photos": incident.other_vehicle_photos,
         "scene_photos": incident.scene_photos,
         "status": "reported",
-        "created_at": datetime.now(timezone.utc),
+        "created_at": incident_timestamp,
         "updated_at": datetime.now(timezone.utc),
     }
     
