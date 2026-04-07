@@ -1560,7 +1560,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://onboard-fleet-check.preview.emergentagent.com"
+    origin_url: str = "https://shield-dev-build.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2275,6 +2275,8 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+@api_router.post("/drivers/{driver_id}/license-photos")
 async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, current_user: dict = Depends(get_current_user)):
     """Upload license photos for a driver - Owner (super_admin) only"""
     # Only super_admin can upload license photos

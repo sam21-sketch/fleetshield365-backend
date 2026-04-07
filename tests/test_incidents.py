@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 # Use production URL from environment
-BASE_URL = "https://shield-driver-test.preview.emergentagent.com"
+BASE_URL = "https://shield-dev-build.preview.emergentagent.com"
 
 # Test credentials
 TEST_EMAIL = "admin@test.com"
