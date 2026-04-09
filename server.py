@@ -4003,7 +4003,13 @@ async def get_incidents(
         query["vehicle_id"] = vehicle_id
     
     # Exclude large base64 data from list query for performance
-    projection = {"photos": 0, "pdf_attachments": 0}
+    projection = {
+        "photos": 0, 
+        "pdf_attachments": 0,
+        "damage_photos": 0,
+        "scene_photos": 0,
+        "other_vehicle_photos": 0
+    }
     incidents = await db.incidents.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     if not incidents:
