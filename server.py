@@ -208,6 +208,46 @@ def get_sydney_today_range():
     
     return today_start_utc, today_end_utc
 
+def parse_date_flexible(date_str: str) -> datetime:
+    """Parse date string in various formats: DD/MM/YYYY, YYYY-MM-DD, or ISO format.
+    Returns datetime object or None if parsing fails."""
+    if not date_str or date_str.upper() == "NA":
+        return None
+    
+    date_str = date_str.strip()
+    
+    # Try DD/MM/YYYY format first
+    if '/' in date_str:
+        try:
+            parts = date_str.split('/')
+            if len(parts) == 3:
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                return datetime(year, month, day)
+        except (ValueError, IndexError):
+            pass
+    
+    # Try YYYY-MM-DD format
+    if '-' in date_str and len(date_str) >= 10:
+        try:
+            return datetime.strptime(date_str[:10], '%Y-%m-%d')
+        except ValueError:
+            pass
+    
+    # Try ISO format
+    try:
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except ValueError:
+        pass
+    
+    return None
+
+def format_date_display(date_str: str) -> str:
+    """Convert any date format to DD/MM/YYYY for display."""
+    parsed = parse_date_flexible(date_str)
+    if parsed:
+        return parsed.strftime('%d/%m/%Y')
+    return date_str or 'N/A'
+
 def get_sydney_date_as_utc(date_str: str, is_end_of_day: bool = False):
     """Convert a date string (YYYY-MM-DD) to UTC datetime, treating it as Sydney timezone.
     Use this when clients pass date filters to ensure consistent interpretation."""
@@ -1362,8 +1402,13 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
         expiry_date_str = vehicle.get(field)
         if expiry_date_str:
             try:
-                expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
+                # Use flexible date parser (handles both DD/MM/YYYY and YYYY-MM-DD)
+                expiry_date = parse_date_flexible(expiry_date_str)
+                if not expiry_date:
+                    continue
+                    
                 days_until_expiry = (expiry_date - now).days
+                display_date = format_date_display(expiry_date_str)
                 
                 # Already expired
                 if days_until_expiry < 0:
@@ -1374,7 +1419,7 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                     })
                     
                     if not existing_alert:
-                        message = f"🚨 {label} for {vehicle_name} has EXPIRED! (was due {expiry_date_str})"
+                        message = f"🚨 {label} for {vehicle_name} has EXPIRED! (was due {display_date})"
                         await create_alert(company_id, "expiry_critical", message, vehicle_id)
                 
                 # Check each reminder interval
@@ -1407,12 +1452,12 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                             })
                             
                             if not existing_alert:
-                                message = f"{emoji} [{urgency}] {label} for {vehicle_name} expires in {days_until_expiry} days ({expiry_date_str})"
+                                message = f"{emoji} [{urgency}] {label} for {vehicle_name} expires in {days_until_expiry} days ({display_date})"
                                 await create_alert(company_id, alert_type, message, vehicle_id)
                             
                             break  # Only create alert for the most urgent matching interval
                             
-            except ValueError:
+            except Exception:
                 pass  # Invalid date format, skip
 
 async def create_alert(company_id: str, alert_type: str, message: str, vehicle_id: str = None, driver_id: str = None):
@@ -3426,8 +3471,13 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
         expiry_str = driver.get(field)
         if expiry_str and expiry_str.upper() != "NA":
             try:
-                expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d')
+                # Use flexible date parser (handles both DD/MM/YYYY and YYYY-MM-DD)
+                expiry_date = parse_date_flexible(expiry_str)
+                if not expiry_date:
+                    continue
+                    
                 days_until = (expiry_date - now).days
+                display_date = format_date_display(expiry_str)
                 
                 # Already expired
                 if days_until < 0:
@@ -3437,9 +3487,9 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                         "message": {"$regex": f"{label}.*EXPIRED"}
                     })
                     if not existing:
-                        message = f"🚨 {label} for {display_name} has EXPIRED! (was due {expiry_str})"
+                        message = f"🚨 {label} for {display_name} has EXPIRED! (was due {display_date})"
                         await create_alert(company_id, "driver_expiry_critical", message, driver_id=driver_id)
-                        await send_driver_expiry_email(company_id, display_name, label, days_until, expiry_str, expired=True)
+                        await send_driver_expiry_email(company_id, display_name, label, days_until, display_date, expired=True)
                 
                 # Check each reminder interval
                 else:
@@ -3471,13 +3521,13 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                             })
                             
                             if not existing:
-                                message = f"{emoji} [{urgency}] {label} for {display_name} expires in {days_until} days ({expiry_str})"
+                                message = f"{emoji} [{urgency}] {label} for {display_name} expires in {days_until} days ({display_date})"
                                 await create_alert(company_id, alert_type, message, driver_id=driver_id)
-                                await send_driver_expiry_email(company_id, display_name, label, days_until, expiry_str)
+                                await send_driver_expiry_email(company_id, display_name, label, days_until, display_date)
                             
                             break  # Only create alert for the most urgent matching interval
                             
-            except ValueError:
+            except Exception:
                 pass
 
 async def send_driver_expiry_email(company_id: str, driver_name: str, document_type: str, days_until: int, expiry_date: str, expired: bool = False):
