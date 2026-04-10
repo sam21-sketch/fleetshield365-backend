@@ -2383,6 +2383,124 @@ async def check_license_photos(driver_id: str, current_user: dict = Depends(get_
         "uploaded_at": driver.get("license_photos_updated_at")
     }
 
+# Generic document upload for all certificate types
+class DocumentUpload(BaseModel):
+    front_photo_base64: Optional[str] = None
+    back_photo_base64: Optional[str] = None
+
+@api_router.post("/drivers/{driver_id}/documents/{doc_type}")
+async def upload_driver_documents(driver_id: str, doc_type: str, photos: DocumentUpload, current_user: dict = Depends(get_current_user)):
+    """Upload documents for a driver - Owner (super_admin) only"""
+    # Only super_admin can upload
+    if current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only Company Owners can upload documents")
+    
+    # Validate document type
+    valid_doc_types = {
+        "medical": ("medical_cert_front", "medical_cert_back"),
+        "first_aid": ("first_aid_front", "first_aid_back"),
+        "forklift": ("forklift_front", "forklift_back"),
+        "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+    }
+    
+    if doc_type not in valid_doc_types:
+        raise HTTPException(status_code=400, detail=f"Invalid document type. Valid types: {list(valid_doc_types.keys())}")
+    
+    front_field, back_field = valid_doc_types[doc_type]
+    
+    # Verify driver exists and belongs to the same company
+    driver = await db.users.find_one({
+        "_id": ObjectId(driver_id),
+        "company_id": current_user["company_id"]
+    })
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    
+    # Prepare update data
+    update_data = {}
+    if photos.front_photo_base64:
+        update_data[front_field] = photos.front_photo_base64
+    if photos.back_photo_base64:
+        update_data[back_field] = photos.back_photo_base64
+    
+    if update_data:
+        update_data[f"{doc_type}_updated_at"] = datetime.utcnow()
+        update_data[f"{doc_type}_uploaded_by"] = str(current_user["_id"])
+        await db.users.update_one(
+            {"_id": ObjectId(driver_id)},
+            {"$set": update_data}
+        )
+    
+    return {"message": f"{doc_type.replace('_', ' ').title()} uploaded successfully", "updated_fields": list(update_data.keys())}
+
+@api_router.get("/drivers/{driver_id}/documents/{doc_type}")
+async def get_driver_documents(driver_id: str, doc_type: str, current_user: dict = Depends(get_current_user)):
+    """Check if driver has documents uploaded - Owner (super_admin) only"""
+    if current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only Company Owners can access documents")
+    
+    valid_doc_types = {
+        "medical": ("medical_cert_front", "medical_cert_back"),
+        "first_aid": ("first_aid_front", "first_aid_back"),
+        "forklift": ("forklift_front", "forklift_back"),
+        "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+    }
+    
+    if doc_type not in valid_doc_types:
+        raise HTTPException(status_code=400, detail=f"Invalid document type")
+    
+    front_field, back_field = valid_doc_types[doc_type]
+    
+    driver = await db.users.find_one({
+        "_id": ObjectId(driver_id),
+        "company_id": current_user["company_id"]
+    })
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    
+    return {
+        "has_front": bool(driver.get(front_field)),
+        "has_back": bool(driver.get(back_field)),
+        "uploaded_at": driver.get(f"{doc_type}_updated_at")
+    }
+
+@api_router.post("/drivers/{driver_id}/documents/{doc_type}/view")
+async def view_driver_documents(driver_id: str, doc_type: str, verification: PasswordVerification, current_user: dict = Depends(get_current_user)):
+    """View driver documents with password re-authentication - Owner only"""
+    if current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only Company Owners can view documents")
+    
+    if not verify_password(verification.password, current_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    valid_doc_types = {
+        "medical": ("medical_cert_front", "medical_cert_back"),
+        "first_aid": ("first_aid_front", "first_aid_back"),
+        "forklift": ("forklift_front", "forklift_back"),
+        "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+    }
+    
+    if doc_type not in valid_doc_types:
+        raise HTTPException(status_code=400, detail=f"Invalid document type")
+    
+    front_field, back_field = valid_doc_types[doc_type]
+    
+    driver = await db.users.find_one({
+        "_id": ObjectId(driver_id),
+        "company_id": current_user["company_id"]
+    })
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    
+    return {
+        "driver_id": driver_id,
+        "driver_name": driver.get("name"),
+        "doc_type": doc_type,
+        "front_photo": driver.get(front_field),
+        "back_photo": driver.get(back_field),
+        "uploaded_at": driver.get(f"{doc_type}_updated_at")
+    }
+
 # ============== Photo Upload Routes (Upload during capture) ==============
 
 class PhotoUploadRequest(BaseModel):
