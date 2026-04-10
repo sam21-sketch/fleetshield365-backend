@@ -680,10 +680,19 @@ class UserRegister(BaseModel):
     # Driver license and training details
     license_number: Optional[str] = None
     license_class: Optional[str] = None
-    license_expiry: Optional[str] = None  # YYYY-MM-DD or "NA"
+    license_issue_date: Optional[str] = None  # DD/MM/YYYY
+    license_expiry: Optional[str] = None  # DD/MM/YYYY or "NA"
+    medical_certificate_number: Optional[str] = None
+    medical_certificate_issue: Optional[str] = None
     medical_certificate_expiry: Optional[str] = None
+    first_aid_number: Optional[str] = None
+    first_aid_issue: Optional[str] = None
     first_aid_expiry: Optional[str] = None
+    forklift_license_number: Optional[str] = None
+    forklift_license_issue: Optional[str] = None
     forklift_license_expiry: Optional[str] = None
+    dangerous_goods_number: Optional[str] = None
+    dangerous_goods_issue: Optional[str] = None
     dangerous_goods_expiry: Optional[str] = None
 
 class DriverUpdate(BaseModel):
@@ -691,10 +700,19 @@ class DriverUpdate(BaseModel):
     phone: Optional[str] = None
     license_number: Optional[str] = None
     license_class: Optional[str] = None
+    license_issue_date: Optional[str] = None
     license_expiry: Optional[str] = None
+    medical_certificate_number: Optional[str] = None
+    medical_certificate_issue: Optional[str] = None
     medical_certificate_expiry: Optional[str] = None
+    first_aid_number: Optional[str] = None
+    first_aid_issue: Optional[str] = None
     first_aid_expiry: Optional[str] = None
+    forklift_license_number: Optional[str] = None
+    forklift_license_issue: Optional[str] = None
     forklift_license_expiry: Optional[str] = None
+    dangerous_goods_number: Optional[str] = None
+    dangerous_goods_issue: Optional[str] = None
     dangerous_goods_expiry: Optional[str] = None
 
 class UserLogin(BaseModel):
@@ -2125,10 +2143,19 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         # License and training details
         "license_number": user.license_number,
         "license_class": user.license_class,
+        "license_issue_date": user.license_issue_date,
         "license_expiry": user.license_expiry,
+        "medical_certificate_number": user.medical_certificate_number,
+        "medical_certificate_issue": user.medical_certificate_issue,
         "medical_certificate_expiry": user.medical_certificate_expiry,
+        "first_aid_number": user.first_aid_number,
+        "first_aid_issue": user.first_aid_issue,
         "first_aid_expiry": user.first_aid_expiry,
+        "forklift_license_number": user.forklift_license_number,
+        "forklift_license_issue": user.forklift_license_issue,
         "forklift_license_expiry": user.forklift_license_expiry,
+        "dangerous_goods_number": user.dangerous_goods_number,
+        "dangerous_goods_issue": user.dangerous_goods_issue,
         "dangerous_goods_expiry": user.dangerous_goods_expiry,
     }
     # Only add email if provided (sparse index doesn't like None values)
