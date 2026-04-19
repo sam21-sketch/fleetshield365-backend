@@ -380,7 +380,7 @@ async def send_expiry_alert_email(admin_email: str, company_name: str, alerts: L
     """
     return await send_email_notification(admin_email, f"[FleetShield365] {len(alerts)} Expiry Alert(s) Require Attention", html_content)
 
-async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict] = None, inspection_id: str = None):
+async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict] = None, inspection_id: str = None, extra_details: dict = None):
     """Send issue alert email when an inspection has issues - WITH PHOTOS"""
     
     # Build photo HTML if photos provided
@@ -406,6 +406,20 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
                 """
         photo_html += "</div></div>"
     
+    # Build extra details rows (fuel, odometer, cleanliness etc)
+    extra_rows = ""
+    if extra_details:
+        if extra_details.get("odometer"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Odometer:</td><td style="padding: 8px 0;">{extra_details["odometer"]} km</td></tr>'
+        if extra_details.get("fuel_level"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Fuel Level:</td><td style="padding: 8px 0;">{extra_details["fuel_level"]}</td></tr>'
+        if extra_details.get("cleanliness"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Cleanliness:</td><td style="padding: 8px 0;">{extra_details["cleanliness"]}</td></tr>'
+        if extra_details.get("incident_today"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Incident Today:</td><td style="padding: 8px 0; color: #DC2626; font-weight: bold;">Yes</td></tr>'
+        if extra_details.get("incident_comment"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Incident Details:</td><td style="padding: 8px 0;">{extra_details["incident_comment"]}</td></tr>'
+
     # Dashboard link
     dashboard_link = f"https://www.fleetshield365.com/dashboard"
     
@@ -426,6 +440,7 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
                     <tr><td style="padding: 8px 0; color: #6B7280;">Driver:</td><td style="padding: 8px 0;">{driver_name}</td></tr>
                     <tr><td style="padding: 8px 0; color: #6B7280;">Inspection Type:</td><td style="padding: 8px 0;">{inspection_type}</td></tr>
                     <tr><td style="padding: 8px 0; color: #6B7280;">Time:</td><td style="padding: 8px 0;">{datetime.now(SYDNEY_TZ).strftime('%I:%M %p, %B %d, %Y')} (Sydney)</td></tr>
+                    {extra_rows}
                 </table>
                 <hr style="border: none; border-top: 1px solid #FECACA; margin: 15px 0;" />
                 <p style="color: #DC2626; font-weight: bold; margin: 0;">⚠️ Issue Reported:</p>
@@ -553,7 +568,7 @@ async def notify_admins(company_id: str, notification_type: str, title: str, bod
         if prefs.get("email_enabled", True) and email_func and email_args:
             await email_func(admin.get("email"), company_name, *email_args)
 
-async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict], inspection_id: str):
+async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict], inspection_id: str, extra_details: dict = None):
     """Send issue alert notifications to admins with photos included"""
     # Get all admins for this company
     admins = await db.users.find({
@@ -595,7 +610,8 @@ async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_n
                 issue_summary,
                 inspection_type,
                 photos,
-                inspection_id
+                inspection_id,
+                extra_details
             )
 
 # ============== Helper Functions ==============
@@ -1483,7 +1499,7 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
     
     admin_emails = [admin['email'] for admin in admins if admin.get('email')]
     
-    if admin_emails:
+    if admin_emails and alert_type != "unsafe_vehicle":
         await email_service.send_alert_email(alert_type, message, admin_emails, company_id)
         await db.alerts.update_one({"_id": alert["_id"]}, {"$set": {"email_sent": True}})
     
@@ -1623,7 +1639,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://shield-dev-build.preview.emergentagent.com"
+    origin_url: str = "https://shield-timezone-sync.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2933,7 +2949,14 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             issue_summary,
             "End-of-shift",
             photos_for_email,
-            str(inspection_id)
+            str(inspection_id),
+            {
+                "odometer": inspection.odometer,
+                "fuel_level": inspection.fuel_level,
+                "cleanliness": inspection.cleanliness,
+                "incident_today": inspection.incident_today,
+                "incident_comment": inspection.incident_comment
+            }
         )
     elif inspection.incident_today:
         # Also alert for incidents without damage
