@@ -2065,6 +2065,15 @@ async def test_email(request: TestEmailRequest, current_user: dict = Depends(get
     else:
         raise HTTPException(status_code=500, detail="Failed to send email. Check SendGrid configuration and sender verification.")
 
+@api_router.post("/trigger-weekly-summary")
+async def trigger_weekly_summary(current_user: dict = Depends(get_current_user)):
+    """Manually trigger weekly summary email (admin only)"""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    await generate_weekly_summary()
+    return {"status": "success", "message": "Weekly summary emails sent to all company admins"}
+
 # ============== Company Routes ==============
 
 @api_router.get("/company")
