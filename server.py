@@ -406,7 +406,7 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
                 """
         photo_html += "</div></div>"
     
-    # Build extra details rows (fuel, odometer, cleanliness etc)
+    # Build extra details rows (fuel, odometer, cleanliness, checklist etc)
     extra_rows = ""
     if extra_details:
         if extra_details.get("odometer"):
@@ -419,6 +419,14 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
             extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Incident Today:</td><td style="padding: 8px 0; color: #DC2626; font-weight: bold;">Yes</td></tr>'
         if extra_details.get("incident_comment"):
             extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Incident Details:</td><td style="padding: 8px 0;">{extra_details["incident_comment"]}</td></tr>'
+        if extra_details.get("total_items") and extra_details.get("failed_items"):
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Checklist:</td><td style="padding: 8px 0; color: #DC2626; font-weight: bold;">{extra_details["failed_items"]} of {extra_details["total_items"]} items failed</td></tr>'
+        if extra_details.get("checklist_issues"):
+            issues_list = ', '.join(extra_details["checklist_issues"])
+            extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">Failed Items:</td><td style="padding: 8px 0;">{issues_list}</td></tr>'
+        if extra_details.get("checklist_comments"):
+            for item_name, comment in extra_details["checklist_comments"].items():
+                extra_rows += f'<tr><td style="padding: 8px 0; color: #6B7280;">{item_name} Note:</td><td style="padding: 8px 0; font-style: italic;">{comment}</td></tr>'
 
     # Dashboard link
     dashboard_link = f"https://www.fleetshield365.com/dashboard"
@@ -2787,6 +2795,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             })
         
         # Send notifications to admins WITH PHOTOS
+        issue_comments = {item.name: item.comment for item in inspection.checklist_items if item.status == ChecklistItemStatus.ISSUE and item.comment}
         await notify_admins_with_photos(
             current_user["company_id"],
             vehicle['name'],
@@ -2794,7 +2803,14 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             ', '.join(issue_items),
             "Pre-start",
             photos_for_email,
-            str(inspection_id)
+            str(inspection_id),
+            {
+                "odometer": inspection.odometer,
+                "checklist_issues": issue_items,
+                "checklist_comments": issue_comments,
+                "total_items": len(inspection.checklist_items),
+                "failed_items": len(issue_items)
+            }
         )
     
     # Check for repeated issues (3+ in 7 days)
