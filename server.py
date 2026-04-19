@@ -4066,23 +4066,41 @@ async def mark_alert_read(alert_id: str, current_user: dict = Depends(get_curren
 async def send_incident_alert_email(admin_email: str, company_name: str, incident: dict, vehicle_name: str, driver_name: str):
     """Send incident alert email to admin"""
     severity_colors = {
-        "minor": "#F59E0B",
+        "minor": "#EAB308",
         "moderate": "#F97316", 
         "severe": "#DC2626"
     }
-    severity_color = severity_colors.get(incident.get("severity", "moderate"), "#F97316")
+    severity_bg = {
+        "minor": "#FEFCE8",
+        "moderate": "#FFF7ED",
+        "severe": "#FEF2F2"
+    }
+    severity_border = {
+        "minor": "#FDE68A",
+        "moderate": "#FDBA74",
+        "severe": "#FECACA"
+    }
+    sev = incident.get("severity", "moderate")
+    severity_color = severity_colors.get(sev, "#F97316")
+    bg_color = severity_bg.get(sev, "#FFF7ED")
+    border_color = severity_border.get(sev, "#FDBA74")
     
     html_content = f"""
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px;">
-        <h2 style="color: {severity_color};">🚨 INCIDENT REPORT - {incident.get('severity', 'MODERATE').upper()}</h2>
+        <div style="background-color: {severity_color}; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">🚨 INCIDENT REPORT - {sev.upper()}</h2>
+        </div>
+        
+        <div style="border: 1px solid {border_color}; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
         <p>Hi {company_name} Admin,</p>
         <p><strong>An incident has been reported and requires your immediate attention.</strong></p>
         
-        <div style="background-color: #FEF2F2; border: 1px solid #FECACA; padding: 16px; border-radius: 8px; margin: 20px 0;">
+        <div style="background-color: {bg_color}; border: 1px solid {border_color}; padding: 16px; border-radius: 8px; margin: 20px 0;">
             <p><strong>Vehicle:</strong> {vehicle_name}</p>
             <p><strong>Driver:</strong> {driver_name}</p>
             <p><strong>Date/Time:</strong> {format_timestamp_sydney(incident.get('created_at', 'N/A'))}</p>
+            <p><strong>Severity:</strong> <span style="color: {severity_color}; font-weight: bold;">{sev.upper()}</span></p>
             <p><strong>Location:</strong> {incident.get('location_address', 'GPS coordinates available')}</p>
             <p><strong>Injuries:</strong> {'Yes - ' + incident.get('injury_description', '') if incident.get('injuries_occurred') else 'No injuries reported'}</p>
         </div>
@@ -4095,8 +4113,12 @@ async def send_incident_alert_email(admin_email: str, company_name: str, inciden
         <p><strong>Phone:</strong> {incident.get('other_party', {}).get('phone', 'N/A')}</p>
         <p><strong>Vehicle Rego:</strong> {incident.get('other_party', {}).get('vehicle_rego', 'N/A')}</p>
         
-        <p style="margin-top: 20px;"><strong>Please log in to FleetShield365 to view full details, photos, and take action.</strong></p>
-        <p style="color: #64748B; font-size: 12px;">This is an automated alert from FleetShield365.</p>
+        <div style="margin-top: 25px; text-align: center;">
+            <a href="https://www.fleetshield365.com/dashboard" style="background-color: {severity_color}; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold;">View Full Incident Report</a>
+        </div>
+        
+        <p style="color: #64748B; font-size: 12px; margin-top: 20px;">This is an automated alert from FleetShield365.</p>
+        </div>
     </body>
     </html>
     """
