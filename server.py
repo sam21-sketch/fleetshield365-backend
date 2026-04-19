@@ -472,6 +472,108 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
     return await send_email_notification(admin_email, f"🚨 [DEFECT ALERT] {vehicle_name} - {issue_summary[:50]}", html_content)
 
 async def send_missed_inspection_email(admin_email: str, company_name: str, vehicles: List[dict]):
+
+async def send_repeated_issues_email(company_id: str, vehicle_name: str, recent_inspections: list):
+    """Send detailed repeated issues email showing pattern of failures"""
+    # Get driver names for each inspection
+    driver_ids = list(set(i.get("driver_id") for i in recent_inspections if i.get("driver_id")))
+    drivers = {}
+    for did in driver_ids:
+        driver = await db.users.find_one({"_id": ObjectId(did)})
+        if driver:
+            drivers[did] = driver.get("name", driver.get("username", "Unknown"))
+    
+    # Get company info
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = company.get("name", "Your Company") if company else "Your Company"
+    
+    # Build issue history rows
+    issue_rows = ""
+    for insp in recent_inspections:
+        driver_name = drivers.get(insp.get("driver_id", ""), "Unknown")
+        insp_type = insp.get("type", "prestart").replace("_", " ").title()
+        timestamp = insp.get("timestamp")
+        date_str = format_timestamp_sydney(timestamp) if timestamp else "N/A"
+        
+        # Get issue description
+        if insp.get("type") == "end_shift":
+            issue = insp.get("damage_comment", "Damage reported")
+            if insp.get("incident_today"):
+                issue += f" | Incident: {insp.get('incident_comment', 'reported')}"
+        else:
+            checklist = insp.get("checklist_items", [])
+            failed = [item.get("name", "") for item in checklist if item.get("status") == "issue"]
+            issue = ", ".join(failed) if failed else "Issues reported"
+        
+        issue_rows += f"""
+        <tr>
+            <td style="padding: 10px; border-bottom: 1px solid #E5E7EB; font-size: 13px;">{date_str}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #E5E7EB; font-size: 13px;">{insp_type}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #E5E7EB; font-size: 13px;">{driver_name}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #E5E7EB; font-size: 13px;">{issue[:60]}</td>
+        </tr>
+        """
+    
+    count = len(recent_inspections)
+    
+    html_content = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 650px; margin: 0 auto;">
+        <div style="background-color: #F97316; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">⚠️ REPEATED ISSUES - {vehicle_name}</h2>
+        </div>
+        
+        <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
+            <p>Hi {company_name} Admin,</p>
+            <p><strong>{vehicle_name}</strong> has had <strong style="color: #DC2626;">{count} issues in the last 7 days</strong>. This pattern suggests the vehicle may need a full inspection or should be taken offline.</p>
+            
+            <h3 style="color: #374151; margin-top: 20px;">Issue History:</h3>
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background-color: #F8FAFC;">
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #E5E7EB; font-size: 12px; color: #6B7280;">Date/Time</th>
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #E5E7EB; font-size: 12px; color: #6B7280;">Type</th>
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #E5E7EB; font-size: 12px; color: #6B7280;">Driver</th>
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #E5E7EB; font-size: 12px; color: #6B7280;">Issue</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {issue_rows}
+                </tbody>
+            </table>
+            
+            <div style="background-color: #FFF7ED; border-left: 4px solid #F97316; padding: 16px; margin: 20px 0;">
+                <p style="color: #9A3412; font-weight: bold; margin: 0;">Recommendation:</p>
+                <p style="color: #9A3412; margin: 8px 0 0 0;">Consider taking {vehicle_name} offline for a full mechanical inspection before further use.</p>
+            </div>
+            
+            <div style="margin-top: 25px; text-align: center;">
+                <a href="https://www.fleetshield365.com/dashboard" style="background-color: #F97316; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold;">View Vehicle History</a>
+            </div>
+            
+            <p style="color: #9CA3AF; font-size: 12px; margin-top: 30px; text-align: center;">
+                This is an automated pattern detection alert from FleetShield365.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    # Send to all admins
+    admins = await db.users.find({
+        "company_id": company_id,
+        "role": {"$in": ["super_admin", "admin"]}
+    }).to_list(100)
+    
+    for admin in admins:
+        if admin.get("email"):
+            await send_email_notification(
+                admin["email"],
+                f"⚠️ [PATTERN ALERT] {vehicle_name} - {count} issues in 7 days",
+                html_content
+            )
+
+async def send_missed_inspection_email(admin_email: str, company_name: str, vehicles: List[dict]):
     """Send missed inspection alert email"""
     html_content = f"""
     <html>
@@ -2815,18 +2917,24 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     
     # Check for repeated issues (3+ in 7 days)
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    recent_issues = await db.inspections.count_documents({
+    recent_inspections = await db.inspections.find({
         "vehicle_id": inspection.vehicle_id,
         "is_safe": False,
         "timestamp": {"$gte": seven_days_ago}
-    })
+    }).sort("timestamp", -1).to_list(20)
     
-    if recent_issues >= 3:
+    if len(recent_inspections) >= 3:
         await create_alert(
             current_user["company_id"],
             "repeated_issues",
-            f"Vehicle {vehicle['name']} has had {recent_issues} issues in the last 7 days",
+            f"Vehicle {vehicle['name']} has had {len(recent_inspections)} issues in the last 7 days",
             inspection.vehicle_id
+        )
+        # Send detailed repeated issues email
+        await send_repeated_issues_email(
+            current_user["company_id"],
+            vehicle['name'],
+            recent_inspections
         )
     
     await log_audit_trail(
