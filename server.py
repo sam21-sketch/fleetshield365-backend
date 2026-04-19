@@ -472,6 +472,22 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
     return await send_email_notification(admin_email, f"🚨 [DEFECT ALERT] {vehicle_name} - {issue_summary[:50]}", html_content)
 
 async def send_missed_inspection_email(admin_email: str, company_name: str, vehicles: List[dict]):
+    """Send missed inspection alert email"""
+    html_content = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2 style="color: #F97316;">FleetShield365 Missed Inspection Alert</h2>
+        <p>Hi {company_name} Admin,</p>
+        <p>The following vehicles did not complete their prestart inspection today:</p>
+        <ul style="margin: 20px 0;">
+            {''.join([f'<li style="padding: 8px 0;">{v.get("name", "Unknown")} ({v.get("registration_number", "N/A")})</li>' for v in vehicles])}
+        </ul>
+        <p>Please follow up with the assigned drivers.</p>
+        <p style="color: #64748B; font-size: 12px;">This is an automated message from FleetShield365.</p>
+    </body>
+    </html>
+    """
+    return await send_email_notification(admin_email, f"[FleetShield365] {len(vehicles)} Vehicle(s) Missed Inspection Today", html_content)
 
 async def send_repeated_issues_email(company_id: str, vehicle_name: str, recent_inspections: list):
     """Send detailed repeated issues email showing pattern of failures"""
