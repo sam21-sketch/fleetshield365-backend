@@ -622,12 +622,186 @@ async def send_daily_summary_email(admin_email: str, company_name: str, summary:
             <p><strong>Fuel Submissions:</strong> {summary.get('fuel_submissions', 0)}</p>
             <p><strong>Total Fuel (L):</strong> {summary.get('total_fuel', 0):.1f}</p>
         </div>
-        <p>Log in to FleetGuard for detailed reports.</p>
+        <p>Log in to FleetShield365 for detailed reports.</p>
         <p style="color: #64748B; font-size: 12px;">This is an automated message from FleetShield365.</p>
     </body>
     </html>
     """
     return await send_email_notification(admin_email, f"[FleetShield365] Daily Summary - {datetime.now(SYDNEY_TZ).strftime('%B %d, %Y')}", html_content)
+
+async def generate_weekly_summary():
+    """Generate and send weekly summary email to all company admins"""
+    try:
+        now = datetime.now(SYDNEY_TZ)
+        week_ago = now - timedelta(days=7)
+        week_ago_utc = week_ago.astimezone(timezone.utc).replace(tzinfo=None)
+        
+        companies = await db.companies.find().to_list(1000)
+        
+        for company in companies:
+            company_id = str(company["_id"])
+            company_name = company.get("name", "Your Company")
+            
+            # Gather weekly stats
+            total_inspections = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": week_ago_utc}
+            })
+            
+            passed_inspections = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": week_ago_utc},
+                "is_safe": True
+            })
+            
+            failed_inspections = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": week_ago_utc},
+                "is_safe": False
+            })
+            
+            prestart_count = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": week_ago_utc},
+                "type": "prestart"
+            })
+            
+            endshift_count = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": week_ago_utc},
+                "type": "end_shift"
+            })
+            
+            incidents = await db.incidents.count_documents({
+                "company_id": company_id,
+                "created_at": {"$gte": week_ago_utc}
+            })
+            
+            fuel_pipeline = [
+                {"$match": {"company_id": company_id, "timestamp": {"$gte": week_ago_utc}}},
+                {"$group": {"_id": None, "total_litres": {"$sum": "$litres"}, "total_cost": {"$sum": "$total_cost"}, "count": {"$sum": 1}}}
+            ]
+            fuel_result = await db.fuel_submissions.aggregate(fuel_pipeline).to_list(1)
+            fuel_data = fuel_result[0] if fuel_result else {"total_litres": 0, "total_cost": 0, "count": 0}
+            
+            total_vehicles = await db.vehicles.count_documents({"company_id": company_id})
+            total_drivers = await db.users.count_documents({"company_id": company_id, "role": "driver"})
+            
+            pass_rate = round((passed_inspections / total_inspections * 100), 1) if total_inspections > 0 else 0
+            
+            # Determine pass rate color
+            if pass_rate >= 90:
+                rate_color = "#16A34A"
+                rate_label = "Excellent"
+            elif pass_rate >= 70:
+                rate_color = "#EAB308"
+                rate_label = "Needs Attention"
+            else:
+                rate_color = "#DC2626"
+                rate_label = "Critical"
+            
+            week_start = week_ago.strftime('%d %b')
+            week_end = now.strftime('%d %b %Y')
+            
+            html_content = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+                <div style="background-color: #0891B2; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+                    <h2 style="margin: 0;">FleetShield365 Weekly Summary</h2>
+                    <p style="margin: 5px 0 0 0; opacity: 0.9;">{week_start} - {week_end}</p>
+                </div>
+                
+                <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
+                    <p>Hi {company_name} Admin,</p>
+                    <p>Here's your weekly fleet overview:</p>
+                    
+                    <!-- Pass Rate Banner -->
+                    <div style="background-color: #F8FAFC; border-left: 4px solid {rate_color}; padding: 16px; margin: 20px 0; text-align: center;">
+                        <p style="font-size: 36px; font-weight: bold; color: {rate_color}; margin: 0;">{pass_rate}%</p>
+                        <p style="color: #6B7280; margin: 5px 0 0 0;">Inspection Pass Rate — {rate_label}</p>
+                    </div>
+                    
+                    <!-- Stats Grid -->
+                    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                        <tr>
+                            <td style="padding: 12px; background-color: #F0FDFA; border-radius: 8px; text-align: center; width: 33%;">
+                                <p style="font-size: 24px; font-weight: bold; color: #0891B2; margin: 0;">{total_inspections}</p>
+                                <p style="color: #6B7280; font-size: 12px; margin: 4px 0 0 0;">Total Inspections</p>
+                            </td>
+                            <td style="width: 4%;"></td>
+                            <td style="padding: 12px; background-color: #F0FDF4; border-radius: 8px; text-align: center; width: 33%;">
+                                <p style="font-size: 24px; font-weight: bold; color: #16A34A; margin: 0;">{passed_inspections}</p>
+                                <p style="color: #6B7280; font-size: 12px; margin: 4px 0 0 0;">Passed</p>
+                            </td>
+                            <td style="width: 4%;"></td>
+                            <td style="padding: 12px; background-color: #FEF2F2; border-radius: 8px; text-align: center; width: 33%;">
+                                <p style="font-size: 24px; font-weight: bold; color: #DC2626; margin: 0;">{failed_inspections}</p>
+                                <p style="color: #6B7280; font-size: 12px; margin: 4px 0 0 0;">Failed</p>
+                            </td>
+                        </tr>
+                    </table>
+                    
+                    <!-- Breakdown -->
+                    <h3 style="color: #374151; border-bottom: 1px solid #E5E7EB; padding-bottom: 8px;">Breakdown</h3>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Pre-start Inspections:</td><td style="padding: 8px 0; font-weight: bold;">{prestart_count}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">End-of-Shift Inspections:</td><td style="padding: 8px 0; font-weight: bold;">{endshift_count}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Incidents Reported:</td><td style="padding: 8px 0; font-weight: bold; color: {'#DC2626' if incidents > 0 else '#16A34A'};">{incidents}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Fuel Submissions:</td><td style="padding: 8px 0; font-weight: bold;">{fuel_data.get('count', 0)}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Total Fuel:</td><td style="padding: 8px 0; font-weight: bold;">{fuel_data.get('total_litres', 0):.1f} L</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Fuel Spend:</td><td style="padding: 8px 0; font-weight: bold;">${fuel_data.get('total_cost', 0):,.2f}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Active Vehicles:</td><td style="padding: 8px 0; font-weight: bold;">{total_vehicles}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #6B7280;">Active Drivers:</td><td style="padding: 8px 0; font-weight: bold;">{total_drivers}</td></tr>
+                    </table>
+                    
+                    <div style="margin-top: 25px; text-align: center;">
+                        <a href="https://www.fleetshield365.com/dashboard" style="background-color: #0891B2; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold;">View Full Dashboard</a>
+                    </div>
+                    
+                    <p style="color: #9CA3AF; font-size: 12px; margin-top: 30px; text-align: center;">
+                        This weekly summary is sent every Monday at 7:00 AM (Sydney time).<br/>
+                        FleetShield365 — A product of Prime Mover Rentals Pty Ltd.
+                    </p>
+                </div>
+            </body>
+            </html>
+            """
+            
+            # Send to all admins
+            admins = await db.users.find({
+                "company_id": company_id,
+                "role": {"$in": ["super_admin", "admin"]}
+            }).to_list(100)
+            
+            for admin in admins:
+                if admin.get("email"):
+                    await send_email_notification(
+                        admin["email"],
+                        f"[FleetShield365] Weekly Summary — {week_start} to {week_end}",
+                        html_content
+                    )
+        
+        logger.info("Weekly summary emails sent to all companies")
+    except Exception as e:
+        logger.error(f"Failed to generate weekly summary: {e}")
+
+async def weekly_summary_scheduler():
+    """Background task that sends weekly summary every Monday at 7 AM Sydney time"""
+    while True:
+        try:
+            now = datetime.now(SYDNEY_TZ)
+            # Calculate next Monday 7 AM
+            days_until_monday = (7 - now.weekday()) % 7
+            if days_until_monday == 0 and now.hour >= 7:
+                days_until_monday = 7
+            next_monday = now.replace(hour=7, minute=0, second=0, microsecond=0) + timedelta(days=days_until_monday)
+            wait_seconds = (next_monday - now).total_seconds()
+            logger.info(f"Weekly summary scheduled for {next_monday.strftime('%Y-%m-%d %H:%M %Z')} (in {wait_seconds/3600:.1f} hours)")
+            await asyncio.sleep(wait_seconds)
+            await generate_weekly_summary()
+        except Exception as e:
+            logger.error(f"Weekly summary scheduler error: {e}")
+            await asyncio.sleep(3600)  # Retry in 1 hour on error
 
 # ============== Push Notification Service ==============
 
@@ -6126,6 +6300,10 @@ async def startup_event():
             {"$set": {"is_safe": False}}
         )
         logger.info(f"Migration: Backfilled is_safe for {end_shift_missing} end-shift inspections")
+    
+    # Start weekly summary scheduler
+    asyncio.create_task(weekly_summary_scheduler())
+    logger.info("Weekly summary scheduler started")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
