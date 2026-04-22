@@ -2244,6 +2244,88 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     await db.users.delete_one({"_id": ObjectId(user_id)})
     return {"message": "User deleted"}
 
+@api_router.post("/account/delete-request")
+async def request_account_deletion(current_user: dict = Depends(get_current_user)):
+    """User requests their own account deletion - anonymizes data per NHVR compliance"""
+    user_id = str(current_user["_id"])
+    company_id = current_user.get("company_id")
+    user_name = current_user.get("name", current_user.get("username", "Unknown"))
+    user_email = current_user.get("email", "")
+    
+    # Anonymize inspection records (keep for NHVR 3-year compliance, remove personal data)
+    await db.inspections.update_many(
+        {"driver_id": user_id},
+        {"$set": {"driver_name": "Deleted User", "driver_id": f"deleted_{user_id[:8]}"}}
+    )
+    
+    # Anonymize fuel submissions
+    await db.fuel_submissions.update_many(
+        {"driver_id": user_id},
+        {"$set": {"driver_name": "Deleted User", "driver_id": f"deleted_{user_id[:8]}"}}
+    )
+    
+    # Anonymize incidents
+    await db.incidents.update_many(
+        {"driver_id": user_id},
+        {"$set": {"driver_name": "Deleted User", "driver_id": f"deleted_{user_id[:8]}"}}
+    )
+    
+    # Remove push tokens
+    await db.push_tokens.delete_many({"user_id": user_id})
+    
+    # Remove user account completely
+    await db.users.delete_one({"_id": ObjectId(user_id)})
+    
+    # Send confirmation email
+    try:
+        if user_email:
+            html_content = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+                <div style="background-color: #0891B2; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+                    <h2 style="margin: 0;">FleetShield365 - Account Deleted</h2>
+                </div>
+                <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
+                    <p>Hi {user_name},</p>
+                    <p>Your FleetShield365 account has been successfully deleted.</p>
+                    <p><strong>What was removed:</strong></p>
+                    <ul>
+                        <li>Your account credentials and profile</li>
+                        <li>Your personal information (name, email, phone)</li>
+                        <li>Push notification tokens</li>
+                    </ul>
+                    <p><strong>What was retained (anonymized):</strong></p>
+                    <ul>
+                        <li>Inspection records — anonymized as "Deleted User" (retained for NHVR compliance, 3-year requirement)</li>
+                        <li>Fuel logs — anonymized as "Deleted User"</li>
+                        <li>Incident reports — anonymized as "Deleted User"</li>
+                    </ul>
+                    <p>These records are required by Australian National Heavy Vehicle Regulator (NHVR) for a minimum of 3 years. Your personal identity has been completely removed from these records.</p>
+                    <p>If you have any questions, contact us at alerts@fleetshield365.com</p>
+                    <p style="color: #9CA3AF; font-size: 12px; margin-top: 20px;">FleetShield365 — A product of Prime Mover Rentals Pty Ltd.</p>
+                </div>
+            </body>
+            </html>
+            """
+            await send_email_notification(user_email, "[FleetShield365] Account Deletion Confirmation", html_content)
+    except Exception:
+        pass  # Don't block deletion if email fails
+    
+    # Notify company admins
+    try:
+        admins = await db.users.find({"company_id": company_id, "role": {"$in": ["super_admin", "admin"]}}).to_list(10)
+        for admin in admins:
+            if admin.get("email"):
+                await send_email_notification(
+                    admin["email"],
+                    f"[FleetShield365] User Account Deleted - {user_name}",
+                    f"<p>Driver <strong>{user_name}</strong> has deleted their account. Their inspection and fuel records have been anonymized and retained for compliance.</p>"
+                )
+    except Exception:
+        pass
+    
+    return {"message": "Account deleted successfully. A confirmation email has been sent."}
+
 # ============== Vehicle Routes ==============
 
 @api_router.post("/vehicles")
