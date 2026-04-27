@@ -1939,7 +1939,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://shield-timezone-sync.preview.emergentagent.com"
+    origin_url: str = "https://form-submission-test-3.preview.emergentagent.com"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -2073,6 +2073,105 @@ async def trigger_weekly_summary(current_user: dict = Depends(get_current_user))
     
     await generate_weekly_summary()
     return {"status": "success", "message": "Weekly summary emails sent to all company admins"}
+
+# ============== Contact Form (Public) ==============
+
+class ContactFormRequest(BaseModel):
+    name: str
+    email: str
+    company: Optional[str] = ""
+    phone: Optional[str] = ""
+    message: str
+
+CONTACT_RECIPIENT = os.environ.get('CONTACT_RECIPIENT_EMAIL', 'contact@fleetshield365.com')
+
+@api_router.post("/contact")
+async def submit_contact_form(request: ContactFormRequest):
+    """Public endpoint: submits a contact request from the website landing page."""
+    # Basic validation
+    name = (request.name or "").strip()
+    email = (request.email or "").strip()
+    message = (request.message or "").strip()
+    company = (request.company or "").strip()
+    phone = (request.phone or "").strip()
+
+    if not name or not email or not message:
+        raise HTTPException(status_code=400, detail="Name, email and message are required.")
+    if "@" not in email or len(email) > 200:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+    if len(message) > 5000:
+        raise HTTPException(status_code=400, detail="Message is too long (max 5000 characters).")
+
+    submitted_at = datetime.now(SYDNEY_TZ).strftime("%d/%m/%Y %I:%M %p AEST")
+
+    # Email to admin
+    admin_html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px; color:#0f172a;">
+        <h2 style="color:#0891b2; margin-bottom:8px;">New Contact Form Submission</h2>
+        <p style="color:#64748b; margin-top:0;">Received on {submitted_at}</p>
+        <table style="border-collapse:collapse; width:100%; max-width:600px; margin-top:16px;">
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Name</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{name}</td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Email</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><a href="mailto:{email}">{email}</a></td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Company</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{company or '-'}</td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Phone</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{phone or '-'}</td></tr>
+        </table>
+        <h3 style="margin-top:24px; color:#0f172a;">Message</h3>
+        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message}</div>
+        <p style="color:#64748b; font-size:12px; margin-top:24px;">Reply directly to this lead at <a href="mailto:{email}">{email}</a>.</p>
+    </body>
+    </html>
+    """
+
+    admin_sent = await send_email_notification(
+        CONTACT_RECIPIENT,
+        f"[FleetShield365] New Contact: {name}",
+        admin_html
+    )
+
+    # Auto-reply confirmation to the submitter
+    confirm_html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px; color:#0f172a;">
+        <h2 style="color:#0891b2;">Thanks for reaching out, {name}!</h2>
+        <p>We've received your message and a member of the FleetShield365 team will get back to you within 24 hours.</p>
+        <p style="margin-top:16px;"><b>Your message:</b></p>
+        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message}</div>
+        <p style="margin-top:24px;">Need urgent help? Email us directly at <a href="mailto:{CONTACT_RECIPIENT}">{CONTACT_RECIPIENT}</a>.</p>
+        <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
+        <p style="color:#64748b; font-size:12px;">FleetShield365 — A product of Prime Mover Rentals Pty Ltd<br>This is an automated confirmation. Please do not reply directly.</p>
+    </body>
+    </html>
+    """
+
+    try:
+        await send_email_notification(
+            email,
+            "[FleetShield365] We've received your message",
+            confirm_html
+        )
+    except Exception as e:
+        logger.error(f"[CONTACT] Failed to send confirmation to {email}: {e}")
+
+    # Persist for record-keeping
+    try:
+        await db.contact_submissions.insert_one({
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "email": email,
+            "company": company,
+            "phone": phone,
+            "message": message,
+            "admin_email_sent": bool(admin_sent),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+    except Exception as e:
+        logger.error(f"[CONTACT] Failed to persist contact submission: {e}")
+
+    if not admin_sent:
+        raise HTTPException(status_code=500, detail="Unable to send your message right now. Please email us directly.")
+
+    return {"status": "success", "message": "Message received. We'll be in touch soon."}
 
 # ============== Company Routes ==============
 
