@@ -1344,8 +1344,8 @@ class CompanyRegister(BaseModel):
 
 # Pricing Configuration
 PRICING = {
-    "base_price": 39,
-    "per_vehicle": 5,
+    "base_price": 29,
+    "per_vehicle": 3,
     "trial_days": 14,
 }
 
