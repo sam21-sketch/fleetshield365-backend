@@ -5495,6 +5495,363 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     }
 
 
+# ============== Vehicle Defect Hub (Phase 2) ==============
+
+def _make_defect_id(inspection_id: str, source: str, idx) -> str:
+    """Stable identifier for a defect derived from an inspection."""
+    return f"{inspection_id}::{source}::{idx}"
+
+
+@api_router.get("/vehicles/{vehicle_id}/defects")
+async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Returns all defects for a single vehicle, aggregated from pre-start checklist
+    failures + end-shift damage/incident reports across the last 90 days.
+    Each defect has a stable ID, severity, source, status (open/assigned/fixed).
+    """
+    company_id = current_user["company_id"]
+    today_dt = datetime.utcnow()
+    ninety_days_ago = (today_dt - timedelta(days=90)).isoformat()
+
+    # Verify vehicle belongs to this company
+    vehicle = await db.vehicles.find_one(
+        {"_id": ObjectId(vehicle_id), "company_id": company_id},
+        {"name": 1, "registration_number": 1, "make": 1, "model": 1, "year": 1, "current_odometer": 1, "vin": 1}
+    )
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    # Pull inspections that have a problem flag
+    inspections = await db.inspections.find(
+        {
+            "company_id": company_id,
+            "vehicle_id": vehicle_id,
+            "timestamp": {"$gte": ninety_days_ago},
+            "$or": [{"is_safe": False}, {"new_damage": True}, {"incident_today": True}],
+        },
+        {"timestamp": 1, "type": 1, "checklist_items": 1, "new_damage": 1, "incident_today": 1,
+         "damage_comment": 1, "incident_comment": 1, "driver_name": 1, "driver_id": 1,
+         "photos": 1, "odometer": 1}
+    ).sort("timestamp", -1).to_list(500)
+
+    # Pull status overrides for this vehicle
+    status_overrides_cursor = db.defect_overrides.find(
+        {"company_id": company_id, "vehicle_id": vehicle_id}
+    )
+    status_overrides = {doc["defect_id"]: doc async for doc in status_overrides_cursor}
+
+    # Build defect records
+    defects = []
+    name_counter: dict = {}  # to detect recurring issues
+
+    for insp in inspections:
+        inspection_id = str(insp.get("_id"))
+        timestamp = insp.get("timestamp")
+        driver_name = insp.get("driver_name") or "Unknown driver"
+
+        # Pre-start checklist failures
+        for idx, item in enumerate(insp.get("checklist_items") or []):
+            if item.get("status") != "issue":
+                continue
+            name = item.get("name") or "Unnamed item"
+            severity = _classify_defect_severity(name, False, False)
+            d_id = _make_defect_id(inspection_id, "checklist", idx)
+            override = status_overrides.get(d_id, {})
+            defects.append({
+                "id": d_id,
+                "source": "Pre-Start",
+                "name": name,
+                "comment": item.get("comment") or "",
+                "photos": [p for p in (item.get("photos") or []) if p][:3],
+                "timestamp": timestamp,
+                "driver_name": driver_name,
+                "severity": severity,
+                "status": override.get("status", "open"),
+                "assigned_to": override.get("assigned_to"),
+                "fixed_date": override.get("fixed_date"),
+                "fixed_cost": override.get("fixed_cost"),
+                "notes": override.get("notes"),
+            })
+            name_counter[name.lower()] = name_counter.get(name.lower(), 0) + 1
+
+        # End-shift damage
+        if insp.get("new_damage"):
+            d_id = _make_defect_id(inspection_id, "endshift", "damage")
+            override = status_overrides.get(d_id, {})
+            name = "Damage reported (end of shift)"
+            defects.append({
+                "id": d_id,
+                "source": "End-Shift",
+                "name": name,
+                "comment": insp.get("damage_comment") or "",
+                "photos": (insp.get("photos") or [])[:3],
+                "timestamp": timestamp,
+                "driver_name": driver_name,
+                "severity": "medium",
+                "status": override.get("status", "open"),
+                "assigned_to": override.get("assigned_to"),
+                "fixed_date": override.get("fixed_date"),
+                "fixed_cost": override.get("fixed_cost"),
+                "notes": override.get("notes"),
+            })
+            name_counter[name.lower()] = name_counter.get(name.lower(), 0) + 1
+
+        # End-shift incident
+        if insp.get("incident_today"):
+            d_id = _make_defect_id(inspection_id, "endshift", "incident")
+            override = status_overrides.get(d_id, {})
+            name = "Incident reported"
+            defects.append({
+                "id": d_id,
+                "source": "End-Shift",
+                "name": name,
+                "comment": insp.get("incident_comment") or "",
+                "photos": (insp.get("photos") or [])[:3],
+                "timestamp": timestamp,
+                "driver_name": driver_name,
+                "severity": "high",
+                "status": override.get("status", "open"),
+                "assigned_to": override.get("assigned_to"),
+                "fixed_date": override.get("fixed_date"),
+                "fixed_cost": override.get("fixed_cost"),
+                "notes": override.get("notes"),
+            })
+            name_counter[name.lower()] = name_counter.get(name.lower(), 0) + 1
+
+    # Detect recurring issues (3+ in last 30 days)
+    thirty_days_ago = (today_dt - timedelta(days=30)).isoformat()
+    recurring_counter: dict = {}
+    for d in defects:
+        if d["timestamp"] >= thirty_days_ago:
+            key = d["name"].lower()
+            recurring_counter[key] = recurring_counter.get(key, 0) + 1
+    recurring = [{"name": k, "count": v} for k, v in recurring_counter.items() if v >= 3]
+    recurring.sort(key=lambda x: x["count"], reverse=True)
+
+    # Mark recurring on each defect
+    recurring_keys = {r["name"] for r in recurring}
+    for d in defects:
+        d["is_recurring"] = d["name"].lower() in recurring_keys
+
+    # Sort: open first (severity desc, then date desc), then assigned, then fixed
+    status_order = {"open": 0, "assigned": 1, "in_progress": 1, "fixed": 2}
+    severity_order = {"high": 0, "medium": 1, "low": 2}
+    defects.sort(key=lambda d: (
+        status_order.get(d["status"], 3),
+        severity_order.get(d["severity"], 3),
+        -1 * (datetime.fromisoformat(d["timestamp"][:19]).timestamp() if d.get("timestamp") else 0),
+    ))
+
+    open_defects = [d for d in defects if d["status"] != "fixed"]
+    fixed_defects = [d for d in defects if d["status"] == "fixed"]
+
+    return {
+        "vehicle": {
+            "id": vehicle_id,
+            "name": vehicle.get("name"),
+            "registration_number": vehicle.get("registration_number"),
+            "make": vehicle.get("make"),
+            "model": vehicle.get("model"),
+            "year": vehicle.get("year"),
+            "vin": vehicle.get("vin"),
+            "current_odometer": vehicle.get("current_odometer"),
+        },
+        "open_count": len(open_defects),
+        "fixed_count": len(fixed_defects),
+        "high_severity_count": sum(1 for d in open_defects if d["severity"] == "high"),
+        "open_defects": open_defects,
+        "fixed_defects": fixed_defects[:20],  # cap fixed history at 20
+        "recurring_issues": recurring,
+    }
+
+
+class DefectStatusUpdate(BaseModel):
+    status: str  # open / assigned / in_progress / fixed
+    assigned_to: Optional[str] = None
+    fixed_date: Optional[str] = None
+    fixed_cost: Optional[float] = None
+    notes: Optional[str] = None
+
+
+@api_router.patch("/defects/{defect_id}/status")
+async def update_defect_status(
+    defect_id: str,
+    update: DefectStatusUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update the status of a single defect. defect_id is a synthetic ID."""
+    if update.status not in ("open", "assigned", "in_progress", "fixed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    # Extract inspection_id from synthetic id ("inspection_id::source::index")
+    parts = defect_id.split("::")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Malformed defect_id")
+    inspection_id = parts[0]
+
+    # Verify the inspection belongs to this user's company
+    insp = await db.inspections.find_one(
+        {"_id": ObjectId(inspection_id), "company_id": current_user["company_id"]},
+        {"vehicle_id": 1}
+    )
+    if not insp:
+        raise HTTPException(status_code=404, detail="Defect source inspection not found")
+
+    update_doc = {
+        "defect_id": defect_id,
+        "company_id": current_user["company_id"],
+        "vehicle_id": insp.get("vehicle_id"),
+        "status": update.status,
+        "assigned_to": update.assigned_to,
+        "fixed_date": update.fixed_date or (datetime.utcnow().isoformat() if update.status == "fixed" else None),
+        "fixed_cost": update.fixed_cost,
+        "notes": update.notes,
+        "updated_by": current_user.get("user_id"),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    await db.defect_overrides.update_one(
+        {"defect_id": defect_id, "company_id": current_user["company_id"]},
+        {"$set": update_doc},
+        upsert=True,
+    )
+    return {"status": "success", "defect_id": defect_id, "new_status": update.status}
+
+
+class WorkshopEmailRequest(BaseModel):
+    workshop_email: str
+    workshop_name: Optional[str] = None
+    message: Optional[str] = None
+    defect_ids: Optional[list] = None  # if provided, only these defects; else all open
+
+
+@api_router.post("/vehicles/{vehicle_id}/email-workshop")
+async def email_defects_to_workshop(
+    vehicle_id: str,
+    request: WorkshopEmailRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Send a defect summary email (HTML) to a workshop or mechanic."""
+    if "@" not in (request.workshop_email or ""):
+        raise HTTPException(status_code=400, detail="Valid workshop email required")
+
+    # Reuse the defect aggregation logic
+    defects_payload = await get_vehicle_defects(vehicle_id, current_user=current_user)
+    open_defects = defects_payload["open_defects"]
+    if request.defect_ids:
+        open_defects = [d for d in open_defects if d["id"] in request.defect_ids]
+
+    if not open_defects:
+        raise HTTPException(status_code=400, detail="No open defects to send")
+
+    vehicle = defects_payload["vehicle"]
+    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])}, {"name": 1})
+    company_name = company.get("name", "FleetShield365 Customer") if company else "FleetShield365 Customer"
+
+    # Build HTML
+    workshop_name = (request.workshop_name or "Workshop").strip()
+    custom_msg = (request.message or "").strip()
+    rows_html = ""
+    for i, d in enumerate(open_defects, start=1):
+        sev_color = {"high": "#dc2626", "medium": "#f59e0b", "low": "#64748b"}.get(d["severity"], "#64748b")
+        ts_short = (d.get("timestamp") or "")[:10]
+        comment_html = f"<div style='color:#475569; margin-top:6px;'>{d.get('comment') or ''}</div>" if d.get("comment") else ""
+        rows_html += f"""
+        <tr>
+          <td style="padding:14px; border-bottom:1px solid #e2e8f0; vertical-align:top;">
+            <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; letter-spacing:0.5px;">#{i} · {d.get('source')} · {ts_short}</div>
+            <div style="font-weight:600; color:#0f172a; font-size:15px; margin-top:4px;">{d.get('name')}</div>
+            {comment_html}
+            <div style="margin-top:6px;">
+              <span style="display:inline-block; padding:3px 10px; border-radius:999px; background:{sev_color}; color:white; font-size:11px; font-weight:600; text-transform:uppercase;">{d.get('severity')}</span>
+              <span style="color:#64748b; font-size:12px; margin-left:8px;">Reported by {d.get('driver_name')}</span>
+            </div>
+          </td>
+        </tr>
+        """
+
+    custom_block = f"""
+        <div style="background:#f1f5f9; padding:16px 20px; border-radius:8px; margin-bottom:24px; border-left:4px solid #0891b2;">
+          <div style="color:#0f172a; white-space:pre-wrap; line-height:1.6;">{custom_msg}</div>
+        </div>
+    """ if custom_msg else ""
+
+    html = f"""
+    <html>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding:0; margin:0; background:#f8fafc;">
+      <div style="max-width:680px; margin:0 auto; background:white;">
+        <div style="background:linear-gradient(135deg, #0d9488, #0891b2); padding:24px 28px; color:white;">
+          <h1 style="margin:0; font-size:22px;">Defect Repair Request</h1>
+          <p style="margin:4px 0 0 0; opacity:0.9; font-size:14px;">{company_name} · {datetime.utcnow().strftime('%d %B %Y')}</p>
+        </div>
+        <div style="padding:28px;">
+          <p style="color:#0f172a; line-height:1.6;">Hi {workshop_name},</p>
+          <p style="color:#475569; line-height:1.6;">
+            Please find below the open defects on the following vehicle. We'd appreciate your assessment and quote at your earliest convenience.
+          </p>
+          {custom_block}
+
+          <div style="background:#f8fafc; padding:18px 20px; border-radius:8px; margin-bottom:20px; border:1px solid #e2e8f0;">
+            <div style="font-size:12px; color:#94a3b8; text-transform:uppercase; letter-spacing:0.5px;">Vehicle</div>
+            <div style="font-size:18px; font-weight:600; color:#0f172a; margin-top:4px;">{vehicle.get('name') or 'Unknown'}</div>
+            <table style="margin-top:10px; width:100%; font-size:13px; color:#475569;">
+              <tr><td style="padding:2px 0;"><b>Rego:</b></td><td>{vehicle.get('registration_number') or '-'}</td></tr>
+              <tr><td style="padding:2px 0;"><b>Make / Model:</b></td><td>{(vehicle.get('make') or '-')} {(vehicle.get('model') or '')}</td></tr>
+              <tr><td style="padding:2px 0;"><b>Year:</b></td><td>{vehicle.get('year') or '-'}</td></tr>
+              <tr><td style="padding:2px 0;"><b>Odometer:</b></td><td>{vehicle.get('current_odometer') or '-'} km</td></tr>
+              <tr><td style="padding:2px 0;"><b>VIN:</b></td><td>{vehicle.get('vin') or '-'}</td></tr>
+            </table>
+          </div>
+
+          <h2 style="font-size:16px; color:#0f172a; margin:24px 0 12px;">Open Defects ({len(open_defects)})</h2>
+          <table style="width:100%; border-collapse:collapse; background:white; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden;">
+            {rows_html}
+          </table>
+
+          <p style="color:#64748b; font-size:13px; margin-top:28px; line-height:1.6;">
+            All defects above include photo evidence and GPS-stamped timestamps in our compliance records.
+            Please reply to this email with your quote or call us if you need additional details.
+          </p>
+
+          <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
+          <p style="color:#94a3b8; font-size:11px; text-align:center;">
+            Sent via FleetShield365 — Australian Fleet Compliance Platform<br>
+            <a href="https://www.fleetshield365.com" style="color:#0891b2;">www.fleetshield365.com</a>
+          </p>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+
+    subject = f"[{company_name}] Defect Repair Request — {vehicle.get('name')} ({vehicle.get('registration_number')})"
+    sent = await send_email_notification(request.workshop_email, subject, html)
+
+    if not sent:
+        raise HTTPException(status_code=500, detail="Failed to send email. Please try again.")
+
+    # Persist log
+    try:
+        await db.workshop_emails.insert_one({
+            "id": str(uuid.uuid4()),
+            "vehicle_id": vehicle_id,
+            "company_id": current_user["company_id"],
+            "workshop_email": request.workshop_email,
+            "workshop_name": workshop_name,
+            "defect_count": len(open_defects),
+            "defect_ids": [d["id"] for d in open_defects],
+            "sent_by": current_user.get("user_id"),
+            "sent_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f"[WORKSHOP_EMAIL] Failed to persist log: {e}")
+
+    return {
+        "status": "success",
+        "message": f"Sent {len(open_defects)} defect(s) to {request.workshop_email}",
+        "defect_count": len(open_defects),
+    }
+
+
 @api_router.get("/dashboard/chart-data")
 async def get_dashboard_chart_data(
     current_user: dict = Depends(get_current_user),
