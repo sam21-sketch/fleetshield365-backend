@@ -5690,8 +5690,12 @@ async def update_defect_status(
     inspection_id = parts[0]
 
     # Verify the inspection belongs to this user's company
+    try:
+        inspection_oid = ObjectId(inspection_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed defect_id")
     insp = await db.inspections.find_one(
-        {"_id": ObjectId(inspection_id), "company_id": current_user["company_id"]},
+        {"_id": inspection_oid, "company_id": current_user["company_id"]},
         {"vehicle_id": 1}
     )
     if not insp:
