@@ -5849,6 +5849,22 @@ async def email_defects_to_workshop(
     except Exception as e:
         logger.error(f"[WORKSHOP_EMAIL] Failed to persist log: {e}")
 
+    # Auto-flip status: open -> assigned for every defect we just emailed
+    try:
+        for d in open_defects:
+            if d.get("status") == "open":
+                await db.defect_overrides.update_one(
+                    {"company_id": current_user["company_id"], "vehicle_id": vehicle_id, "defect_id": d["id"]},
+                    {"$set": {
+                        "status": "assigned",
+                        "assigned_to": workshop_name,
+                        "assigned_at": datetime.utcnow().isoformat(),
+                    }},
+                    upsert=True,
+                )
+    except Exception as e:
+        logger.error(f"[WORKSHOP_EMAIL] Failed to auto-flip statuses: {e}")
+
     return {
         "status": "success",
         "message": f"Sent {len(open_defects)} defect(s) to {request.workshop_email}",
