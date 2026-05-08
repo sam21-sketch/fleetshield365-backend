@@ -5312,6 +5312,189 @@ async def get_dashboard_stats(
     return result
 
 
+# ============== Fleet Health Score ==============
+
+CRITICAL_DEFECT_KEYWORDS = ["brake", "steering", "tire", "tyre", "light", "horn", "seatbelt", "wiper", "fluid leak"]
+
+def _classify_defect_severity(item_name: str, has_damage: bool, has_incident: bool) -> str:
+    """Classify defect severity based on keywords + flags."""
+    name_l = (item_name or "").lower()
+    if has_incident or any(k in name_l for k in ["brake", "steering", "seatbelt"]):
+        return "high"
+    if has_damage or any(k in name_l for k in CRITICAL_DEFECT_KEYWORDS):
+        return "medium"
+    return "low"
+
+
+def _vehicle_health_score(open_defects: list, expiry_days: list, last_inspection_days: int, has_grounding: bool) -> int:
+    """
+    Calculate vehicle health score 0-100.
+    - 100 = perfect
+    - <60 = critical
+    """
+    score = 100
+    severity_weights = {"high": 15, "medium": 10, "low": 5}
+    for d in open_defects:
+        score -= severity_weights.get(d.get("severity", "low"), 5)
+    # expiry_days = list of days-until-expiry for any tracked field
+    for days in expiry_days:
+        if days is not None:
+            if days < 0:
+                score -= 15  # already expired
+            elif days <= 14:
+                score -= 10
+    if last_inspection_days > 7:
+        score -= 10
+    elif last_inspection_days > 3:
+        score -= 5
+    if has_grounding:
+        score -= 20
+    return max(0, min(100, score))
+
+
+@api_router.get("/fleet-health")
+async def get_fleet_health(current_user: dict = Depends(get_current_user)):
+    """
+    Returns fleet-wide health score + per-vehicle breakdown.
+    Pulls from existing inspection data — no mobile app changes required.
+    """
+    company_id = current_user["company_id"]
+    today_str = datetime.utcnow().isoformat()[:10]
+    today_dt = datetime.utcnow()
+    thirty_days_ago = (today_dt - timedelta(days=30)).isoformat()
+    
+    # 1. Get all vehicles for this company
+    vehicles_cursor = db.vehicles.find(
+        {"company_id": company_id},
+        {"name": 1, "registration_number": 1, "rego_expiry": 1, "insurance_expiry": 1,
+         "safety_certificate_expiry": 1, "coi_expiry": 1, "status": 1}
+    )
+    vehicles = await vehicles_cursor.to_list(1000)
+    
+    # 2. Get all open defects (last 30 days, not yet marked fixed) for company
+    inspections_cursor = db.inspections.find(
+        {
+            "company_id": company_id,
+            "timestamp": {"$gte": thirty_days_ago},
+            "$or": [
+                {"is_safe": False},
+                {"new_damage": True},
+                {"incident_today": True},
+            ],
+        },
+        {"vehicle_id": 1, "timestamp": 1, "type": 1, "checklist_items": 1,
+         "new_damage": 1, "incident_today": 1, "damage_comment": 1, "incident_comment": 1,
+         "defect_status": 1}
+    )
+    inspections = await inspections_cursor.to_list(5000)
+    
+    # 3. Get last-inspection date per vehicle
+    last_insp_cursor = db.inspections.aggregate([
+        {"$match": {"company_id": company_id}},
+        {"$group": {"_id": "$vehicle_id", "last": {"$max": "$timestamp"}}}
+    ])
+    last_insp_map = {doc["_id"]: doc["last"] for doc in await last_insp_cursor.to_list(1000)}
+    
+    # Build defects per vehicle
+    defects_by_vehicle: dict = {}
+    for insp in inspections:
+        vid = insp.get("vehicle_id")
+        if not vid:
+            continue
+        bucket = defects_by_vehicle.setdefault(vid, [])
+        # Pre-start failed checklist items
+        for item in (insp.get("checklist_items") or []):
+            if item.get("status") == "issue":
+                bucket.append({
+                    "source": "prestart",
+                    "name": item.get("name"),
+                    "comment": item.get("comment"),
+                    "timestamp": insp.get("timestamp"),
+                    "severity": _classify_defect_severity(item.get("name", ""), False, False),
+                    "status": insp.get("defect_status", "open"),
+                })
+        # End-shift damage / incident
+        if insp.get("new_damage"):
+            bucket.append({
+                "source": "endshift",
+                "name": "New damage reported",
+                "comment": insp.get("damage_comment"),
+                "timestamp": insp.get("timestamp"),
+                "severity": "medium",
+                "status": insp.get("defect_status", "open"),
+            })
+        if insp.get("incident_today"):
+            bucket.append({
+                "source": "endshift",
+                "name": "Incident reported",
+                "comment": insp.get("incident_comment"),
+                "timestamp": insp.get("timestamp"),
+                "severity": "high",
+                "status": insp.get("defect_status", "open"),
+            })
+    
+    # Calculate per-vehicle score
+    per_vehicle = []
+    for v in vehicles:
+        vid = str(v.get("_id"))
+        defects = [d for d in defects_by_vehicle.get(vid, []) if d.get("status") != "fixed"]
+        # Days-until-expiry for each tracked date
+        expiry_days_list = []
+        for field in ("rego_expiry", "insurance_expiry", "safety_certificate_expiry", "coi_expiry"):
+            val = v.get(field)
+            if val:
+                try:
+                    exp_dt = datetime.fromisoformat(val[:10])
+                    expiry_days_list.append((exp_dt - today_dt).days)
+                except Exception:
+                    pass
+        # Last inspection age
+        last = last_insp_map.get(vid)
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last.replace("Z", "")) if isinstance(last, str) else last
+                last_inspection_days = (today_dt - last_dt).days
+            except Exception:
+                last_inspection_days = 999
+        else:
+            last_inspection_days = 999
+        # Has grounding defect?
+        has_grounding = any(d.get("severity") == "high" for d in defects)
+        score = _vehicle_health_score(defects, expiry_days_list, last_inspection_days, has_grounding)
+        per_vehicle.append({
+            "vehicle_id": vid,
+            "name": v.get("name"),
+            "registration_number": v.get("registration_number"),
+            "score": score,
+            "open_defects": len(defects),
+            "high_severity_defects": sum(1 for d in defects if d.get("severity") == "high"),
+            "last_inspection_days_ago": last_inspection_days if last_inspection_days < 999 else None,
+            "tier": "healthy" if score >= 90 else ("attention" if score >= 60 else "critical"),
+        })
+    
+    # Sort: critical first, then attention, then healthy
+    tier_order = {"critical": 0, "attention": 1, "healthy": 2}
+    per_vehicle.sort(key=lambda x: (tier_order.get(x["tier"], 3), x["score"]))
+    
+    # Fleet score = average
+    fleet_score = round(sum(v["score"] for v in per_vehicle) / len(per_vehicle)) if per_vehicle else 100
+    
+    # Trend: compare to score 30 days ago (simple — use today's score as baseline if no history)
+    # For now, return None for trend; future enhancement can store daily snapshots
+    
+    return {
+        "fleet_score": fleet_score,
+        "fleet_tier": "healthy" if fleet_score >= 90 else ("attention" if fleet_score >= 60 else "critical"),
+        "vehicle_count": len(per_vehicle),
+        "healthy_count": sum(1 for v in per_vehicle if v["tier"] == "healthy"),
+        "attention_count": sum(1 for v in per_vehicle if v["tier"] == "attention"),
+        "critical_count": sum(1 for v in per_vehicle if v["tier"] == "critical"),
+        "total_open_defects": sum(v["open_defects"] for v in per_vehicle),
+        "vehicles": per_vehicle,
+        "worst_vehicle": per_vehicle[0] if per_vehicle and per_vehicle[0]["tier"] != "healthy" else None,
+    }
+
+
 @api_router.get("/dashboard/chart-data")
 async def get_dashboard_chart_data(
     current_user: dict = Depends(get_current_user),
