@@ -5436,17 +5436,27 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     
     # Calculate per-vehicle score
     per_vehicle = []
+    DOC_LABELS = {
+        "rego_expiry": "Registration",
+        "insurance_expiry": "Insurance",
+        "safety_certificate_expiry": "Safety Certificate",
+        "coi_expiry": "Certificate of Inspection",
+    }
     for v in vehicles:
         vid = str(v.get("_id"))
         defects = [d for d in defects_by_vehicle.get(vid, []) if d.get("status") != "fixed"]
         # Days-until-expiry for each tracked date
         expiry_days_list = []
-        for field in ("rego_expiry", "insurance_expiry", "safety_certificate_expiry", "coi_expiry"):
+        expiring_docs = []
+        for field, label in DOC_LABELS.items():
             val = v.get(field)
             if val:
                 try:
                     exp_dt = datetime.fromisoformat(val[:10])
-                    expiry_days_list.append((exp_dt - today_dt).days)
+                    days = (exp_dt - today_dt).days
+                    expiry_days_list.append(days)
+                    if days <= 30:
+                        expiring_docs.append({"name": label, "days_until_expiry": days})
                 except Exception:
                     pass
         # Last inspection age
@@ -5471,6 +5481,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
             "high_severity_defects": sum(1 for d in defects if d.get("severity") == "high"),
             "last_inspection_days_ago": last_inspection_days if last_inspection_days < 999 else None,
             "tier": "healthy" if score >= 90 else ("attention" if score >= 60 else "critical"),
+            "expiring_docs": expiring_docs,
         })
     
     # Sort: critical first, then attention, then healthy
