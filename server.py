@@ -5361,7 +5361,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     company_id = current_user["company_id"]
     today_str = datetime.utcnow().isoformat()[:10]
     today_dt = datetime.utcnow()
-    thirty_days_ago = (today_dt - timedelta(days=30)).isoformat()
+    thirty_days_ago = today_dt - timedelta(days=30)
     
     # 1. Get all vehicles for this company
     vehicles_cursor = db.vehicles.find(
@@ -5371,11 +5371,13 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     )
     vehicles = await vehicles_cursor.to_list(1000)
     
-    # 2. Get all open defects (last 30 days, not yet marked fixed) for company
+    # 2. Get all open defects (last 30 days, not yet marked fixed) for company.
+    # Timestamp filter removed from DB query because timestamps are stored as a mix of strings
+    # (legacy) and BSON ISODates (new mobile-app data). MongoDB cannot compare across BSON types,
+    # so we filter post-fetch in Python below for type-safety.
     inspections_cursor = db.inspections.find(
         {
             "company_id": company_id,
-            "timestamp": {"$gte": thirty_days_ago},
             "$or": [
                 {"is_safe": False},
                 {"new_damage": True},
@@ -5398,7 +5400,20 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     
     # Build defects per vehicle
     defects_by_vehicle: dict = {}
+    def _ts_to_dt(t):
+        if isinstance(t, datetime):
+            return t
+        if isinstance(t, str):
+            try:
+                return datetime.fromisoformat(t.replace("Z", "")[:26])
+            except Exception:
+                return None
+        return None
     for insp in inspections:
+        # Skip inspections older than 30 days (filter in Python — handles both string + datetime timestamps)
+        ts_dt = _ts_to_dt(insp.get("timestamp"))
+        if not ts_dt or ts_dt < thirty_days_ago:
+            continue
         vid = insp.get("vehicle_id")
         if not vid:
             continue
@@ -5523,7 +5538,7 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     """
     company_id = current_user["company_id"]
     today_dt = datetime.utcnow()
-    ninety_days_ago = (today_dt - timedelta(days=90)).isoformat()
+    ninety_days_ago = today_dt - timedelta(days=90)
 
     # Verify vehicle belongs to this company
     vehicle = await db.vehicles.find_one(
@@ -5533,12 +5548,13 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    # Pull inspections that have a problem flag
+    # Pull inspections that have a problem flag.
+    # Timestamp filter applied in Python (post-fetch) because MongoDB cannot compare across
+    # the mix of legacy string timestamps and new BSON ISODate timestamps.
     inspections = await db.inspections.find(
         {
             "company_id": company_id,
             "vehicle_id": vehicle_id,
-            "timestamp": {"$gte": ninety_days_ago},
             "$or": [
                 {"is_safe": False},
                 {"new_damage": True},
@@ -5550,6 +5566,18 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
          "damage_comment": 1, "incident_comment": 1, "driver_name": 1, "driver_id": 1,
          "photos": 1, "odometer": 1}
     ).sort("timestamp", -1).to_list(500)
+
+    # Type-tolerant 90-day filter
+    def _ts_to_dt(t):
+        if isinstance(t, datetime):
+            return t
+        if isinstance(t, str):
+            try:
+                return datetime.fromisoformat(t.replace("Z", "")[:26])
+            except Exception:
+                return None
+        return None
+    inspections = [i for i in inspections if (_d := _ts_to_dt(i.get("timestamp"))) and _d >= ninety_days_ago]
 
     # Pull status overrides for this vehicle
     status_overrides_cursor = db.defect_overrides.find(
@@ -5636,10 +5664,20 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
             name_counter[name.lower()] = name_counter.get(name.lower(), 0) + 1
 
     # Detect recurring issues (3+ in last 30 days)
-    thirty_days_ago = (today_dt - timedelta(days=30)).isoformat()
+    thirty_days_ago_dt = today_dt - timedelta(days=30)
+    def _ts_to_dt(t):
+        if isinstance(t, datetime):
+            return t
+        if isinstance(t, str):
+            try:
+                return datetime.fromisoformat(t.replace("Z", "")[:26])
+            except Exception:
+                return None
+        return None
     recurring_counter: dict = {}
     for d in defects:
-        if d["timestamp"] >= thirty_days_ago:
+        d_dt = _ts_to_dt(d.get("timestamp"))
+        if d_dt and d_dt >= thirty_days_ago_dt:
             key = d["name"].lower()
             recurring_counter[key] = recurring_counter.get(key, 0) + 1
     recurring = [{"name": k, "count": v} for k, v in recurring_counter.items() if v >= 3]
@@ -5653,11 +5691,20 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     # Sort: open first (severity desc, then date desc), then assigned, then fixed
     status_order = {"open": 0, "assigned": 1, "in_progress": 1, "fixed": 2}
     severity_order = {"high": 0, "medium": 1, "low": 2}
+    def _ts_for_sort(d):
+        d_dt = _ts_to_dt(d.get("timestamp"))
+        return d_dt.timestamp() if d_dt else 0
     defects.sort(key=lambda d: (
         status_order.get(d["status"], 3),
         severity_order.get(d["severity"], 3),
-        -1 * (datetime.fromisoformat(d["timestamp"][:19]).timestamp() if d.get("timestamp") else 0),
+        -1 * _ts_for_sort(d),
     ))
+
+    # Convert all defect timestamps to ISO strings for JSON serialization
+    for d in defects:
+        d_dt = _ts_to_dt(d.get("timestamp"))
+        if d_dt:
+            d["timestamp"] = d_dt.isoformat()
 
     open_defects = [d for d in defects if d["status"] != "fixed"]
     fixed_defects = [d for d in defects if d["status"] == "fixed"]
