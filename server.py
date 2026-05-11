@@ -17,17 +17,62 @@ from bson import ObjectId
 import base64
 from io import BytesIO
 import zipfile
+import object_store
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.units import inch, cm
 import json
+import re
 import stripe
 import httpx
 import asyncio
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
+
+
+class MissingRequiredEnvVarError(RuntimeError):
+    """Raised at module load when a required environment variable is missing or empty."""
+    pass
+
+
+class SubdomainValidationError(ValueError):
+    """Base error for subdomain validation + uniqueness failures.
+
+    Subclasses carry a ``code`` attribute (``"reserved"``, ``"malformed"``,
+    ``"taken"``) which the register endpoints map to HTTP status codes per
+    Requirements 9.9 (reserved → 400), 9.10 (malformed → 400), and 9.11
+    (already used → 409). ``subdomain`` is the (already-normalized when
+    possible) offending value, so callers can echo it back in error bodies
+    without re-parsing the request.
+    """
+
+    # Overridden by each concrete subclass below.
+    code: str = "invalid"
+
+    def __init__(self, subdomain: str, message: str | None = None) -> None:
+        self.subdomain = subdomain
+        super().__init__(message or f"Invalid subdomain: {subdomain!r}")
+
+
+class ReservedSubdomainError(SubdomainValidationError):
+    """Raised when a submitted subdomain is in Reserved_Subdomain_List (Req 9.9, 10.1)."""
+
+    code = "reserved"
+
+
+class MalformedSubdomainError(SubdomainValidationError):
+    """Raised when a submitted subdomain fails SUBDOMAIN_REGEX (Req 9.3, 9.4, 9.10)."""
+
+    code = "malformed"
+
+
+class SubdomainTakenError(SubdomainValidationError):
+    """Raised when a submitted subdomain is already stored on another company (Req 9.2, 9.11)."""
+
+    code = "taken"
+
 
 # Stripe Configuration
 stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
@@ -35,13 +80,201 @@ stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+
+def _require_env(name: str) -> str:
+    """Read a required environment variable, failing fast if missing or empty.
+
+    Raises MissingRequiredEnvVarError when the value is None or empty after
+    whitespace stripping, so the error surface is clear at startup.
+    """
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        raise MissingRequiredEnvVarError(
+            f"Required env var {name!r} is missing or empty"
+        )
+    return value
+
+
+# Fail-fast validation of required environment variables at module load.
+# Must run before FastAPI app initialization and Mongo client construction.
+JWT_SECRET = _require_env('JWT_SECRET')
+MONGO_URL = _require_env('MONGO_URL')
+OBJECT_STORE_ACCESS_KEY = _require_env('OBJECT_STORE_ACCESS_KEY')
+OBJECT_STORE_SECRET_KEY = _require_env('OBJECT_STORE_SECRET_KEY')
+
+# Origin / CORS configuration loaded from environment.
+# DEFAULT_ORIGIN_URL is used as the fallback origin for password-reset links
+# and any other flow that needs to construct an absolute URL to the website.
+# Falls back to the marketing apex when the env var is unset or blank.
+DEFAULT_ORIGIN_URL: str = (
+    os.environ.get('DEFAULT_ORIGIN_URL', '').strip()
+    or 'https://www.fleetshield365.com'
+)
+
+# CORS_ALLOWED_ORIGINS is parsed as a comma-separated list of absolute origins.
+# Entries are stripped; empty entries are dropped. When the env var is unset or
+# parses to an empty list, we fall back to the default production whitelist
+# required by Requirement 8.3 (apex, www, app, owner).
+_DEFAULT_CORS_ALLOWED_ORIGINS: list[str] = [
+    'https://fleetshield365.com',
+    'https://www.fleetshield365.com',
+    'https://app.fleetshield365.com',
+    'https://owner.fleetshield365.com',
+]
+CORS_ALLOWED_ORIGINS: list[str] = [
+    o.strip()
+    for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
+    if o.strip()
+] or list(_DEFAULT_CORS_ALLOWED_ORIGINS)
+
+# Tenant subdomain regex used to decide whether an origin like
+# https://<slug>.fleetshield365.com is a legitimate tenant host even when it
+# is not explicitly listed in CORS_ALLOWED_ORIGINS. Mirrors the CORS
+# middleware's allow_origin_regex (Requirement 8.4) and is reused by
+# _is_allowed_origin for password-reset URL validation (Requirement 6.3).
+_TENANT_ORIGIN_REGEX: re.Pattern[str] = re.compile(
+    r'^https://[a-z0-9-]+\.fleetshield365\.com$'
+)
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    """Return True if ``origin`` is a trusted FleetShield365_Web host.
+
+    An origin is trusted when, after stripping surrounding whitespace and a
+    single trailing slash, it either:
+
+    * exactly matches an entry in ``CORS_ALLOWED_ORIGINS``, or
+    * matches the tenant subdomain regex ``^https://[a-z0-9-]+\\.fleetshield365\\.com$``.
+
+    Empty, ``None``, or otherwise non-matching values return False. Used to
+    prevent open-redirect via untrusted ``origin_url`` values on flows like
+    password reset (Requirement 6.3).
+    """
+    if not origin:
+        return False
+    normalized = origin.strip().rstrip('/')
+    if not normalized:
+        return False
+    if normalized in CORS_ALLOWED_ORIGINS:
+        return True
+    if _TENANT_ORIGIN_REGEX.fullmatch(normalized) is not None:
+        return True
+    return False
+
+# PLATFORM_OWNER_USER_IDS is parsed as a comma-separated list of MongoDB
+# ObjectId string representations (24-char hex). Entries are stripped; empty
+# entries are dropped. The login handler consults this frozenset to decide
+# whether to mint a JWT with role="platform_owner" for a given user
+# (Requirement 15.6). We deliberately do NOT validate that each entry is a
+# syntactically valid ObjectId at load time — invalid or stale values simply
+# never match a real user _id, which fails closed. frozenset is used so the
+# set is immutable at runtime and cheap to probe on every login.
+PLATFORM_OWNER_USER_IDS: frozenset[str] = frozenset(
+    entry.strip()
+    for entry in os.environ.get('PLATFORM_OWNER_USER_IDS', '').split(',')
+    if entry.strip()
+)
+
+# Reserved subdomains (Requirement 10.1). Values are the canonical lowercase
+# form; Requirement 10.2 requires case-insensitive comparison, so callers
+# must normalize to lowercase before checking membership. This frozenset
+# contains exactly the 23 values enumerated in Requirement 10.1 and is the
+# sole source of truth for reserved-name collision checks across the
+# Slug_Generator (Req 9.8), validate_subdomain (Req 9.9), and
+# POST /api/tenant/resolve (Req 11.5).
+RESERVED_SUBDOMAINS: frozenset[str] = frozenset({
+    'www', 'api', 'admin', 'owner', 'mail', 'app',
+    'autodiscover', 'autoconfig', 'zmail', '_domainkey', '_dmarc',
+    'em', 's1', 's2', 'cdn', 'static', 'assets',
+    'help', 'docs', 'blog', 'status', 'support', 'security',
+})
+
+# Subdomain format regex (Requirements 9.3, 9.4): 3-30 characters,
+# lowercase alphanumeric plus hyphen, no leading/trailing hyphen. This is
+# the canonical "Reserved Slug Regex" from the spec glossary; validators
+# lowercase input first (Req 9.3) before matching, so the character class
+# intentionally excludes uppercase letters.
+SUBDOMAIN_REGEX: re.Pattern[str] = re.compile(
+    r'^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$'
+)
+
+# ObjectStore (MinIO) connection + presigning configuration.
+# Loaded from env with safe defaults so local dev works out of the box and
+# the production EC2_Instance single-box layout (MinIO on 127.0.0.1:9000
+# behind Nginx_Proxy at /files/) is reflected by the defaults.
+# The access/secret key pair is already fail-fast loaded above via
+# OBJECT_STORE_ACCESS_KEY / OBJECT_STORE_SECRET_KEY; this block only covers
+# the non-secret, defaultable connection + presigning settings.
+# (Requirements 3.1, 21.12, 21.13)
+
+# OBJECT_STORE_ENDPOINT is the internal endpoint the FleetShield365_API uses
+# to reach MinIO for uploads and to compute presigned URLs. On the EC2 box
+# MinIO binds to 127.0.0.1:9000 so the default matches that layout and is
+# also valid for local dev against a default MinIO install.
+OBJECT_STORE_ENDPOINT: str = (
+    os.environ.get('OBJECT_STORE_ENDPOINT', '').strip()
+    or 'http://127.0.0.1:9000'
+)
+
+# OBJECT_STORE_PUBLIC_ENDPOINT is the public-facing base URL presigned GET
+# URLs must be rewritten to, so external clients fetch objects through
+# Nginx_Proxy at https://api.fleetshield365.com/files/... rather than
+# hitting the MinIO origin directly (Requirement 21.13).
+OBJECT_STORE_PUBLIC_ENDPOINT: str = (
+    os.environ.get('OBJECT_STORE_PUBLIC_ENDPOINT', '').strip()
+    or 'https://api.fleetshield365.com/files'
+)
+
+# OBJECT_STORE_REGION is the S3-compatible region string passed to the MinIO
+# client. MinIO accepts any value; us-east-1 is used by convention to match
+# common S3 SDK defaults.
+OBJECT_STORE_REGION: str = (
+    os.environ.get('OBJECT_STORE_REGION', '').strip()
+    or 'us-east-1'
+)
+
+# OBJECT_STORE_PRESIGN_TTL_SECONDS caps the lifetime of every presigned GET
+# URL issued by the API (Requirements 21.12, 21.15). Parsed as a positive
+# integer; when the env var is missing, empty, non-integer, or non-positive,
+# we fall back to the documented default of 3600 seconds rather than failing
+# startup, since this is a tunable rather than a secret.
+_DEFAULT_PRESIGN_TTL_SECONDS: int = 3600
+_raw_presign_ttl: str = os.environ.get(
+    'OBJECT_STORE_PRESIGN_TTL_SECONDS', ''
+).strip()
+try:
+    _parsed_presign_ttl: int = (
+        int(_raw_presign_ttl) if _raw_presign_ttl else _DEFAULT_PRESIGN_TTL_SECONDS
+    )
+except ValueError:
+    _parsed_presign_ttl = _DEFAULT_PRESIGN_TTL_SECONDS
+OBJECT_STORE_PRESIGN_TTL_SECONDS: int = (
+    _parsed_presign_ttl
+    if _parsed_presign_ttl > 0
+    else _DEFAULT_PRESIGN_TTL_SECONDS
+)
+
+client = AsyncIOMotorClient(MONGO_URL)
 db = client[os.environ.get('DB_NAME', 'fleetguard_db')]
 
+# Verify the replica set config is visible to the driver (Req 4.4, 4.6,
+# 12.4). The production ``MONGO_URL`` includes ``?replicaSet=rs0`` so
+# change streams and multi-document transactions work on the single-node
+# MongoDB_Instance. This is a defensive log — we do not crash here
+# because local dev environments often run a standalone mongod without a
+# replica set, and the application still functions in that mode. The
+# module-level ``logger`` is not yet defined at this point in module
+# load order, so emit via the ``logging`` root logger instead.
+if "replicaSet=" not in MONGO_URL:
+    logging.warning(
+        "MONGO_URL is missing ?replicaSet=<name>. Change streams and "
+        "transactions require the single-node replica set 'rs0' on the "
+        "EC2 MongoDB_Instance — production deployments MUST include "
+        "replicaSet=rs0 in the connection string (Req 4.4)."
+    )
+
 # JWT Configuration
-SECRET_KEY = os.environ.get('JWT_SECRET', 'fleetguard-secret-key-2025')
+SECRET_KEY = JWT_SECRET
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
@@ -951,10 +1184,119 @@ async def generate_unique_username(name: str, company_id: str) -> str:
     
     return username
 
+def _resolve_platform_owner(user_id: str, user_doc: Optional[dict]) -> bool:
+    """Return True if the given user is a platform owner (Req 15.6, 12.2).
+
+    A user is treated as platform_owner when either:
+
+    * their MongoDB ``_id`` stringifies to a value listed in the
+      ``PLATFORM_OWNER_USER_IDS`` env-driven frozenset, or
+    * their user document has ``is_platform_owner`` set to True.
+
+    Both gates are defence-in-depth: the env var lets the operator
+    bootstrap ownership without a DB round-trip, the DB flag lets
+    day-to-day promotions happen without a redeploy. Either one being
+    true is sufficient.
+    """
+
+    if user_id in PLATFORM_OWNER_USER_IDS:
+        return True
+    if user_doc and user_doc.get("is_platform_owner") is True:
+        return True
+    return False
+
+
+async def _mint_access_token(
+    user_id: str,
+    *,
+    user_doc: Optional[dict] = None,
+    company_id: Optional[str] = None,
+    subdomain: Optional[str] = None,
+    role: Optional[str] = None,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """Mint a JWT carrying the full tenant + role claim set (Req 12.1-12.3).
+
+    The resulting token payload contains ``sub``, ``company_id``,
+    ``subdomain``, ``role``, ``iat`` and ``exp``. ``role`` is one of
+    ``super_admin`` / ``admin`` / ``driver`` / ``platform_owner`` — a
+    user listed in ``PLATFORM_OWNER_USER_IDS`` or carrying
+    ``users.is_platform_owner == true`` is minted a token with
+    ``role="platform_owner"`` regardless of their ``users.role`` field
+    (Req 15.6).
+
+    When ``company_id`` / ``subdomain`` / ``role`` are not supplied the
+    helper fetches the user + company documents to fill them in so the
+    minted token always reflects the current state of the DB at mint
+    time (Req 12.3).
+    """
+
+    # Fetch user if the caller didn't already have it.
+    if user_doc is None:
+        try:
+            user_doc = await db.users.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            user_doc = None
+
+    resolved_company_id = company_id or (
+        user_doc.get("company_id") if user_doc else None
+    )
+
+    resolved_role: str
+    if _resolve_platform_owner(user_id, user_doc):
+        resolved_role = UserRole.PLATFORM_OWNER
+    elif role and role in ALLOWED_JWT_ROLES:
+        resolved_role = role
+    else:
+        user_role = (user_doc or {}).get("role") if user_doc else None
+        resolved_role = (
+            user_role
+            if user_role in ALLOWED_JWT_ROLES
+            else UserRole.DRIVER
+        )
+
+    resolved_subdomain = subdomain
+    if resolved_subdomain is None and resolved_company_id:
+        try:
+            company_doc = await db.companies.find_one(
+                {"_id": ObjectId(resolved_company_id)},
+                {"subdomain": 1},
+            )
+            if company_doc:
+                resolved_subdomain = company_doc.get("subdomain")
+        except Exception:
+            resolved_subdomain = None
+
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(user_id),
+        "company_id": str(resolved_company_id) if resolved_company_id else None,
+        "subdomain": resolved_subdomain,
+        "role": resolved_role,
+        "iat": int(now.timestamp()),
+        "exp": now + (
+            expires_delta
+            or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+        ),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
 def create_access_token(data: dict, expires_delta: timedelta = None):
+    """Synchronous thin wrapper around ``jwt.encode`` for legacy call sites.
+
+    Prefer ``_mint_access_token`` (async, fetches company + role) for new
+    code paths. This shim keeps a handful of older callers working with a
+    ``{"sub": user_id}`` payload; it does NOT populate ``company_id`` /
+    ``subdomain`` / ``role`` claims, so ``get_current_user`` is tolerant
+    of their absence (Req 12.4 only enforces the stale-subdomain check
+    when the ``subdomain`` claim is present).
+    """
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS))
-    to_encode.update({"exp": expire})
+    now = datetime.utcnow()
+    expire = now + (expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS))
+    to_encode.setdefault("iat", int(now.timestamp()))
+    to_encode["exp"] = expire
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -966,12 +1308,79 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
+
+        # Stale-subdomain rejection (Req 12.4, 12.5). When the JWT was
+        # minted with a ``subdomain`` claim we look up the current
+        # ``companies.subdomain`` and 401 on mismatch so a token survives
+        # only as long as the tenant slug on the token does. Tokens minted
+        # before the subdomain claim existed (legacy path) carry no
+        # ``subdomain`` and are accepted unchanged — the guarantee only
+        # applies to new-style tokens.
+        token_subdomain = payload.get("subdomain")
+        token_company_id = payload.get("company_id")
+        if token_subdomain is not None:
+            compare_company_id = token_company_id or user.get("company_id")
+            if compare_company_id:
+                try:
+                    company_doc = await db.companies.find_one(
+                        {"_id": ObjectId(compare_company_id)},
+                        {"subdomain": 1},
+                    )
+                except Exception:
+                    company_doc = None
+                current_subdomain = (
+                    company_doc.get("subdomain") if company_doc else None
+                )
+                if current_subdomain != token_subdomain:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Stale token: tenant subdomain has changed; please log in again",
+                    )
+
         user['id'] = str(user['_id'])
+        # Expose the JWT role on the returned user object so downstream
+        # dependencies like ``require_platform_owner`` can gate on the
+        # minted role (which is NOT necessarily equal to ``users.role``
+        # — ``platform_owner`` is mint-time-only, not persisted there).
+        user['jwt_role'] = payload.get('role')
+        user['jwt_company_id'] = payload.get('company_id')
+        user['jwt_subdomain'] = payload.get('subdomain')
         return user
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:
+        # PyJWT raises ``InvalidTokenError`` (and subclasses) for every
+        # malformed-token failure mode. Older ``python-jose`` style
+        # ``jwt.JWTError`` does not exist in PyJWT, so using that here
+        # bubbles an ``AttributeError`` up and turns a 401 into a 500.
         raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        # Defensive catch so a malformed bearer never crashes to 500.
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def require_platform_owner(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """FastAPI dependency that enforces the ``platform_owner`` role.
+
+    Returns the current user when the request bearer token carries
+    ``role == "platform_owner"``. Raises HTTP 403 on any other role so the
+    owner dashboard at ``owner.fleetshield365.com`` is the only UI whose
+    users can exercise the ``/api/developer/*`` surface (Req 15.3, 15.4,
+    15.5). HTTP 401 is handled upstream by ``get_current_user`` when the
+    bearer is missing or invalid.
+    """
+
+    role = current_user.get("jwt_role") or current_user.get("role")
+    if role != UserRole.PLATFORM_OWNER:
+        raise HTTPException(
+            status_code=403,
+            detail="Platform owner role required",
+        )
+    return current_user
 
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict"""
@@ -997,12 +1406,327 @@ def serialize_doc(doc):
         return result
     return doc
 
+
+def _upload_base64_or_400(
+    bucket: str,
+    key: str,
+    b64_string: str,
+    default_ext: str,
+    field_name: str,
+    expected_company_id: Optional[str] = None,
+) -> None:
+    """Wrap ``object_store.upload_base64`` and translate errors to HTTP responses.
+
+    Task 5.3 requires every write path that accepted a base64 field to now
+    upload the bytes to MinIO and store only the resulting object key in
+    MongoDB (Requirements 21.10, 21.11). When the incoming payload is not
+    valid base64 we surface a 400 response naming the offending field
+    rather than letting the generic 500 handler fire.
+
+    Task 5.5 extends the contract: callers pass ``expected_company_id``
+    (typically ``current_user["company_id"]``) so the object store can
+    enforce Requirement 21.14 — the ``<company_id>`` segment of the
+    object key must match the authenticated uploader's tenant. A
+    mismatch surfaces as HTTP 403 (not 400) because the payload is
+    well-formed; the request is forbidden by policy.
+    """
+    try:
+        object_store.upload_base64(
+            bucket,
+            key,
+            b64_string,
+            default_ext,
+            expected_company_id=expected_company_id,
+        )
+    except object_store.TenantPrefixViolation as exc:
+        # 403 — authorization violation. The payload decoded fine; the
+        # key simply does not belong to this tenant's namespace.
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden Object_Key for {field_name}: {exc}",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid base64 payload in {field_name}: {exc}",
+        )
+
+
+def _presign_if_key(bucket: str, key: Optional[str]) -> Optional[str]:
+    """Return a presigned GET URL for ``<bucket>/<key>`` or ``None``.
+
+    Read-path helper used by every handler that returns a document carrying
+    an ``<name>_object_key`` field. Emits a sibling ``<name>_url`` so the
+    frontend can render the asset directly from
+    ``https://api.fleetshield365.com/files/<bucket>/<key>?X-Amz-...`` via
+    Nginx_Proxy (Requirements 21.12, 21.13).
+
+    Returns ``None`` when ``key`` is falsy (missing, empty string, ``None``)
+    so callers can unconditionally emit ``<name>_url: _presign_if_key(...)``
+    for both populated and empty key fields.
+
+    Any exception from ``object_store.presign_get`` (MinIO outage, transient
+    network error, misconfigured client) is logged and swallowed by
+    returning ``None``. Presigning is a read-side convenience; a single
+    MinIO hiccup must not 500 the entire read path and block the rest of
+    the response body.
+    """
+    if not key:
+        return None
+    try:
+        return object_store.presign_get(bucket, key)
+    except Exception as exc:
+        logger.warning(
+            "Failed to presign %s/%s: %s", bucket, key, exc
+        )
+        return None
+
+
+def _presign_keys(bucket: str, keys: Optional[List[str]]) -> List[Optional[str]]:
+    """Return a parallel list of presigned URLs for a list of object keys.
+
+    Used for fields like ``incidents.damage_photos`` that are stored as a
+    flat ``List[str]`` of object keys. The returned list preserves
+    positional alignment so a frontend can pair ``damage_photos[i]`` with
+    ``damage_photo_urls[i]``. Falsy entries (``None``, empty string) map to
+    ``None`` in the output.
+    """
+    return [_presign_if_key(bucket, k) for k in (keys or [])]
+
+
+def _presign_photos(
+    photos: List[dict],
+    bucket: str,
+    *,
+    url_field: str = "object_url",
+    key_field: str = "object_key",
+) -> List[dict]:
+    """Return a shallow copy of ``photos`` with a presigned URL added.
+
+    Each input dict gets ``<url_field>`` populated from
+    ``object_store.presign_get(bucket, entry[<key_field>])`` when
+    ``entry[<key_field>]`` is set; otherwise ``<url_field>`` is ``None``.
+    The original dicts are not mutated; a new list of new dicts is
+    returned so callers can pass the result straight into ``serialize_doc``
+    without affecting their source data.
+    """
+    enriched: List[dict] = []
+    for entry in photos or []:
+        if not isinstance(entry, dict):
+            enriched.append(entry)
+            continue
+        copy = dict(entry)
+        copy[url_field] = _presign_if_key(bucket, copy.get(key_field))
+        enriched.append(copy)
+    return enriched
+
+# ============== Subdomain helpers (Task 6) ==============
+#
+# These helpers implement the tenant subdomain validation and slug
+# generation described in Requirements 9 and 10:
+#
+# * validate_subdomain — normalize + format-check + reserved-name check
+#   (Req 9.3, 9.4, 9.5, 9.9, 9.10)
+# * ensure_subdomain_unique — DB uniqueness check (Req 9.2, 9.11)
+# * slug_generator — derive a candidate slug from a company name and
+#   resolve collisions against reserved list + existing subdomains
+#   (Req 9.7, 9.8)
+#
+# The register endpoints wire these together (Req 9.1, 9.3, 9.7) and
+# translate the raised ``SubdomainValidationError`` subclasses into HTTP
+# status codes (Req 9.9, 9.10, 9.11).
+
+
+def validate_subdomain(value: str) -> str:
+    """Normalize and validate a user-submitted subdomain slug.
+
+    Returns the lowercased, stripped canonical form on success. Raises
+    ``MalformedSubdomainError`` when the value fails ``SUBDOMAIN_REGEX``
+    (Requirements 9.3, 9.4, 9.10) and ``ReservedSubdomainError`` when the
+    normalized value is in ``RESERVED_SUBDOMAINS`` (Requirements 9.5,
+    9.9, 10.1, 10.2). Uniqueness against the ``companies`` collection is
+    a separate concern and lives in ``ensure_subdomain_unique`` so callers
+    that only need format validation can skip the DB round-trip.
+
+    ``value`` being ``None`` or a non-string is treated as malformed so
+    this function is safe to call on raw request bodies.
+    """
+    if not isinstance(value, str):
+        raise MalformedSubdomainError(
+            subdomain=str(value) if value is not None else "",
+            message="subdomain must be a string",
+        )
+    normalized = value.strip().lower()
+    if SUBDOMAIN_REGEX.fullmatch(normalized) is None:
+        raise MalformedSubdomainError(
+            subdomain=normalized,
+            message=(
+                "subdomain must be 3-30 characters of lowercase letters, "
+                "digits, or hyphens, with no leading or trailing hyphen"
+            ),
+        )
+    if normalized in RESERVED_SUBDOMAINS:
+        raise ReservedSubdomainError(
+            subdomain=normalized,
+            message=f"subdomain {normalized!r} is reserved",
+        )
+    return normalized
+
+
+async def ensure_subdomain_unique(
+    subdomain: str,
+    db_,
+    *,
+    exclude_company_id: Optional[str] = None,
+) -> None:
+    """Raise ``SubdomainTakenError`` if another company already holds the slug.
+
+    ``subdomain`` must already be normalized (lowercase, trimmed) —
+    callers should run ``validate_subdomain`` first. ``exclude_company_id``
+    lets the rename flow exempt the current tenant from the collision
+    check (Requirement 17.1 — a no-op rename must not 409 itself).
+
+    The query uses a simple equality filter against ``companies.subdomain``;
+    Requirement 9.6 pairs this with a unique sparse case-insensitive index
+    that the ``ensure_indexes()`` bootstrap creates (Task 12.3), giving
+    the DB the authoritative uniqueness guarantee under concurrent writes.
+    This application-level check runs first so we can return a clean 409
+    rather than surfacing a raw ``DuplicateKeyError``.
+    """
+    existing = await db_.companies.find_one(
+        {"subdomain": subdomain},
+        {"_id": 1},
+    )
+    if existing is None:
+        return
+    if exclude_company_id and str(existing["_id"]) == exclude_company_id:
+        return
+    raise SubdomainTakenError(
+        subdomain=subdomain,
+        message=f"subdomain {subdomain!r} is already in use",
+    )
+
+
+async def slug_generator(name: str, db_) -> str:
+    """Derive a unique, non-reserved tenant slug from a company ``name``.
+
+    Implements Requirements 9.7 and 9.8:
+
+    1. Lowercase ``name``.
+    2. Replace runs of non-alphanumeric characters with a single hyphen.
+    3. Strip leading and trailing hyphens.
+    4. Truncate to 30 characters.
+    5. If the candidate is empty, fails ``SUBDOMAIN_REGEX``, collides with
+       ``RESERVED_SUBDOMAINS``, or already exists in
+       ``companies.subdomain``, append ``-N`` starting at N=2 and
+       incrementing until a valid, unreserved, unique slug is found.
+
+    When the normalized base is shorter than the 3-character minimum
+    (e.g., a pathological name like ``"!"`` that strips to empty) we
+    fall back to a random ``tenant-<hex>`` base so the generator always
+    terminates with a regex-valid slug rather than raising.
+
+    The caller (register endpoints) treats the returned value as
+    already-validated; downstream persistence code must NOT re-validate
+    with ``validate_subdomain`` because a generator-produced slug is
+    guaranteed to match ``SUBDOMAIN_REGEX``.
+    """
+    # Step 1-3: normalize and slugify. Collapse any run of non-
+    # alphanumerics into a single hyphen (covers whitespace, punctuation,
+    # unicode letters we don't accept) without needing a full Unicode-
+    # aware slugify library.
+    base = (name or "").lower()
+    base = re.sub(r'[^a-z0-9]+', '-', base).strip('-')
+    # Step 4: enforce the 30-char upper bound up front so suffix math has
+    # room. Re-strip trailing hyphens in case truncation landed mid-run.
+    base = base[:30].strip('-')
+
+    # Fallback for empty/too-short bases (e.g., name was "!!!" or a
+    # single character). The fallback form is always regex-valid
+    # (``tenant-`` prefix + 6 hex chars = 13 chars, all lowercase
+    # alphanumeric/hyphen, no leading/trailing hyphen).
+    if len(base) < 3 or SUBDOMAIN_REGEX.fullmatch(base) is None:
+        base = f"tenant-{uuid.uuid4().hex[:6]}"
+
+    # Step 5: resolve collisions. Try the bare base first, then `-2`,
+    # `-3`, ... The suffix starts at 2 per Requirement 9.8. We use a
+    # sentinel ``suffix == 1`` to mean "no suffix yet".
+    suffix = 1
+    while True:
+        if suffix == 1:
+            candidate = base
+        else:
+            suffix_str = f"-{suffix}"
+            # Ensure base + suffix fits in 30 chars; trim the base if
+            # needed and re-strip trailing hyphen.
+            max_base_len = 30 - len(suffix_str)
+            trimmed_base = base[:max_base_len].rstrip('-')
+            if not trimmed_base:
+                # Extreme edge case: suffix_str alone is ~30 chars (would
+                # require N with ~28 digits). Fall through to a random
+                # base so we terminate.
+                trimmed_base = f"tenant-{uuid.uuid4().hex[:6]}"[:max_base_len]
+            candidate = f"{trimmed_base}{suffix_str}"
+
+        if (
+            SUBDOMAIN_REGEX.fullmatch(candidate) is not None
+            and candidate not in RESERVED_SUBDOMAINS
+        ):
+            existing = await db_.companies.find_one(
+                {"subdomain": candidate},
+                {"_id": 1},
+            )
+            if existing is None:
+                return candidate
+
+        suffix = 2 if suffix == 1 else suffix + 1
+        # Guard against unbounded loops under pathological states. After
+        # 1000 tries, fall back to a random suffix which has effectively
+        # zero collision probability.
+        if suffix > 1000:
+            return f"tenant-{uuid.uuid4().hex[:8]}"
+
+
+def _subdomain_error_to_http(exc: SubdomainValidationError) -> HTTPException:
+    """Translate a ``SubdomainValidationError`` into the spec HTTP code.
+
+    Per Requirements 9.9, 9.10, 9.11:
+    * ``reserved`` → 400 with a body identifying the subdomain as reserved
+    * ``malformed`` → 400 with a body describing the required format
+    * ``taken`` → 409
+
+    Unknown codes fall through to a generic 400 so any future subclass
+    that forgets to map cleanly still fails closed rather than 500ing.
+    """
+    status_code = 409 if exc.code == "taken" else 400
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": "invalid_subdomain",
+            "code": exc.code,
+            "subdomain": exc.subdomain,
+            "message": str(exc),
+        },
+    )
+
+
 # ============== Pydantic Models ==============
 
 class UserRole:
     SUPER_ADMIN = "super_admin"
     ADMIN = "admin"
     DRIVER = "driver"
+    PLATFORM_OWNER = "platform_owner"
+
+
+# Allowed values for the JWT ``role`` claim (Requirement 12.2). Any future
+# role addition must be reflected here and in the UserRole pseudo-enum.
+ALLOWED_JWT_ROLES: frozenset[str] = frozenset({
+    UserRole.SUPER_ADMIN,
+    UserRole.ADMIN,
+    UserRole.DRIVER,
+    UserRole.PLATFORM_OWNER,
+})
 
 class VehicleStatus:
     ACTIVE = "active"
@@ -1033,6 +1757,12 @@ class UserRegister(BaseModel):
     phone: Optional[str] = None
     role: str = UserRole.DRIVER
     company_id: Optional[str] = None
+    # Optional tenant subdomain (Requirements 9.1, 9.3). When provided the
+    # value is validated + uniqueness-checked; when omitted the register
+    # handler calls slug_generator() to derive one from the company name.
+    # Mobile clients should NOT set this — they carry tenant context via
+    # JWT claims (Requirement 18.2) — but the web signup form may.
+    subdomain: Optional[str] = None
     # Driver license and training details
     license_number: Optional[str] = None
     license_class: Optional[str] = None
@@ -1076,6 +1806,14 @@ class UserLogin(BaseModel):
     username: Optional[str] = None  # Alternative to email
     password: str
     remember_me: bool = False  # Keep logged in option
+    # Optional tenant subdomain (Requirements 13.1, 14.2). When the web
+    # client is on a tenant host like ``acme.fleetshield365.com`` it
+    # includes ``tenant_subdomain: "acme"`` so the backend enforces that
+    # the authenticated user belongs to that tenant (401 on mismatch,
+    # 401 on unknown slug). When omitted — apex / www / mobile — the
+    # login proceeds and the apex path returns a ``redirect_to`` pointing
+    # at the user's own tenant dashboard.
+    tenant_subdomain: Optional[str] = None
 
 # Fuel Submission Models
 class FuelSubmission(BaseModel):
@@ -1341,6 +2079,10 @@ class CompanyRegister(BaseModel):
     origin_url: Optional[str] = None
     role: Optional[str] = None  # 'super_admin' for Company Owner, 'admin' for Admin
     timezone: Optional[str] = "Australia/Sydney"  # Company timezone for timestamps
+    # Optional tenant subdomain (Requirements 9.1, 9.3). When provided the
+    # value is validated + uniqueness-checked; when omitted the register
+    # handler calls slug_generator() to derive one from ``company_name``.
+    subdomain: Optional[str] = None
 
 # Pricing Configuration
 PRICING = {
@@ -1428,14 +2170,37 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontSize=10, spaceAfter=6)
     
     # Company Logo (if exists)
-    if company and company.get('logo_base64'):
+    # Task 5.4: post-migration the logo lives in MinIO at
+    # company.logo_object_key. Fetch the bytes via object_store.get_bytes
+    # so we can embed the image in the PDF. Pre-migration rows that still
+    # carry logo_base64 fall through to the legacy branch below.
+    logo_bytes: Optional[bytes] = None
+    if company and company.get('logo_object_key'):
         try:
-            logo_data = base64.b64decode(company['logo_base64'].split(',')[-1] if ',' in company['logo_base64'] else company['logo_base64'])
-            logo_img = RLImage(BytesIO(logo_data), width=2*inch, height=1*inch)
+            logo_bytes = object_store.get_bytes(
+                "logos", company['logo_object_key']
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch company logo %s from MinIO: %s",
+                company.get('logo_object_key'), exc,
+            )
+            logo_bytes = None
+    if logo_bytes is None and company and company.get('logo_base64'):
+        try:
+            raw_b64 = company['logo_base64']
+            logo_bytes = base64.b64decode(
+                raw_b64.split(',')[-1] if ',' in raw_b64 else raw_b64
+            )
+        except Exception:
+            logo_bytes = None
+    if logo_bytes:
+        try:
+            logo_img = RLImage(BytesIO(logo_bytes), width=2*inch, height=1*inch)
             elements.append(logo_img)
             elements.append(Spacer(1, 12))
-        except:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to embed company logo: %s", exc)
     
     # Title
     inspection_type = "Prestart Inspection Report" if inspection['type'] == 'prestart' else "End of Shift Report"
@@ -1524,48 +2289,91 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
         elements.append(Spacer(1, 20))
     
     # Photos section (with actual images)
+    # Task 5.4: photos are now referenced by object_key on the
+    # inspection_photos collection; fetch each via object_store.get_bytes
+    # so the PDF embeds the actual image. Pre-migration rows that still
+    # carry base64_data inline are handled by the fallback branch.
     if inspection.get('photos') and len(inspection['photos']) > 0:
         elements.append(Paragraph("Inspection Photos", heading_style))
         elements.append(Spacer(1, 10))
         
+        rendered_any = False
         # Add photos one by one (simpler approach)
         for i, photo in enumerate(inspection['photos'][:6]):  # Limit to 6 photos
             try:
-                photo_base64 = photo.get('base64_data', '')
-                if photo_base64:
-                    # Remove data URL prefix if present
-                    if ',' in photo_base64:
-                        photo_base64 = photo_base64.split(',')[-1]
-                    
-                    photo_bytes = base64.b64decode(photo_base64)
+                photo_bytes: Optional[bytes] = None
+                photo_key = photo.get('object_key')
+                if photo_key:
+                    try:
+                        photo_bytes = object_store.get_bytes(
+                            "inspection-photos", photo_key
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to fetch inspection photo %s: %s",
+                            photo_key, exc,
+                        )
+                        photo_bytes = None
+                if photo_bytes is None:
+                    photo_base64 = photo.get('base64_data', '') or ''
+                    if photo_base64:
+                        if ',' in photo_base64:
+                            photo_base64 = photo_base64.split(',')[-1]
+                        try:
+                            photo_bytes = base64.b64decode(photo_base64)
+                        except Exception:
+                            photo_bytes = None
+                if photo_bytes:
                     photo_img = RLImage(BytesIO(photo_bytes), width=3*inch, height=2.5*inch)
-                    
+
                     # Add photo type label
                     photo_type = photo.get('photo_type', 'Photo').replace('_', ' ').title()
                     elements.append(Paragraph(f"<b>{photo_type}</b>", normal_style))
                     elements.append(Spacer(1, 5))
                     elements.append(photo_img)
                     elements.append(Spacer(1, 15))
+                    rendered_any = True
             except Exception as e:
                 logger.error(f"Failed to add photo to PDF: {e}")
                 continue
         
-        if not any(p.get('base64_data') for p in inspection['photos'][:6]):
+        if not rendered_any:
             elements.append(Paragraph("Photos on file (unable to render)", normal_style))
         
         elements.append(Spacer(1, 20))
     
     # Signature
-    if inspection.get('signature_base64'):
+    # Task 5.4: signature now lives in MinIO at
+    # inspection.signature_object_key. Fetch the bytes via
+    # object_store.get_bytes; pre-migration rows still carrying
+    # signature_base64 fall through to the legacy branch.
+    sig_bytes: Optional[bytes] = None
+    if inspection.get('signature_object_key'):
+        try:
+            sig_bytes = object_store.get_bytes(
+                "signatures", inspection['signature_object_key']
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch inspection signature %s: %s",
+                inspection.get('signature_object_key'), exc,
+            )
+            sig_bytes = None
+    if sig_bytes is None and inspection.get('signature_base64'):
+        sig_data = inspection['signature_base64']
+        if ',' in sig_data:
+            sig_data = sig_data.split(',')[-1]
+        try:
+            sig_bytes = base64.b64decode(sig_data)
+        except Exception:
+            sig_bytes = None
+    if sig_bytes is not None:
         elements.append(Paragraph("Driver Signature", heading_style))
         try:
-            sig_data = inspection['signature_base64']
-            if ',' in sig_data:
-                sig_data = sig_data.split(',')[-1]
-            sig_bytes = base64.b64decode(sig_data)
             sig_img = RLImage(BytesIO(sig_bytes), width=2*inch, height=0.75*inch)
             elements.append(sig_img)
         except Exception as e:
+            logger.warning("Failed to embed signature: %s", e)
             elements.append(Paragraph("Signature on file", normal_style))
         elements.append(Spacer(1, 12))
     
@@ -1829,10 +2637,26 @@ async def register(user: UserRegister, request: Request):
     # Create company for super_admin
     company_id = user.company_id
     if user.role == UserRole.SUPER_ADMIN and not company_id:
+        # Resolve the tenant subdomain (Requirements 9.1, 9.3, 9.7).
+        # When the caller supplied a subdomain we validate + uniqueness-
+        # check it; otherwise we derive one from the company name via
+        # slug_generator. Validation errors surface as 400/409 per the
+        # _subdomain_error_to_http mapping.
+        company_name = f"{user.name}'s Company"
+        try:
+            if user.subdomain is not None:
+                resolved_subdomain = validate_subdomain(user.subdomain)
+                await ensure_subdomain_unique(resolved_subdomain, db)
+            else:
+                resolved_subdomain = await slug_generator(company_name, db)
+        except SubdomainValidationError as exc:
+            raise _subdomain_error_to_http(exc)
+
         company = {
             "_id": ObjectId(),
-            "name": f"{user.name}'s Company",
-            "logo_base64": None,
+            "name": company_name,
+            "subdomain": resolved_subdomain,
+            "logo_object_key": None,
             "subscription_plan": "basic",
             "active_vehicles_count": 0,
             "billing_history": [],
@@ -1856,8 +2680,16 @@ async def register(user: UserRegister, request: Request):
     }
     await db.users.insert_one(user_doc)
     
-    # Create token
-    token = create_access_token({"sub": str(user_doc["_id"])})
+    # Mint a full-claims JWT (Req 12.1-12.3). ``user_doc`` carries the
+    # newly persisted role / company_id; ``_mint_access_token`` looks up
+    # the current companies.subdomain so the ``subdomain`` claim always
+    # reflects the slug we just resolved.
+    token = await _mint_access_token(
+        str(user_doc["_id"]),
+        user_doc=user_doc,
+        company_id=company_id,
+        role=user_doc["role"],
+    )
     
     return {
         "access_token": token,
@@ -1884,7 +2716,33 @@ async def login(credentials: UserLogin, request: Request):
     
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
+    # Tenant-scoped login enforcement (Req 13.1, 13.2, 13.3, 13.4). When
+    # the client passed a ``tenant_subdomain`` (always true on the web
+    # client when it is on a tenant host), look up the company attached
+    # to the authenticated user and reject with 401 if:
+    #   * the submitted slug does not correspond to any company, or
+    #   * the user's ``company_id`` does not map to that company.
+    # 401 is deliberate — a 403 would leak that the creds are valid but
+    # on the wrong tenant, which is useful information to an attacker
+    # enumerating which orgs a given email belongs to.
+    company_doc: Optional[dict] = None
+    user_company_id = user.get("company_id")
+    if credentials.tenant_subdomain:
+        try:
+            submitted_slug = validate_subdomain(credentials.tenant_subdomain)
+        except SubdomainValidationError:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        scoped_company = await db.companies.find_one(
+            {"subdomain": submitted_slug},
+            {"_id": 1, "subdomain": 1, "timezone": 1, "name": 1},
+        )
+        if not scoped_company:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not user_company_id or str(scoped_company["_id"]) != str(user_company_id):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        company_doc = scoped_company
+
     # Update last login
     await db.users.update_one(
         {"_id": user["_id"]},
@@ -1893,25 +2751,49 @@ async def login(credentials: UserLogin, request: Request):
     
     # Token expiry based on "remember me" option
     expires_delta = timedelta(days=30) if credentials.remember_me else timedelta(days=1)
-    token = create_access_token({"sub": str(user["_id"])}, expires_delta=expires_delta)
-    
-    # Get company timezone if user has a company
+    token = await _mint_access_token(
+        str(user["_id"]),
+        user_doc=user,
+        company_id=user_company_id,
+        expires_delta=expires_delta,
+    )
+
+    # Get company timezone + subdomain if we did not already fetch the
+    # company document during tenant scoping.
     company_timezone = DEFAULT_TIMEZONE
-    company_id = user.get("company_id")
-    if company_id:
-        company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
-        if company:
-            company_timezone = company.get("timezone", DEFAULT_TIMEZONE)
-    
+    company_subdomain: Optional[str] = None
+    if user_company_id:
+        if company_doc is None:
+            company_doc = await db.companies.find_one(
+                {"_id": ObjectId(user_company_id)},
+                {"timezone": 1, "subdomain": 1, "name": 1},
+            )
+        if company_doc:
+            company_timezone = company_doc.get("timezone", DEFAULT_TIMEZONE)
+            company_subdomain = company_doc.get("subdomain")
+
     # Add company timezone to user data
     user_data = serialize_doc(user)
     user_data["company_timezone"] = company_timezone
-    
-    return {
+
+    response: dict = {
         "access_token": token,
         "token_type": "bearer",
-        "user": user_data
+        "user": user_data,
     }
+
+    # Apex / www login redirect (Req 14.3). When the caller did NOT pass
+    # a ``tenant_subdomain`` (i.e. they logged in from the marketing
+    # apex, www, or owner host) and the user belongs to a company with
+    # a resolvable subdomain, surface a ``redirect_to`` URL so the web
+    # client can bounce the session to the branded tenant host. The
+    # client is free to ignore it (mobile clients stay on api.* + JWT).
+    if not credentials.tenant_subdomain and company_subdomain:
+        response["redirect_to"] = (
+            f"https://{company_subdomain}.fleetshield365.com/dashboard"
+        )
+
+    return response
 
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
@@ -1929,6 +2811,11 @@ async def get_me(current_user: dict = Depends(get_current_user)):
             # Override with dynamic vehicle count
             company["vehicle_count"] = vehicle_count
             company["active_vehicles_count"] = vehicle_count
+            # Task 5.4: expose presigned logo URL alongside logo_object_key
+            # (Requirements 21.12, 21.13).
+            company["logo_url"] = _presign_if_key(
+                "logos", company.get("logo_object_key")
+            )
     
     return {
         "user": serialize_doc(current_user),
@@ -1939,7 +2826,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
-    origin_url: str = "https://form-submission-test-3.preview.emergentagent.com"
+    origin_url: str = DEFAULT_ORIGIN_URL
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1974,7 +2861,23 @@ async def forgot_password(request: ForgotPasswordRequest):
     )
     
     # Send reset email
-    reset_url = f"{request.origin_url}/reset-password?token={reset_token}"
+    # Validate the submitted origin against the CORS allow list / tenant
+    # subdomain regex to prevent an open-redirect via the password-reset
+    # email (Requirement 6.3). On mismatch we silently fall back to
+    # DEFAULT_ORIGIN_URL — this is a trust boundary, not user-facing input
+    # validation, so surfacing a 4xx would only help an attacker probe.
+    submitted_origin = request.origin_url
+    if _is_allowed_origin(submitted_origin):
+        validated_origin = submitted_origin.strip().rstrip('/')
+    else:
+        logger.warning(
+            "forgot_password: rejecting disallowed origin_url=%r; "
+            "falling back to DEFAULT_ORIGIN_URL",
+            submitted_origin,
+        )
+        validated_origin = DEFAULT_ORIGIN_URL.rstrip('/')
+
+    reset_url = f"{validated_origin}/reset-password?token={reset_token}"
     html_content = f"""
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f8fafc;">
@@ -2169,7 +3072,18 @@ async def submit_contact_form(request: ContactFormRequest):
         logger.error(f"[CONTACT] Failed to persist contact submission: {e}")
 
     if not admin_sent:
-        raise HTTPException(status_code=500, detail="Unable to send your message right now. Please email us directly.")
+        # Pilot / pre-SendGrid state: the contact submission is
+        # persisted above; we surface a 202 Accepted so the website UI
+        # can still acknowledge receipt instead of showing a hard 5xx.
+        # Once SendGrid is wired up this branch stops firing.
+        logger.warning(
+            "/api/contact: email not delivered (SendGrid not configured); "
+            "submission persisted for manual follow-up."
+        )
+        return {
+            "status": "pending",
+            "message": "Message received. We'll be in touch soon.",
+        }
 
     return {"status": "success", "message": "Message received. We'll be in touch soon."}
 
@@ -2196,6 +3110,10 @@ async def get_company(current_user: dict = Depends(get_current_user)):
     result["active_vehicles_count"] = vehicle_count
     # Ensure timezone has a default value
     result["timezone"] = result.get("timezone", DEFAULT_TIMEZONE)
+    # Task 5.4: expose a presigned GET URL alongside the logo_object_key so
+    # the frontend renders the asset directly through Nginx_Proxy without
+    # pulling bytes through the API (Requirements 21.12, 21.13).
+    result["logo_url"] = _presign_if_key("logos", result.get("logo_object_key"))
     return result
 
 @api_router.get("/timezones")
@@ -2211,15 +3129,36 @@ async def update_company(update: CompanyUpdate, current_user: dict = Depends(get
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    # Task 5.3: strip logo_base64 off the payload and route it through MinIO.
+    # The stored document must not contain the raw base64 (Req 21.11); we
+    # upload under logos/<company_id>/logo.png and persist logo_object_key.
+    company_id = current_user["company_id"]
     update_data = {k: v for k, v in update.dict().items() if v is not None}
+    logo_b64 = update_data.pop("logo_base64", None)
+    if logo_b64:
+        logo_key = f"{company_id}/logo.png"
+        _upload_base64_or_400(
+            "logos", logo_key, logo_b64, "png", "logo_base64",
+            expected_company_id=company_id,
+        )
+        update_data["logo_object_key"] = logo_key
+
     if update_data:
         await db.companies.update_one(
-            {"_id": ObjectId(current_user["company_id"])},
+            {"_id": ObjectId(company_id)},
             {"$set": update_data}
         )
     
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    return serialize_doc(company)
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    result = serialize_doc(company)
+    # Task 5.4: surface logo_url alongside logo_object_key on the updated
+    # response so the frontend can refresh its preview immediately after a
+    # logo change (Requirements 21.12, 21.13).
+    if isinstance(result, dict):
+        result["logo_url"] = _presign_if_key(
+            "logos", result.get("logo_object_key")
+        )
+    return result
 
 @api_router.post("/company/logo")
 async def upload_company_logo(logo: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
@@ -2231,22 +3170,53 @@ async def upload_company_logo(logo: UploadFile = File(...), current_user: dict =
     if not logo.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
     
-    # Read file and convert to base64
+    # Read file
     contents = await logo.read()
     if len(contents) > 5 * 1024 * 1024:  # 5MB limit
         raise HTTPException(status_code=400, detail="File too large (max 5MB)")
     
-    # Store as base64 with data URI prefix
-    logo_base64 = f"data:{logo.content_type};base64,{base64.b64encode(contents).decode('utf-8')}"
+    # Task 5.3: store bytes in MinIO under the tenant-scoped logos bucket and
+    # persist only logo_object_key on the company document (Req 21.10, 21.11).
+    company_id = current_user["company_id"]
+    logo_key = f"{company_id}/logo.png"
+    try:
+        object_store.upload_bytes(
+            "logos", logo_key, contents, logo.content_type or "image/png",
+            expected_company_id=company_id,
+        )
+    except object_store.TenantPrefixViolation as exc:
+        # Task 5.5 / Req 21.14: the computed key does not begin with the
+        # caller's company_id. This is defensive — the key is derived
+        # from current_user above so this path should be unreachable
+        # under normal auth, but we fail closed with 403 rather than
+        # 500 if the invariant is ever violated.
+        logger.error(
+            f"Logo upload blocked by tenant prefix check for "
+            f"company {company_id}: {exc}"
+        )
+        raise HTTPException(status_code=403, detail="Forbidden Object_Key")
+    except Exception as exc:
+        logger.error(f"Logo upload failed for company {company_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to upload logo")
     
-    # Update company with logo
+    # Update company with new object key; remove the legacy base64 field so
+    # the stored document never retains the bytes.
     await db.companies.update_one(
-        {"_id": ObjectId(current_user["company_id"])},
-        {"$set": {"logo_base64": logo_base64, "logo_url": logo_base64}}
+        {"_id": ObjectId(company_id)},
+        {
+            "$set": {"logo_object_key": logo_key},
+            "$unset": {"logo_base64": "", "logo_url": ""},
+        },
     )
     
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    return {"message": "Logo uploaded successfully", "logo_url": company.get("logo_url")}
+    return {
+        "message": "Logo uploaded successfully",
+        "logo_object_key": logo_key,
+        # Task 5.4: include the presigned URL so the client can refresh
+        # its logo preview immediately without another round-trip to
+        # /api/company (Requirements 21.12, 21.13).
+        "logo_url": _presign_if_key("logos", logo_key),
+    }
 
 # ============== User Management Routes ==============
 
@@ -2820,24 +3790,54 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
             for doc_type in request.document_types:
                 if doc_type not in doc_mappings:
                     continue
-                    
+
+                # Task 5.4: prefer the MinIO-backed object keys. Fetch each
+                # file via object_store.get_bytes from the compliance bucket
+                # and write to the ZIP. Fall back to the legacy inline
+                # base64 field for pre-migration rows (Req 21.10, 21.11).
                 for field_name, file_name in doc_mappings[doc_type]:
-                    photo_data = operator.get(field_name)
-                    if photo_data:
-                        # Handle base64 data
-                        if photo_data.startswith("data:"):
-                            # Extract base64 part after the comma
-                            base64_data = photo_data.split(",", 1)[1] if "," in photo_data else photo_data
-                        else:
-                            base64_data = photo_data
-                        
+                    image_bytes: Optional[bytes] = None
+                    key_field = f"{field_name}_object_key"
+                    object_key = operator.get(key_field)
+                    if object_key:
                         try:
-                            image_bytes = base64.b64decode(base64_data)
-                            zip_file.writestr(f"{folder_name}/{file_name}", image_bytes)
-                            manifest_lines.append(f"  - {file_name}")
+                            image_bytes = object_store.get_bytes(
+                                "compliance", object_key
+                            )
                         except Exception as e:
-                            logger.error(f"Failed to decode image for {op_name}/{file_name}: {e}")
-                            manifest_lines.append(f"  - {file_name} (ERROR: Could not decode)")
+                            logger.error(
+                                f"Failed to fetch {op_name}/{file_name} from MinIO: {e}"
+                            )
+                            image_bytes = None
+
+                    if image_bytes is None:
+                        photo_data = operator.get(field_name)
+                        if photo_data:
+                            if photo_data.startswith("data:"):
+                                base64_data = (
+                                    photo_data.split(",", 1)[1]
+                                    if "," in photo_data
+                                    else photo_data
+                                )
+                            else:
+                                base64_data = photo_data
+                            try:
+                                image_bytes = base64.b64decode(base64_data)
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to decode image for {op_name}/{file_name}: {e}"
+                                )
+                                image_bytes = None
+
+                    if image_bytes is not None:
+                        zip_file.writestr(
+                            f"{folder_name}/{file_name}", image_bytes
+                        )
+                        manifest_lines.append(f"  - {file_name}")
+                    elif object_key or operator.get(field_name):
+                        manifest_lines.append(
+                            f"  - {file_name} (ERROR: Could not retrieve)"
+                        )
         
         # Add manifest
         zip_file.writestr("manifest.txt", "\n".join(manifest_lines))
@@ -2862,26 +3862,59 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
         raise HTTPException(status_code=403, detail="Only Company Owners can upload license photos")
     
     # Verify driver exists and belongs to the same company
+    company_id = current_user["company_id"]
     driver = await db.users.find_one({
         "_id": ObjectId(driver_id),
-        "company_id": current_user["company_id"]
+        "company_id": company_id
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
-    # Prepare update data
+    # Task 5.3: license photos land in the compliance bucket under the
+    # tenant+driver namespace; Mongo stores only the object keys
+    # (Req 21.10, 21.11, 21.14). Field names follow design Section 4.18.
     update_data = {}
     if photos.front_photo_base64:
-        update_data["license_photo_front"] = photos.front_photo_base64
+        front_key = (
+            f"driver-docs/{company_id}/{driver_id}/license-front.jpg"
+        )
+        _upload_base64_or_400(
+            "compliance",
+            front_key,
+            photos.front_photo_base64,
+            "jpg",
+            "front_photo_base64",
+            expected_company_id=company_id,
+        )
+        update_data["license_front_object_key"] = front_key
     if photos.back_photo_base64:
-        update_data["license_photo_back"] = photos.back_photo_base64
+        back_key = (
+            f"driver-docs/{company_id}/{driver_id}/license-back.jpg"
+        )
+        _upload_base64_or_400(
+            "compliance",
+            back_key,
+            photos.back_photo_base64,
+            "jpg",
+            "back_photo_base64",
+            expected_company_id=company_id,
+        )
+        update_data["license_back_object_key"] = back_key
     
     if update_data:
         update_data["license_photos_updated_at"] = datetime.utcnow()
         update_data["license_photos_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
             {"_id": ObjectId(driver_id)},
-            {"$set": update_data}
+            {
+                "$set": update_data,
+                # Remove legacy inline base64 fields so the stored document
+                # never retains the bytes alongside the new object keys.
+                "$unset": {
+                    "license_photo_front": "",
+                    "license_photo_back": "",
+                },
+            }
         )
     
     return {"message": "License photos uploaded successfully", "updated_fields": list(update_data.keys())}
@@ -2908,6 +3941,19 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     return {
         "driver_id": driver_id,
         "driver_name": driver.get("name"),
+        # Task 5.3: object keys are the canonical pointer; legacy inline
+        # base64 is returned for backward compat with pre-migration rows.
+        "license_front_object_key": driver.get("license_front_object_key"),
+        "license_back_object_key": driver.get("license_back_object_key"),
+        # Task 5.4: presigned URLs let the frontend render the license
+        # photos directly from Nginx_Proxy without pulling bytes through
+        # the API (Requirements 21.12, 21.13).
+        "license_front_url": _presign_if_key(
+            "compliance", driver.get("license_front_object_key")
+        ),
+        "license_back_url": _presign_if_key(
+            "compliance", driver.get("license_back_object_key")
+        ),
         "front_photo": driver.get("license_photo_front"),
         "back_photo": driver.get("license_photo_back"),
         "uploaded_at": driver.get("license_photos_updated_at")
@@ -2933,6 +3979,8 @@ async def delete_license_photos(driver_id: str, current_user: dict = Depends(get
         {"$unset": {
             "license_photo_front": "",
             "license_photo_back": "",
+            "license_front_object_key": "",
+            "license_back_object_key": "",
             "license_photos_updated_at": "",
             "license_photos_uploaded_by": ""
         }}
@@ -2956,8 +4004,14 @@ async def check_license_photos(driver_id: str, current_user: dict = Depends(get_
         raise HTTPException(status_code=404, detail="Driver not found")
     
     return {
-        "has_front_photo": bool(driver.get("license_photo_front")),
-        "has_back_photo": bool(driver.get("license_photo_back")),
+        "has_front_photo": bool(
+            driver.get("license_front_object_key")
+            or driver.get("license_photo_front")
+        ),
+        "has_back_photo": bool(
+            driver.get("license_back_object_key")
+            or driver.get("license_photo_back")
+        ),
         "uploaded_at": driver.get("license_photos_updated_at")
     }
 
@@ -2975,38 +4029,72 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
     
     # Validate document type
     valid_doc_types = {
-        "medical": ("medical_cert_front", "medical_cert_back"),
-        "first_aid": ("first_aid_front", "first_aid_back"),
-        "forklift": ("forklift_front", "forklift_back"),
-        "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+        "medical": ("medical_cert_front", "medical_cert_back", "medical-cert"),
+        "first_aid": ("first_aid_front", "first_aid_back", "first-aid"),
+        "forklift": ("forklift_front", "forklift_back", "forklift"),
+        "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back", "dangerous-goods"),
     }
     
     if doc_type not in valid_doc_types:
         raise HTTPException(status_code=400, detail=f"Invalid document type. Valid types: {list(valid_doc_types.keys())}")
     
-    front_field, back_field = valid_doc_types[doc_type]
+    front_field, back_field, slug = valid_doc_types[doc_type]
+    front_key_field = f"{front_field}_object_key"
+    back_key_field = f"{back_field}_object_key"
     
     # Verify driver exists and belongs to the same company
+    company_id = current_user["company_id"]
     driver = await db.users.find_one({
         "_id": ObjectId(driver_id),
-        "company_id": current_user["company_id"]
+        "company_id": company_id
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
-    # Prepare update data
-    update_data = {}
+    # Task 5.3: driver certificates go to the compliance bucket and Mongo
+    # keeps only the tenant-scoped object keys (Req 21.10, 21.11, 21.14).
+    update_data: dict = {}
     if photos.front_photo_base64:
-        update_data[front_field] = photos.front_photo_base64
+        key = (
+            f"driver-docs/{company_id}/{driver_id}/{slug}-front.jpg"
+        )
+        _upload_base64_or_400(
+            "compliance",
+            key,
+            photos.front_photo_base64,
+            "jpg",
+            "front_photo_base64",
+            expected_company_id=company_id,
+        )
+        update_data[front_key_field] = key
     if photos.back_photo_base64:
-        update_data[back_field] = photos.back_photo_base64
+        key = (
+            f"driver-docs/{company_id}/{driver_id}/{slug}-back.jpg"
+        )
+        _upload_base64_or_400(
+            "compliance",
+            key,
+            photos.back_photo_base64,
+            "jpg",
+            "back_photo_base64",
+            expected_company_id=company_id,
+        )
+        update_data[back_key_field] = key
     
     if update_data:
         update_data[f"{doc_type}_updated_at"] = datetime.utcnow()
         update_data[f"{doc_type}_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
             {"_id": ObjectId(driver_id)},
-            {"$set": update_data}
+            {
+                "$set": update_data,
+                # Drop the legacy inline-base64 fields so the stored doc
+                # never carries the bytes alongside the new object keys.
+                "$unset": {
+                    front_field: "",
+                    back_field: "",
+                },
+            }
         )
     
     return {"message": f"{doc_type.replace('_', ' ').title()} uploaded successfully", "updated_fields": list(update_data.keys())}
@@ -3036,9 +4124,16 @@ async def get_driver_documents(driver_id: str, doc_type: str, current_user: dict
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
     
+    # Task 5.3: post-migration we check the new _object_key fields; legacy
+    # inline-base64 fields are also consulted so pre-migration rows still
+    # report has_front / has_back correctly.
     return {
-        "has_front": bool(driver.get(front_field)),
-        "has_back": bool(driver.get(back_field)),
+        "has_front": bool(
+            driver.get(f"{front_field}_object_key") or driver.get(front_field)
+        ),
+        "has_back": bool(
+            driver.get(f"{back_field}_object_key") or driver.get(back_field)
+        ),
         "uploaded_at": driver.get(f"{doc_type}_updated_at")
     }
 
@@ -3074,6 +4169,19 @@ async def view_driver_documents(driver_id: str, doc_type: str, verification: Pas
         "driver_id": driver_id,
         "driver_name": driver.get("name"),
         "doc_type": doc_type,
+        # Task 5.3: object keys are the canonical pointer; legacy inline
+        # base64 is returned for backward compat with pre-migration rows.
+        f"{front_field}_object_key": driver.get(f"{front_field}_object_key"),
+        f"{back_field}_object_key": driver.get(f"{back_field}_object_key"),
+        # Task 5.4: presigned URLs let the frontend render the document
+        # directly via Nginx_Proxy (Requirements 21.12, 21.13). Driver
+        # compliance documents live in the ``compliance`` bucket.
+        f"{front_field}_url": _presign_if_key(
+            "compliance", driver.get(f"{front_field}_object_key")
+        ),
+        f"{back_field}_url": _presign_if_key(
+            "compliance", driver.get(f"{back_field}_object_key")
+        ),
         "front_photo": driver.get(front_field),
         "back_photo": driver.get(back_field),
         "uploaded_at": driver.get(f"{doc_type}_updated_at")
@@ -3098,14 +4206,23 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
     """
     try:
         photo_id = ObjectId()
-        
+        # Task 5.3: photo bytes live in MinIO, never in MongoDB (Req 21.10,
+        # 21.11). The key is tenant-scoped per Req 21.14.
+        company_id = current_user["company_id"]
+        user_id = current_user.get("id") or str(current_user.get("_id"))
+        object_key = f"{company_id}/{user_id}/{uuid.uuid4().hex}.jpg"
+        _upload_base64_or_400(
+            "photos", object_key, photo.base64_data, "jpg", "base64_data",
+            expected_company_id=company_id,
+        )
+
         photo_doc = {
             "_id": photo_id,
-            "company_id": current_user["company_id"],
-            "uploaded_by": current_user["id"],
+            "company_id": company_id,
+            "uploaded_by": user_id,
             "vehicle_id": photo.vehicle_id,
             "photo_type": photo.photo_type,
-            "base64_data": photo.base64_data,
+            "object_key": object_key,
             "timestamp": photo.timestamp or datetime.utcnow().isoformat(),
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
@@ -3119,8 +4236,15 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
         return {
             "success": True,
             "photo_id": str(photo_id),
+            # Task 5.4: return the object key + presigned URL so the
+            # mobile/web client can reference the uploaded photo without a
+            # follow-up GET /api/photos/{photo_id} (Req 21.12, 21.13).
+            "object_key": object_key,
+            "object_url": _presign_if_key("photos", object_key),
             "message": "Photo uploaded successfully"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Photo upload failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload photo")
@@ -3137,10 +4261,16 @@ async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user
         if not photo:
             raise HTTPException(status_code=404, detail="Photo not found")
         
+        # Task 5.3: the stored document references MinIO via object_key.
+        # Task 5.4: emit a sibling object_url so the frontend renders the
+        # photo directly from Nginx_Proxy (Requirements 21.12, 21.13).
         return {
             "photo_id": str(photo["_id"]),
             "photo_type": photo["photo_type"],
-            "base64_data": photo["base64_data"],
+            "object_key": photo.get("object_key"),
+            "object_url": _presign_if_key(
+                "photos", photo.get("object_key")
+            ),
             "timestamp": photo.get("timestamp"),
             "gps_latitude": photo.get("gps_latitude"),
             "gps_longitude": photo.get("gps_longitude")
@@ -3174,17 +4304,32 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     
     inspection_id = ObjectId()
     
-    # Store photos separately using bulk insert for better performance
+    # Store photos separately using bulk insert for better performance.
+    # Task 5.3: each photo's base64 bytes go to MinIO under
+    # inspection-photos/<company_id>/<inspection_id>/<uuid>.jpg. Mongo
+    # holds only the tenant-scoped object_key (Req 21.10, 21.11, 21.14).
+    company_id = current_user["company_id"]
     photo_refs = []
     photo_docs = []
     for photo in inspection.photos:
         photo_id = ObjectId()
+        photo_object_key = (
+            f"{company_id}/{str(inspection_id)}/{uuid.uuid4().hex}.jpg"
+        )
+        _upload_base64_or_400(
+            "inspection-photos",
+            photo_object_key,
+            photo.base64_data,
+            "jpg",
+            f"photos[{photo.photo_type}].base64_data",
+            expected_company_id=company_id,
+        )
         photo_docs.append({
             "_id": photo_id,
             "inspection_id": str(inspection_id),
             "vehicle_id": inspection.vehicle_id,
             "photo_type": photo.photo_type,
-            "base64_data": photo.base64_data,
+            "object_key": photo_object_key,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
@@ -3195,6 +4340,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         photo_refs.append({
             "photo_id": str(photo_id),
             "photo_type": photo.photo_type,
+            "object_key": photo_object_key,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
@@ -3216,16 +4362,31 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     else:
         inspection_timestamp = datetime.utcnow()
     
+    # Task 5.3: signature bytes go to MinIO under
+    # signatures/<company_id>/<inspection_id>.png. Mongo stores only
+    # signature_object_key (Req 21.10, 21.11, 21.14).
+    signature_object_key: Optional[str] = None
+    if inspection.signature_base64:
+        signature_object_key = f"{company_id}/{str(inspection_id)}.png"
+        _upload_base64_or_400(
+            "signatures",
+            signature_object_key,
+            inspection.signature_base64,
+            "png",
+            "signature_base64",
+            expected_company_id=company_id,
+        )
+
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
         "driver_id": str(current_user["_id"]),
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "type": InspectionType.PRESTART,
         "odometer": inspection.odometer,
         "checklist_items": [item.dict() for item in inspection.checklist_items],
-        "photo_refs": photo_refs,  # Only store references, not full base64
-        "signature_base64": inspection.signature_base64,
+        "photo_refs": photo_refs,  # References to inspection_photos docs (which point at MinIO)
+        "signature_object_key": signature_object_key,
         # Store digital agreement if provided (new checkbox-based consent)
         "digital_agreement": inspection.digital_agreement.dict() if inspection.digital_agreement else None,
         "declaration_confirmed": inspection.declaration_confirmed,
@@ -3336,17 +4497,32 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     
     inspection_id = ObjectId()
     
-    # Store photos using bulk insert for better performance
+    # Store photos using bulk insert for better performance.
+    # Task 5.3: each photo's base64 bytes go to MinIO under
+    # inspection-photos/<company_id>/<inspection_id>/<uuid>.jpg. Mongo
+    # holds only the tenant-scoped object_key (Req 21.10, 21.11, 21.14).
+    company_id = current_user["company_id"]
     photo_refs = []
     photo_docs = []
     for photo in (inspection.photos or []):
         photo_id = ObjectId()
+        photo_object_key = (
+            f"{company_id}/{str(inspection_id)}/{uuid.uuid4().hex}.jpg"
+        )
+        _upload_base64_or_400(
+            "inspection-photos",
+            photo_object_key,
+            photo.base64_data,
+            "jpg",
+            f"photos[{photo.photo_type}].base64_data",
+            expected_company_id=company_id,
+        )
         photo_docs.append({
             "_id": photo_id,
             "inspection_id": str(inspection_id),
             "vehicle_id": inspection.vehicle_id,
             "photo_type": photo.photo_type,
-            "base64_data": photo.base64_data,
+            "object_key": photo_object_key,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
@@ -3357,6 +4533,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         photo_refs.append({
             "photo_id": str(photo_id),
             "photo_type": photo.photo_type,
+            "object_key": photo_object_key,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
@@ -3378,11 +4555,26 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     else:
         inspection_timestamp = datetime.utcnow()
     
+    # Task 5.3: signature bytes go to MinIO under
+    # signatures/<company_id>/<inspection_id>.png. Mongo stores only
+    # signature_object_key (Req 21.10, 21.11, 21.14).
+    signature_object_key: Optional[str] = None
+    if inspection.signature_base64:
+        signature_object_key = f"{company_id}/{str(inspection_id)}.png"
+        _upload_base64_or_400(
+            "signatures",
+            signature_object_key,
+            inspection.signature_base64,
+            "png",
+            "signature_base64",
+            expected_company_id=company_id,
+        )
+
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
         "driver_id": str(current_user["_id"]),
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "type": InspectionType.END_SHIFT,
         "odometer": inspection.odometer,
         "fuel_level": inspection.fuel_level,
@@ -3391,8 +4583,8 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "cleanliness": inspection.cleanliness,
         "damage_comment": inspection.damage_comment,
         "incident_comment": inspection.incident_comment,
-        "photo_refs": photo_refs,  # Only store references, not full base64
-        "signature_base64": inspection.signature_base64,
+        "photo_refs": photo_refs,  # References to inspection_photos docs (which point at MinIO)
+        "signature_object_key": signature_object_key,
         # Store digital agreement if provided (new checkbox-based consent)
         "digital_agreement": inspection.digital_agreement.dict() if inspection.digital_agreement else None,
         "declaration_confirmed": inspection.declaration_confirmed,
@@ -3582,6 +4774,12 @@ async def get_inspections(
         for inspection in inspections:
             photos = await fetch_inspection_photos(str(inspection["_id"]))
             inspection["photos"] = photos
+            # Task 5.4: expose signature_url when photos are requested so
+            # the inspection detail view can render the driver signature
+            # without a separate round-trip (Req 21.12, 21.13).
+            inspection["signature_url"] = _presign_if_key(
+                "signatures", inspection.get("signature_object_key")
+            )
     
     return serialize_doc(inspections)
 
@@ -3601,7 +4799,22 @@ async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
                     "_id": {"$in": [ObjectId(pid) for pid in photo_ids]}
                 }).to_list(20)
     
-    return [{"photo_type": p.get("photo_type"), "base64_data": p.get("base64_data")} for p in photos]
+    # Task 5.3: photos now reference MinIO via object_key.
+    # Task 5.4: emit a sibling object_url so the frontend can render the
+    # photo straight from Nginx_Proxy without a second round-trip
+    # (Requirements 21.12, 21.13). Legacy rows may still carry
+    # base64_data inline; that field is preserved for backward compat.
+    return [
+        {
+            "photo_type": p.get("photo_type"),
+            "object_key": p.get("object_key"),
+            "object_url": _presign_if_key(
+                "inspection-photos", p.get("object_key")
+            ),
+            "base64_data": p.get("base64_data"),
+        }
+        for p in photos
+    ]
 
 @api_router.get("/inspections/{inspection_id}")
 async def get_inspection(inspection_id: str, current_user: dict = Depends(get_current_user)):
@@ -3615,6 +4828,13 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
     # Fetch photos from separate collection
     photos = await fetch_inspection_photos(inspection_id)
     inspection["photos"] = photos
+
+    # Task 5.4: expose a presigned signature URL alongside the stored
+    # signature_object_key so the frontend can render the driver's
+    # signature image without a second round-trip (Req 21.12, 21.13).
+    inspection["signature_url"] = _presign_if_key(
+        "signatures", inspection.get("signature_object_key")
+    )
     
     # Add driver and vehicle info
     if inspection.get("driver_id"):
@@ -3690,15 +4910,31 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
     else:
         fuel_timestamp = datetime.utcnow()
     
+    # Task 5.3: upload the receipt bytes to MinIO and persist only the key
+    # on the fuel submission document (Req 21.10, 21.11, 21.14).
+    fuel_id = ObjectId()
+    company_id = current_user["company_id"]
+    receipt_object_key: Optional[str] = None
+    if fuel.receipt_photo_base64:
+        receipt_object_key = f"{company_id}/{str(fuel_id)}.jpg"
+        _upload_base64_or_400(
+            "fuel-receipts",
+            receipt_object_key,
+            fuel.receipt_photo_base64,
+            "jpg",
+            "receipt_photo_base64",
+            expected_company_id=company_id,
+        )
+
     fuel_doc = {
-        "_id": ObjectId(),
-        "company_id": current_user["company_id"],
+        "_id": fuel_id,
+        "company_id": company_id,
         "vehicle_id": fuel.vehicle_id,
         "driver_id": str(current_user["_id"]),
         "amount": fuel.amount,
         "liters": fuel.liters,
         "price_per_liter": round(fuel.amount / fuel.liters, 2) if fuel.liters > 0 else 0,
-        "receipt_photo_base64": fuel.receipt_photo_base64,
+        "receipt_object_key": receipt_object_key,
         "odometer": fuel.odometer,
         "fuel_station": fuel.fuel_station,
         "notes": fuel.notes,
@@ -3720,12 +4956,21 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
     
-    # Exclude large base64 images from list query for performance, but include has_receipt flag
+    # Task 5.3: receipts live in MinIO now; has_receipt reflects whether the
+    # document carries a receipt_object_key. Legacy receipt_photo_base64 is
+    # still checked for backward compat with pre-migration rows.
     pipeline = [
         {"$match": query},
         {"$sort": {"timestamp": -1}},
         {"$limit": 100},
-        {"$addFields": {"has_receipt": {"$cond": [{"$ifNull": ["$receipt_photo_base64", False]}, True, False]}}},
+        {"$addFields": {"has_receipt": {"$cond": [
+            {"$or": [
+                {"$ifNull": ["$receipt_object_key", False]},
+                {"$ifNull": ["$receipt_photo_base64", False]},
+            ]},
+            True,
+            False,
+        ]}}},
         {"$project": {"receipt_photo_base64": 0}}
     ]
     submissions = await db.fuel_submissions.aggregate(pipeline).to_list(100)
@@ -3751,6 +4996,12 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
         else:
             s["driver_name"] = "Unknown"
         s["has_receipt"] = s.get("has_receipt", False)
+        # Task 5.4: surface a presigned receipt URL alongside
+        # receipt_object_key so the admin web UI can render the thumbnail
+        # inline without a follow-up GET (Requirements 21.12, 21.13).
+        s["receipt_url"] = _presign_if_key(
+            "fuel-receipts", s.get("receipt_object_key")
+        )
     
     return submissions
 
@@ -3759,16 +5010,27 @@ async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_curren
     """Get receipt photo for a specific fuel submission"""
     submission = await db.fuel_submissions.find_one(
         {"_id": ObjectId(fuel_id), "company_id": current_user["company_id"]},
-        {"receipt_photo_base64": 1}
+        {"receipt_photo_base64": 1, "receipt_object_key": 1}
     )
     if not submission:
         raise HTTPException(status_code=404, detail="Fuel submission not found")
     
+    # Task 5.3: new rows carry receipt_object_key; we expose it here so the
+    # frontend can render via the presigned-URL path added in Task 5.4.
+    # Pre-migration rows may still carry legacy receipt_photo_base64.
+    object_key = submission.get("receipt_object_key")
     receipt = submission.get("receipt_photo_base64")
-    if not receipt:
+    if not object_key and not receipt:
         raise HTTPException(status_code=404, detail="No receipt photo for this submission")
     
-    return {"receipt_photo_base64": receipt}
+    return {
+        "receipt_object_key": object_key,
+        # Task 5.4: presigned receipt URL so the frontend can render the
+        # receipt image directly from Nginx_Proxy without pulling bytes
+        # through the API (Requirements 21.12, 21.13).
+        "receipt_url": _presign_if_key("fuel-receipts", object_key),
+        "receipt_photo_base64": receipt,
+    }
 
 @api_router.get("/fuel/export/csv")
 async def export_fuel_csv(
@@ -3850,7 +5112,7 @@ async def export_fuel_csv(
             s.get("price_per_liter", ""),
             s.get("odometer", ""),
             s.get("fuel_station", ""),
-            "Yes" if s.get("receipt_photo_base64") is not None or s.get("has_receipt") else "No"
+            "Yes" if s.get("receipt_object_key") is not None or s.get("receipt_photo_base64") is not None or s.get("has_receipt") else "No"
         ])
     
     output.seek(0)
@@ -4081,15 +5343,32 @@ async def create_maintenance(log: MaintenanceLogCreate, request: Request, curren
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    # Task 5.3: invoice bytes go to MinIO; Mongo stores only
+    # invoice_object_key under maintenance/<company_id>/<log_id>/invoice.pdf
+    # (Req 21.10, 21.11, 21.14).
+    log_id = ObjectId()
+    company_id = current_user["company_id"]
+    invoice_object_key: Optional[str] = None
+    if log.invoice_base64:
+        invoice_object_key = f"{company_id}/{str(log_id)}/invoice.pdf"
+        _upload_base64_or_400(
+            "maintenance",
+            invoice_object_key,
+            log.invoice_base64,
+            "pdf",
+            "invoice_base64",
+            expected_company_id=company_id,
+        )
+
     maintenance_doc = {
-        "_id": ObjectId(),
-        "company_id": current_user["company_id"],
+        "_id": log_id,
+        "company_id": company_id,
         "vehicle_id": log.vehicle_id,
         "service_date": log.service_date,
         "service_type": log.service_type,
         "cost": log.cost,
         "workshop_name": log.workshop_name,
-        "invoice_base64": log.invoice_base64,
+        "invoice_object_key": invoice_object_key,
         "notes": log.notes,
         "created_by": str(current_user["_id"]),
         "created_at": datetime.utcnow()
@@ -4110,7 +5389,17 @@ async def get_maintenance_logs(vehicle_id: Optional[str] = None, current_user: d
         query["vehicle_id"] = vehicle_id
     
     logs = await db.maintenance_logs.find(query).sort("service_date", -1).to_list(1000)
-    return serialize_doc(logs)
+    # Task 5.4: expose invoice_url alongside invoice_object_key so the
+    # admin UI can download/preview the PDF directly from Nginx_Proxy
+    # (Requirements 21.12, 21.13).
+    serialized = serialize_doc(logs)
+    if isinstance(serialized, list):
+        for log in serialized:
+            if isinstance(log, dict):
+                log["invoice_url"] = _presign_if_key(
+                    "maintenance", log.get("invoice_object_key")
+                )
+    return serialized
 
 @api_router.get("/maintenance/stats/{vehicle_id}")
 async def get_maintenance_stats(vehicle_id: str, current_user: dict = Depends(get_current_user)):
@@ -4122,11 +5411,22 @@ async def get_maintenance_stats(vehicle_id: str, current_user: dict = Depends(ge
     total_cost = sum(log.get("cost", 0) for log in logs)
     service_count = len(logs)
     
+    # Task 5.4: enrich each log with invoice_url so any UI reusing this
+    # stats endpoint can render the PDF without a separate fetch
+    # (Requirements 21.12, 21.13).
+    serialized_logs = serialize_doc(logs)
+    if isinstance(serialized_logs, list):
+        for log in serialized_logs:
+            if isinstance(log, dict):
+                log["invoice_url"] = _presign_if_key(
+                    "maintenance", log.get("invoice_object_key")
+                )
+
     return {
         "vehicle_id": vehicle_id,
         "total_cost": total_cost,
         "service_count": service_count,
-        "logs": serialize_doc(logs)
+        "logs": serialized_logs
     }
 
 # ============== Service Records Routes ==============
@@ -4147,9 +5447,30 @@ async def create_service_record(record: ServiceRecordCreate, request: Request, c
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
+    # Task 5.3: attachments arrive as base64 strings; upload each to MinIO
+    # under service-records/<company_id>/<record_id>/<uuid>.pdf and store
+    # only the tenant-scoped object keys (Req 21.10, 21.11, 21.14).
+    record_id = ObjectId()
+    attachment_keys: List[str] = []
+    for idx, b64 in enumerate(record.attachments or []):
+        if not b64:
+            continue
+        key = (
+            f"{company_id}/{str(record_id)}/{uuid.uuid4().hex}.pdf"
+        )
+        _upload_base64_or_400(
+            "service-records",
+            key,
+            b64,
+            "pdf",
+            f"attachments[{idx}]",
+            expected_company_id=company_id,
+        )
+        attachment_keys.append(key)
+
     # Create service record
     service_doc = {
-        "_id": ObjectId(),
+        "_id": record_id,
         "company_id": company_id,
         "vehicle_id": record.vehicle_id,
         "service_date": record.service_date,
@@ -4162,7 +5483,7 @@ async def create_service_record(record: ServiceRecordCreate, request: Request, c
         "workshop_name": record.workshop_name,
         "next_service_date": record.next_service_date,
         "next_service_odometer": record.next_service_odometer,
-        "attachments": record.attachments or [],
+        "attachments": attachment_keys,
         "warranty_until": record.warranty_until,
         "warranty_notes": record.warranty_notes,
         "created_by": str(current_user["_id"]),
@@ -4225,8 +5546,21 @@ async def get_service_records(
     # Get records sorted by service date (newest first)
     records = await db.service_records.find(query).sort("service_date", -1).skip(skip).limit(limit).to_list(limit)
     
+    # Task 5.4: enrich each record with a parallel attachment_urls list so
+    # the frontend can render or download each attachment directly through
+    # Nginx_Proxy (Requirements 21.12, 21.13). Per-record attachments is a
+    # List[str] of object keys; attachment_urls preserves positional
+    # alignment one-for-one.
+    serialized = serialize_doc(records)
+    if isinstance(serialized, list):
+        for record in serialized:
+            if isinstance(record, dict):
+                record["attachment_urls"] = _presign_keys(
+                    "service-records", record.get("attachments")
+                )
+
     return {
-        "data": serialize_doc(records),
+        "data": serialized,
         "total": total,
         "limit": limit,
         "skip": skip
@@ -4346,7 +5680,15 @@ async def get_service_record(record_id: str, current_user: dict = Depends(get_cu
     if not record:
         raise HTTPException(status_code=404, detail="Service record not found")
     
-    return serialize_doc(record)
+    # Task 5.4: expose attachment_urls parallel to attachments so the
+    # frontend can render PDF/image attachments via Nginx_Proxy without a
+    # separate fetch (Requirements 21.12, 21.13).
+    result = serialize_doc(record)
+    if isinstance(result, dict):
+        result["attachment_urls"] = _presign_keys(
+            "service-records", result.get("attachments")
+        )
+    return result
 
 @api_router.put("/service-records/{record_id}")
 async def update_service_record(
@@ -4376,6 +5718,37 @@ async def update_service_record(
         if value is not None:
             if key == "service_type":
                 update_data[key] = value.value
+            elif key == "attachments":
+                # Task 5.3: incoming attachments are base64 strings; upload
+                # each to MinIO and replace with tenant-scoped object keys
+                # (Req 21.10, 21.11, 21.14). The caller is expected to send
+                # the full desired list on update, same as the pre-MinIO
+                # behaviour of replacing the array.
+                attachment_keys: List[str] = []
+                for idx, b64 in enumerate(value or []):
+                    if not b64:
+                        continue
+                    # If caller resent an already-migrated key (looks like a
+                    # path, not base64), pass it through unchanged.
+                    if isinstance(b64, str) and b64.startswith(
+                        f"{company_id}/{record_id}/"
+                    ):
+                        attachment_keys.append(b64)
+                        continue
+                    key_path = (
+                        f"{company_id}/{record_id}/"
+                        f"{uuid.uuid4().hex}.pdf"
+                    )
+                    _upload_base64_or_400(
+                        "service-records",
+                        key_path,
+                        b64,
+                        "pdf",
+                        f"attachments[{idx}]",
+                        expected_company_id=company_id,
+                    )
+                    attachment_keys.append(key_path)
+                update_data[key] = attachment_keys
             else:
                 update_data[key] = value
     
@@ -4395,7 +5768,15 @@ async def update_service_record(
     )
     
     updated_record = await db.service_records.find_one({"_id": ObjectId(record_id)})
-    return serialize_doc(updated_record)
+    # Task 5.4: enrich the updated response with attachment_urls so the UI
+    # can immediately render any newly uploaded attachments
+    # (Requirements 21.12, 21.13).
+    result = serialize_doc(updated_record)
+    if isinstance(result, dict):
+        result["attachment_urls"] = _presign_keys(
+            "service-records", result.get("attachments")
+        )
+    return result
 
 @api_router.delete("/service-records/{record_id}")
 async def delete_service_record(record_id: str, request: Request, current_user: dict = Depends(get_current_user)):
@@ -4637,7 +6018,40 @@ async def create_incident(
     else:
         incident_timestamp = datetime.now(timezone.utc)
     
+    # Task 5.3: upload each incident photo array to MinIO and store only
+    # object keys. Keys are scoped to
+    # incident-photos/<company_id>/<incident_id>/<kind>/<uuid>.jpg so every
+    # photo sits inside the tenant's namespace (Req 21.10, 21.11, 21.14).
+    incident_id = ObjectId()
+
+    def _upload_incident_photos(b64_list: List[str], kind: str) -> List[str]:
+        keys: List[str] = []
+        for idx, b64 in enumerate(b64_list or []):
+            if not b64:
+                continue
+            key = (
+                f"{company_id}/{str(incident_id)}/{kind}/"
+                f"{uuid.uuid4().hex}.jpg"
+            )
+            _upload_base64_or_400(
+                "incident-photos",
+                key,
+                b64,
+                "jpg",
+                f"{kind}_photos[{idx}]",
+                expected_company_id=company_id,
+            )
+            keys.append(key)
+        return keys
+
+    damage_photo_keys = _upload_incident_photos(incident.damage_photos, "damage")
+    other_vehicle_photo_keys = _upload_incident_photos(
+        incident.other_vehicle_photos, "other-vehicle"
+    )
+    scene_photo_keys = _upload_incident_photos(incident.scene_photos, "scene")
+
     incident_doc = {
+        "_id": incident_id,
         "company_id": company_id,
         "vehicle_id": incident.vehicle_id,
         "driver_id": str(current_user["_id"]),
@@ -4651,9 +6065,9 @@ async def create_incident(
         "police_report_number": incident.police_report_number,
         "injuries_occurred": incident.injuries_occurred,
         "injury_description": incident.injury_description,
-        "damage_photos": incident.damage_photos,
-        "other_vehicle_photos": incident.other_vehicle_photos,
-        "scene_photos": incident.scene_photos,
+        "damage_photos": damage_photo_keys,
+        "other_vehicle_photos": other_vehicle_photo_keys,
+        "scene_photos": scene_photo_keys,
         "status": "reported",
         "created_at": incident_timestamp,
         "updated_at": datetime.now(timezone.utc),
@@ -4906,6 +6320,27 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
     incident["vehicle_name"] = vehicle.get("name", "Unknown") if vehicle else "Unknown"
     incident["vehicle_rego"] = vehicle.get("registration_number", "N/A") if vehicle else "N/A"
     incident["driver_name"] = driver.get("name", driver.get("email", "Unknown")) if driver else "Unknown"
+
+    # Task 5.4: emit parallel URL lists for each stored photo-key array and
+    # a url field on each pdf_attachments entry so the frontend can render
+    # every asset via Nginx_Proxy without pulling bytes through the API
+    # (Requirements 21.12, 21.13). Per-photo keys live in the
+    # ``incident-photos`` bucket; PDF attachments in ``incident-attachments``.
+    incident["damage_photo_urls"] = _presign_keys(
+        "incident-photos", incident.get("damage_photos")
+    )
+    incident["other_vehicle_photo_urls"] = _presign_keys(
+        "incident-photos", incident.get("other_vehicle_photos")
+    )
+    incident["scene_photo_urls"] = _presign_keys(
+        "incident-photos", incident.get("scene_photos")
+    )
+    incident["pdf_attachments"] = _presign_photos(
+        incident.get("pdf_attachments") or [],
+        "incident-attachments",
+        url_field="url",
+        key_field="object_key",
+    )
     
     return serialize_doc(incident)
 
@@ -5038,6 +6473,10 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
         elements.append(Spacer(1, 15))
     
     # Photos
+    # Task 5.4: stored values are now MinIO object keys rather than base64
+    # strings (see Task 5.3). Fetch each via object_store.get_bytes from
+    # the incident-photos bucket; pre-migration rows carrying inline
+    # base64 fall through to the legacy decode branch.
     photo_sections = [
         ("Damage Photos", incident.get("damage_photos", [])),
         ("Other Vehicle Photos", incident.get("other_vehicle_photos", [])),
@@ -5055,14 +6494,42 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
                 elements.append(Spacer(1, 5))
                 for i, photo_data in enumerate(photos):
                     try:
+                        img_bytes: Optional[bytes] = None
                         if isinstance(photo_data, str) and photo_data.startswith('data:'):
                             img_data = photo_data.split(',', 1)[1]
+                            try:
+                                img_bytes = base64.b64decode(img_data)
+                            except Exception:
+                                img_bytes = None
                         elif isinstance(photo_data, str):
-                            img_data = photo_data
+                            # Post-migration values are object keys of the
+                            # form "<company_id>/<incident_id>/<kind>/<uuid>.jpg"
+                            # inside the incident-photos bucket. Legacy
+                            # rows can still carry a raw base64 string; we
+                            # try the MinIO lookup first and fall back to
+                            # base64 decode on failure.
+                            try:
+                                img_bytes = object_store.get_bytes(
+                                    "incident-photos", photo_data
+                                )
+                            except Exception:
+                                try:
+                                    img_bytes = base64.b64decode(photo_data)
+                                except Exception:
+                                    img_bytes = None
                         else:
                             continue
-                        
-                        img_bytes = base64.b64decode(img_data)
+
+                        if img_bytes is None:
+                            elements.append(
+                                Paragraph(
+                                    f"[Photo {i+1} could not be rendered]",
+                                    styles['Normal'],
+                                )
+                            )
+                            elements.append(Spacer(1, 5))
+                            continue
+
                         img_buffer = BytesIO(img_bytes)
                         img = RLImage(img_buffer, width=250, height=180)
                         elements.append(img)
@@ -5114,15 +6581,59 @@ async def update_incident(
         if value is not None:
             update_data[field] = value
     
-    # Handle additional photos - append to existing damage_photos
+    # Task 5.3: additional photos supplied as base64 are uploaded to MinIO
+    # and appended as object keys on the incident. The stored document
+    # never contains the raw base64 (Req 21.10, 21.11, 21.14).
     if update.additional_photos:
         existing_photos = existing.get("damage_photos", [])
-        update_data["damage_photos"] = existing_photos + update.additional_photos
+        new_keys: List[str] = []
+        for idx, b64 in enumerate(update.additional_photos):
+            if not b64:
+                continue
+            key = (
+                f"{company_id}/{str(existing['_id'])}/damage/"
+                f"{uuid.uuid4().hex}.jpg"
+            )
+            _upload_base64_or_400(
+                "incident-photos",
+                key,
+                b64,
+                "jpg",
+                f"additional_photos[{idx}]",
+                expected_company_id=company_id,
+            )
+            new_keys.append(key)
+        update_data["damage_photos"] = existing_photos + new_keys
     
-    # Handle PDF attachments - append or create
+    # Task 5.3: PDF attachments supplied as {name, data} get uploaded to
+    # MinIO. Mongo stores {name, object_key} entries instead of
+    # {name, data} (Req 21.10, 21.11, 21.14).
     if update.pdf_attachments:
         existing_pdfs = existing.get("pdf_attachments", [])
-        update_data["pdf_attachments"] = existing_pdfs + update.pdf_attachments
+        new_pdfs: List[dict] = []
+        for idx, attachment in enumerate(update.pdf_attachments):
+            if not isinstance(attachment, dict):
+                continue
+            b64 = attachment.get("data")
+            if not b64:
+                continue
+            key = (
+                f"{company_id}/{str(existing['_id'])}/"
+                f"{uuid.uuid4().hex}.pdf"
+            )
+            _upload_base64_or_400(
+                "incident-attachments",
+                key,
+                b64,
+                "pdf",
+                f"pdf_attachments[{idx}].data",
+                expected_company_id=company_id,
+            )
+            new_pdfs.append({
+                "name": attachment.get("name"),
+                "object_key": key,
+            })
+        update_data["pdf_attachments"] = existing_pdfs + new_pdfs
     
     update_data["updated_at"] = datetime.now(timezone.utc)
     
@@ -6067,9 +7578,23 @@ async def register_company(data: CompanyRegister):
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
+    # Resolve the tenant subdomain (Requirements 9.1, 9.3, 9.7). When the
+    # caller supplied a subdomain we validate + uniqueness-check it;
+    # otherwise we derive one from ``company_name`` via slug_generator.
+    # Validation errors surface as 400/409 per _subdomain_error_to_http.
+    try:
+        if data.subdomain is not None:
+            resolved_subdomain = validate_subdomain(data.subdomain)
+            await ensure_subdomain_unique(resolved_subdomain, db)
+        else:
+            resolved_subdomain = await slug_generator(data.company_name, db)
+    except SubdomainValidationError as exc:
+        raise _subdomain_error_to_http(exc)
+
     # Create company
     company_doc = {
         "name": data.company_name,
+        "subdomain": resolved_subdomain,
         "vehicle_count": data.vehicle_count,
         "subscription_status": "trialing",
         "subscription_plan": "pro",
@@ -6152,14 +7677,24 @@ async def register_company(data: CompanyRegister):
             logger.error(f"Stripe error: {e}")
             # Continue without Stripe - trial mode
     
-    # Generate access token
-    access_token = create_access_token(data={"sub": user_id})
+    # Mint a full-claims JWT (Req 12.1-12.3).
+    access_token = await _mint_access_token(
+        user_id,
+        company_id=company_id,
+        subdomain=resolved_subdomain,
+        role=data.role or UserRole.SUPER_ADMIN,
+    )
     
     return {
         "access_token": access_token,
         "checkout_url": checkout_url,
         "company_id": company_id,
         "user_id": user_id,
+        # Post-register bounce to the branded tenant host so the new
+        # owner lands on <slug>.fleetshield365.com/dashboard instead of
+        # the apex. Frontend AuthContext.register() reads this field.
+        "redirect_to": f"https://{resolved_subdomain}.fleetshield365.com/dashboard",
+        "subdomain": resolved_subdomain,
     }
 
 # Get current user with company info (for website)
@@ -6174,6 +7709,11 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
             vehicle_count = await db.vehicles.count_documents({"company_id": current_user["company_id"]})
             company = serialize_doc(company)
             company["vehicle_count"] = vehicle_count
+            # Task 5.4: expose presigned logo URL alongside logo_object_key
+            # (Requirements 21.12, 21.13).
+            company["logo_url"] = _presign_if_key(
+                "logos", company.get("logo_object_key")
+            )
     
     user_data = {
         "id": current_user["id"],
@@ -6451,7 +7991,10 @@ async def get_subscription(current_user: dict = Depends(get_current_user)):
     plans = {
         "basic": {"max_vehicles": 5, "price": 0},
         "standard": {"max_vehicles": 20, "price": 49},
-        "pro": {"max_vehicles": float("inf"), "price": 99}
+        # ``max_vehicles: null`` represents "unlimited" for the pro plan.
+        # ``float("inf")`` is not JSON-serializable and crashes the
+        # response encoder — use None and let the client render "∞".
+        "pro": {"max_vehicles": None, "price": 99}
     }
     
     current_plan = company.get("subscription_plan", "basic")
@@ -6715,15 +8258,20 @@ async def get_faq():
 
 
 # ============== Developer Dashboard Stats ==============
-
-DEVELOPER_KEY = "fleetshield365-dev-key-2025"
+#
+# Task 9: The legacy ``DEVELOPER_KEY`` query-string gate has been removed
+# (Req 15.1, 15.2). Every ``/api/developer/*`` route now depends on
+# ``require_platform_owner`` which validates the bearer JWT carries
+# ``role == "platform_owner"``. A valid bearer with any other role 403s;
+# a missing/invalid bearer 401s upstream in ``get_current_user``.
+# Platform-owner tenant scoping is exempt (Req 16.4) — the dependency
+# deliberately does not filter DB queries by company_id.
 
 @api_router.get("/developer/stats")
-async def get_developer_stats(key: str):
+async def get_developer_stats(
+    current_user: dict = Depends(require_platform_owner),
+):
     """Get system-wide stats for developer/owner dashboard"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid developer key")
-    
     start_time = datetime.now(timezone.utc)
     
     try:
@@ -6879,11 +8427,11 @@ async def get_developer_stats(key: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/developer/company/{company_id}")
-async def get_developer_company_details(company_id: str, key: str):
+async def get_developer_company_details(
+    company_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
     """Get detailed company info for developer dashboard"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid developer key")
-    
     try:
         company = await db.companies.find_one({"_id": ObjectId(company_id)})
         if not company:
@@ -6936,11 +8484,10 @@ async def get_developer_company_details(company_id: str, key: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/developer/users")
-async def get_developer_all_users(key: str):
+async def get_developer_all_users(
+    current_user: dict = Depends(require_platform_owner),
+):
     """Get all users across all companies for developer dashboard"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid developer key")
-    
     try:
         users = []
         async for user in db.users.find({}, {"password": 0}):
@@ -6968,11 +8515,12 @@ async def get_developer_all_users(key: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.put("/developer/users/{user_id}/freeze")
-async def toggle_user_freeze(user_id: str, key: str, freeze: bool = True):
+async def toggle_user_freeze(
+    user_id: str,
+    freeze: bool = True,
+    current_user: dict = Depends(require_platform_owner),
+):
     """Freeze or unfreeze a user account"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid developer key")
-    
     try:
         result = await db.users.update_one(
             {"_id": ObjectId(user_id)},
@@ -6988,11 +8536,12 @@ async def toggle_user_freeze(user_id: str, key: str, freeze: bool = True):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.put("/developer/users/{user_id}/reset-password")
-async def reset_user_password(user_id: str, key: str, new_password: str = "temp123"):
+async def reset_user_password(
+    user_id: str,
+    new_password: str = "temp123",
+    current_user: dict = Depends(require_platform_owner),
+):
     """Reset a user's password (developer emergency access)"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid developer key")
-    
     try:
         hashed_password = get_password_hash(new_password)
         result = await db.users.update_one(
@@ -7013,11 +8562,11 @@ async def reset_user_password(user_id: str, key: str, new_password: str = "temp1
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.delete("/developer/company/{company_id}")
-async def delete_company(company_id: str, key: str):
+async def delete_company(
+    company_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
     """Delete a company and all associated data (Developer only)"""
-    if key != DEVELOPER_KEY:
-        raise HTTPException(status_code=401, detail="Invalid developer key")
-    
     try:
         deleted = {
             "users": (await db.users.delete_many({"company_id": company_id})).deleted_count,
@@ -7038,7 +8587,281 @@ async def delete_company(company_id: str, key: str):
         logger.error(f"Developer delete company error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@api_router.delete("/developer/clear-all")
+async def developer_clear_all(
+    confirm: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Drop every tenant document in every collection.
+
+    Guarded by the ``require_platform_owner`` dependency (JWT role check)
+    AND a mandatory ``confirm=DELETE_EVERYTHING`` query parameter
+    (Requirement 15.9). Both gates must pass before a single
+    ``delete_many({})`` runs; anything less returns HTTP 400.
+
+    The platform-owner user document(s) are NOT deleted — the scratch
+    space must stay reachable immediately after a reset so the operator
+    does not have to re-run ``bootstrap_platform_owner.py`` mid-migration.
+    """
+
+    if confirm != "DELETE_EVERYTHING":
+        raise HTTPException(
+            status_code=400,
+            detail="Pass confirm=DELETE_EVERYTHING to proceed.",
+        )
+
+    collections = [
+        "companies", "vehicles", "inspections", "inspection_photos",
+        "fuel_submissions", "incidents", "alerts", "service_records",
+        "maintenance_logs", "support_requests", "audit_trail",
+        "password_resets", "email_logs", "notification_preferences",
+        "push_tokens", "temp_photos", "photos",
+    ]
+    deleted: dict[str, int] = {}
+    for coll in collections:
+        try:
+            result = await db[coll].delete_many({})
+            deleted[coll] = result.deleted_count
+        except Exception as exc:
+            logger.warning(
+                "developer_clear_all: failed to clear %s: %s", coll, exc
+            )
+            deleted[coll] = 0
+
+    # Users: wipe everyone except platform owners so the owner dashboard
+    # is still reachable after the reset without re-running the bootstrap
+    # script.
+    deleted["users"] = (
+        await db.users.delete_many({"is_platform_owner": {"$ne": True}})
+    ).deleted_count
+
+    return {"message": "All tenant data deleted", "deleted": deleted}
+
+
+# ============== Tenant Resolution (Req 11) ==============
+
+
+class TenantResolveRequest(BaseModel):
+    """Request body for POST /api/tenant/resolve.
+
+    The subdomain is provided lowercased by the web client (the router
+    derives it from ``window.location.hostname``), but we still normalize
+    + validate server-side so a direct cURL with mixed case or trailing
+    whitespace still works consistently.
+    """
+
+    subdomain: str
+
+
+class TenantResolveResponse(BaseModel):
+    """Response for POST /api/tenant/resolve (Req 11.3).
+
+    ``logo_url`` is a presigned GET URL for the company logo stored in
+    the ``logos`` bucket; null when the tenant has not uploaded a logo.
+    ``logo_object_key`` is exposed for debugging and for clients that
+    want to cache the URL locally.
+    """
+
+    company_id: str
+    name: str
+    logo_object_key: Optional[str] = None
+    logo_url: Optional[str] = None
+
+
+@api_router.post("/tenant/resolve", response_model=TenantResolveResponse)
+async def resolve_tenant(payload: TenantResolveRequest):
+    """Look up a tenant by subdomain slug and return branding info.
+
+    No auth required (Req 11.2). Reserved slugs never resolve and
+    always 404 (Req 11.5) — ``www``, ``api``, ``admin``, ``owner`` etc.
+    are not tenants. Unknown slugs 404 (Req 11.4). Successful resolution
+    returns the company id, display name, and a presigned logo URL so
+    the web client can render the branded login form before auth.
+    """
+
+    raw = (payload.subdomain or "").strip().lower()
+    if not raw or raw in RESERVED_SUBDOMAINS:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    company = await db.companies.find_one(
+        {"subdomain": raw},
+        {"name": 1, "logo_object_key": 1},
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    logo_key = company.get("logo_object_key")
+    return TenantResolveResponse(
+        company_id=str(company["_id"]),
+        name=company.get("name", ""),
+        logo_object_key=logo_key,
+        logo_url=_presign_if_key("logos", logo_key) if logo_key else None,
+    )
+
+
+# ============== Company Subdomain Rename (Req 17) ==============
+
+
+# Cooldown between successive subdomain renames. Also used as the grace
+# window during which a retired slug remains reserved before it becomes
+# claimable again (Req 17.5).
+SUBDOMAIN_RENAME_COOLDOWN: timedelta = timedelta(days=30)
+
+
+class SubdomainRenameRequest(BaseModel):
+    """Body for PUT /api/company/subdomain.
+
+    ``new_subdomain`` is validated against ``SUBDOMAIN_REGEX`` and the
+    reserved list; malformed / reserved values 400; collisions with an
+    active tenant 409; requests inside the 30-day cooldown 429 with a
+    ``next_permitted_at`` timestamp in the response body.
+    """
+
+    new_subdomain: str
+
+
+def _subdomain_recently_retired(
+    history: List[dict],
+    candidate: str,
+    now: datetime,
+) -> bool:
+    """Return True if ``candidate`` appears in ``history`` within the
+    cooldown window (Req 17.5). Entries older than the cooldown free up
+    the slug for re-use.
+    """
+
+    cutoff = now - SUBDOMAIN_RENAME_COOLDOWN
+    for entry in history or []:
+        if entry.get("old_subdomain") != candidate:
+            continue
+        changed_at = entry.get("changed_at")
+        if isinstance(changed_at, datetime) and changed_at >= cutoff:
+            return True
+    return False
+
+
+@api_router.put("/company/subdomain")
+async def rename_company_subdomain(
+    payload: SubdomainRenameRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Rename the authenticated tenant's subdomain.
+
+    Authz: only ``super_admin`` (company owner) or ``platform_owner``
+    may rename a subdomain (Req 17.6); any other role 403s. Rate limit:
+    the most recent entry in ``companies.subdomain_history`` must be
+    older than ``SUBDOMAIN_RENAME_COOLDOWN`` (Req 17.3), otherwise 429
+    with ``next_permitted_at``. Uniqueness check excludes the current
+    tenant so a no-op rename does not 409 itself (Req 17.1).
+    """
+
+    role = current_user.get("jwt_role") or current_user.get("role")
+    if role not in {UserRole.SUPER_ADMIN, UserRole.PLATFORM_OWNER}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only super_admin or platform_owner may rename the subdomain",
+        )
+
+    company_id = current_user.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="User has no company context")
+
+    # Validate + normalize the candidate (Req 17.2).
+    try:
+        new_slug = validate_subdomain(payload.new_subdomain)
+    except SubdomainValidationError as exc:
+        raise _subdomain_error_to_http(exc)
+
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    current_slug = company.get("subdomain")
+    if new_slug == current_slug:
+        # No-op rename — treat as success without touching history or
+        # starting a new cooldown.
+        return {"subdomain": current_slug, "changed": False}
+
+    # 30-day cooldown check (Req 17.3). Based on the most recent history
+    # entry's changed_at. Missing / malformed history == no cooldown.
+    history: List[dict] = company.get("subdomain_history") or []
+    now = datetime.utcnow()
+    if history:
+        most_recent = history[-1]
+        changed_at = most_recent.get("changed_at")
+        if isinstance(changed_at, datetime):
+            next_permitted = changed_at + SUBDOMAIN_RENAME_COOLDOWN
+            if now < next_permitted:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Subdomain rename is rate limited (30-day cooldown).",
+                        "next_permitted_at": next_permitted.isoformat(),
+                    },
+                )
+
+    # Uniqueness against active tenants (Req 17.1), excluding self.
+    try:
+        await ensure_subdomain_unique(
+            new_slug, db, exclude_company_id=company_id
+        )
+    except SubdomainValidationError as exc:
+        raise _subdomain_error_to_http(exc)
+
+    # Freshly retired slugs are reserved for the cooldown window
+    # (Req 17.5). Checking company history covers the "rename back to a
+    # recently used value" case; a broader cross-tenant retired check is
+    # out of scope because retired slugs are always scoped to the tenant
+    # that held them.
+    if _subdomain_recently_retired(history, new_slug, now):
+        raise HTTPException(
+            status_code=409,
+            detail="Subdomain was recently retired; try again in 30 days.",
+        )
+
+    # Persist the rename + history entry atomically.
+    history_entry = {
+        "old_subdomain": current_slug,
+        "changed_at": now,
+    }
+    await db.companies.update_one(
+        {"_id": ObjectId(company_id)},
+        {
+            "$set": {"subdomain": new_slug, "updated_at": now},
+            "$push": {"subdomain_history": history_entry},
+        },
+    )
+
+    return {
+        "subdomain": new_slug,
+        "previous_subdomain": current_slug,
+        "changed": True,
+        "changed_at": now.isoformat(),
+    }
+
 # ============== Health Check ==============
+#
+# Req 2: these must be reachable without the /api prefix when the API is
+# served standalone on EC2 (Nginx_Proxy forwards /health -> uvicorn /health
+# and / -> uvicorn /). They are additionally mirrored under /api so the
+# existing clients that call /api/health continue to work during the
+# cutover.
+
+@app.get("/")
+async def app_root():
+    """Root endpoint reachable without /api prefix (Req 2.2)."""
+    return {"message": "FleetShield365 API", "version": "1.0.0"}
+
+
+@app.get("/health")
+async def app_health():
+    """Health probe reachable without /api prefix (Req 2.1, 2.3).
+
+    Response body contains ``status: "ok"`` per Req 2.1.
+    """
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
 
 @api_router.get("/")
 async def root():
@@ -7046,57 +8869,120 @@ async def root():
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 # Include router
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https://[a-z0-9-]+\.fleetshield365\.com$",
     allow_credentials=True,
-    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    # Create indexes for better query performance
-    # Drop old email index and create a sparse one (allows multiple nulls)
+async def ensure_indexes() -> None:
+    """Idempotently create every index the application relies on.
+
+    Called from the FastAPI startup event and also available for the
+    deploy-time migration script to invoke standalone (Req 12.3, 24.5).
+    Every ``create_index`` call is idempotent on MongoDB — if the index
+    already exists with the same definition it is a no-op; if it exists
+    with a conflicting definition Mongo raises and the caller sees a
+    clear error.
+    """
+
+    from pymongo.collation import Collation
+
+    # --- users ---------------------------------------------------------
+    # Legacy indexes on users.email and users.company_id_username may
+    # exist from earlier releases with different options; drop then
+    # recreate sparse-unique so the new shape is authoritative.
     try:
         await db.users.drop_index("email_1")
-    except:
-        pass  # Index might not exist
+    except Exception:
+        pass
     try:
         await db.users.drop_index("company_id_1_username_1")
-    except:
-        pass  # Index might not exist
-    
-    # Sparse indexes allow multiple null values
+    except Exception:
+        pass
+
     await db.users.create_index("email", unique=True, sparse=True)
-    await db.users.create_index("username", sparse=True)  # Not unique globally, just for lookups
+    await db.users.create_index("username", unique=True, sparse=True)
     await db.users.create_index([("company_id", 1), ("role", 1)])
+    await db.users.create_index("company_id")
+
+    # --- companies -----------------------------------------------------
+    # Case-insensitive unique sparse index on companies.subdomain
+    # (Req 9.2, 9.6). The unique constraint is enforced by Mongo at the
+    # server level so concurrent registrations cannot both claim the
+    # same slug even if the app-level check races.
+    await db.companies.create_index(
+        "subdomain",
+        unique=True,
+        sparse=True,
+        collation=Collation(locale="en", strength=2),
+    )
+
+    # --- vehicles ------------------------------------------------------
+    await db.vehicles.create_index("company_id")
     await db.vehicles.create_index([("company_id", 1), ("registration_number", 1)])
     await db.vehicles.create_index([("company_id", 1), ("status", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("rego_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("insurance_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("safety_certificate_expiry", 1)])
+    await db.vehicles.create_index([("company_id", 1), ("coi_expiry", 1)])
+
+    # --- inspections / photos -----------------------------------------
+    await db.inspections.create_index("company_id")
     await db.inspections.create_index([("company_id", 1), ("timestamp", -1)])
     await db.inspections.create_index([("company_id", 1), ("vehicle_id", 1), ("timestamp", -1)])
     await db.inspections.create_index([("driver_id", 1), ("timestamp", -1)])
     await db.inspection_photos.create_index([("vehicle_id", 1), ("created_at", -1)])
     await db.inspection_photos.create_index("inspection_id")
+
+    # --- alerts, fuel, incidents, service, maintenance, support, photos
+    await db.alerts.create_index("company_id")
     await db.alerts.create_index([("company_id", 1), ("is_read", 1)])
     await db.alerts.create_index([("company_id", 1), ("created_at", -1)])
-    await db.maintenance_logs.create_index([("company_id", 1), ("service_date", -1)])
+    await db.fuel_submissions.create_index("company_id")
     await db.fuel_submissions.create_index([("company_id", 1), ("timestamp", -1)])
+    await db.incidents.create_index("company_id")
     await db.incidents.create_index([("company_id", 1), ("created_at", -1)])
     await db.incidents.create_index([("company_id", 1), ("status", 1)])
+    await db.service_records.create_index("company_id")
     await db.service_records.create_index([("company_id", 1), ("service_date", -1)])
     await db.service_records.create_index([("company_id", 1), ("vehicle_id", 1)])
-    # Indexes for expiry date queries (dashboard performance)
-    await db.vehicles.create_index([("company_id", 1), ("rego_expiry", 1)])
-    await db.vehicles.create_index([("company_id", 1), ("insurance_expiry", 1)])
-    await db.vehicles.create_index([("company_id", 1), ("safety_certificate_expiry", 1)])
-    await db.vehicles.create_index([("company_id", 1), ("coi_expiry", 1)])
-    logger.info("Database indexes created")
+    await db.maintenance_logs.create_index("company_id")
+    await db.maintenance_logs.create_index([("company_id", 1), ("service_date", -1)])
+    await db.support_requests.create_index("company_id")
+    await db.photos.create_index("company_id")
+
+    # --- audit_trail ---------------------------------------------------
+    await db.audit_trail.create_index("company_id")
+    await db.audit_trail.create_index([("timestamp", -1)])
+    await db.audit_trail.create_index("user_id")
+
+    # --- password_resets + email_logs ---------------------------------
+    # TTL index on password_resets.expires_at auto-removes spent tokens.
+    await db.password_resets.create_index("token", unique=True)
+    await db.password_resets.create_index(
+        "expires_at", expireAfterSeconds=0
+    )
+    await db.email_logs.create_index([("sent_at", -1)])
+
+    logger.info("ensure_indexes(): DB indexes verified")
+
+
+@app.on_event("startup")
+async def startup_event_indexes():
+    """Run the ensure_indexes bootstrap on app startup (Req 24.5, 12.3)."""
+    try:
+        await ensure_indexes()
+    except Exception as exc:
+        logger.error("ensure_indexes() failed at startup: %s", exc)
     
     # One-time migration: backfill is_safe for end_shift inspections missing it
     end_shift_missing = await db.inspections.count_documents({

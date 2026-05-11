@@ -1,0 +1,33 @@
+[Unit]
+# systemd unit for the FleetShield365 FastAPI backend (Req 1.2, 22.2).
+#
+# Install with:
+#   sudo cp fleetshield365-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fleetshield365-api
+#
+# Log output goes to the journald unit log:
+#   sudo journalctl -u fleetshield365-api -f
+Description=FleetShield365 FastAPI backend
+After=network-online.target mongod.service minio.service
+Wants=network-online.target
+Requires=mongod.service minio.service
+
+[Service]
+Type=simple
+User=fleetshield
+Group=fleetshield
+WorkingDirectory=/opt/fleetshield365/backend
+EnvironmentFile=/opt/fleetshield365/backend/.env
+ExecStart=/opt/fleetshield365/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

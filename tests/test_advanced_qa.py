@@ -13,7 +13,7 @@ import uuid
 import json
 
 # Production backend URL
-BASE_URL = "https://fleetshield365-backend-production.up.railway.app"
+BASE_URL = os.environ.get("FLEETSHIELD_API_BASE_URL", "https://api.fleetshield365.com")
 
 # Test credentials
 ADMIN_EMAIL = "samneel27@gmail.com"
