@@ -28,8 +28,8 @@ import re
 import stripe
 import httpx
 import asyncio
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Content
+import aiosmtplib
+from email.message import EmailMessage
 
 
 class MissingRequiredEnvVarError(RuntimeError):
@@ -548,36 +548,41 @@ def set_cached_stats(company_id: str, data: dict):
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# SendGrid Configuration
-SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'noreply@fleetguard.app')
+# SMTP Configuration (Namecheap PrivateEmail)
+SMTP_HOST     = os.environ.get('SMTP_HOST', 'mail.privateemail.com')
+SMTP_PORT     = int(os.environ.get('SMTP_PORT', '465') or 465)
+SMTP_USER     = os.environ.get('SMTP_USER', '')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+SENDER_EMAIL  = os.environ.get('SENDER_EMAIL', 'alerts@fleetshield365.com')
 
 # ============== Email Notification Service ==============
 
 async def send_email_notification(to_email: str, subject: str, html_content: str):
-    """Send email notification via SendGrid"""
-    if not SENDGRID_API_KEY:
-        logger.warning("SendGrid API key not configured, skipping email")
+    """Send email notification via SMTP (Namecheap PrivateEmail)."""
+    if not SMTP_PASSWORD:
+        logger.warning("SMTP_PASSWORD not configured, skipping email")
         return False
-    
     try:
-        message = Mail(
-            from_email=Email(SENDER_EMAIL, "FleetShield365 Alerts"),
-            to_emails=To(to_email),
-            subject=subject,
-            html_content=Content("text/html", html_content)
+        msg = EmailMessage()
+        msg["From"]    = f"FleetShield365 Alerts <{SENDER_EMAIL}>"
+        msg["To"]      = to_email
+        msg["Subject"] = subject
+        msg.set_content("This email requires an HTML-capable mail client.")
+        msg.add_alternative(html_content, subtype="html")
+        await aiosmtplib.send(
+            msg,
+            hostname=SMTP_HOST,
+            port=SMTP_PORT,
+            username=SMTP_USER or SENDER_EMAIL,
+            password=SMTP_PASSWORD,
+            use_tls=(SMTP_PORT == 465),
+            start_tls=(SMTP_PORT == 587),
+            timeout=30,
         )
-        
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        status_code = response.status_code
-        logger.info(f"[SENDGRID-TEST] Email sent to {to_email}: {subject} (HTTP {status_code})")
-        # SendGrid returns 200, 201, or 202 for success
-        is_success = status_code in [200, 201, 202]
-        logger.info(f"[SENDGRID-TEST] Return value: {is_success}")
-        return is_success
+        logger.info(f"[SMTP] Email sent to {to_email}: {subject}")
+        return True
     except Exception as e:
-        logger.error(f"[SENDGRID] Error sending email: {e}")
+        logger.error(f"[SMTP] Error sending email to {to_email}: {e}")
         return False
 
 async def send_expiry_alert_email(admin_email: str, company_name: str, alerts: List[dict]):
@@ -2394,63 +2399,60 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
     return pdf_base64
 
-# ============== SendGrid Email Service ==============
-
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+# ============== Email Service (SMTP-backed, with DB logging) ==============
 
 class EmailService:
-    """SendGrid email service for sending notifications"""
-    
+    """SMTP email service for sending notifications, with DB logging."""
+
     @staticmethod
     async def send_email(to_email: str, subject: str, body: str, company_id: str = None, is_html: bool = True):
         """
-        Send email via SendGrid (if configured) or fallback to logging
+        Send email via SMTP (Namecheap PrivateEmail). Falls back to mock-log when SMTP is not configured.
         """
-        sendgrid_api_key = os.environ.get('SENDGRID_API_KEY')
-        sender_email = os.environ.get('SENDER_EMAIL', 'noreply@fleetguard.app')
-        
-        # Store in database for tracking
         email_log = {
-            "to_email": to_email,
-            "subject": subject,
-            "body": body[:500],  # Truncate for storage
+            "to_email":   to_email,
+            "subject":    subject,
+            "body":       body[:500],
             "company_id": company_id,
-            "sent_at": datetime.utcnow(),
-            "status": "pending",
-            "provider": "sendgrid" if sendgrid_api_key else "mock"
+            "sent_at":    datetime.utcnow(),
+            "status":     "pending",
+            "provider":   "smtp" if SMTP_PASSWORD else "mock",
         }
-        
-        if sendgrid_api_key:
+
+        if SMTP_PASSWORD:
             try:
-                message = Mail(
-                    from_email=sender_email,
-                    to_emails=to_email,
-                    subject=subject,
-                    html_content=body if is_html else None,
-                    plain_text_content=body if not is_html else None
-                )
-                sg = SendGridAPIClient(sendgrid_api_key)
-                response = sg.send(message)
-                
-                if response.status_code == 202:
-                    email_log["status"] = "sent"
-                    logger.info(f"[SENDGRID] Email sent to {to_email}: {subject}")
+                msg = EmailMessage()
+                msg["From"]    = SENDER_EMAIL
+                msg["To"]      = to_email
+                msg["Subject"] = subject
+                if is_html:
+                    msg.set_content("This email requires an HTML-capable mail client.")
+                    msg.add_alternative(body, subtype="html")
                 else:
-                    email_log["status"] = "failed"
-                    email_log["error"] = f"Status code: {response.status_code}"
-                    logger.error(f"[SENDGRID] Failed to send email: {response.status_code}")
+                    msg.set_content(body)
+                await aiosmtplib.send(
+                    msg,
+                    hostname=SMTP_HOST,
+                    port=SMTP_PORT,
+                    username=SMTP_USER or SENDER_EMAIL,
+                    password=SMTP_PASSWORD,
+                    use_tls=(SMTP_PORT == 465),
+                    start_tls=(SMTP_PORT == 587),
+                    timeout=30,
+                )
+                email_log["status"] = "sent"
+                logger.info(f"[SMTP] Email sent to {to_email}: {subject}")
             except Exception as e:
                 email_log["status"] = "failed"
-                email_log["error"] = str(e)
-                logger.error(f"[SENDGRID] Error sending email: {e}")
+                email_log["error"]  = str(e)
+                logger.error(f"[SMTP] Error sending email to {to_email}: {e}")
         else:
-            # Mock mode - just log it
+            # Mock mode — log only, do not actually send
             logger.info(f"[MOCK EMAIL] To: {to_email}")
             logger.info(f"[MOCK EMAIL] Subject: {subject}")
             logger.info(f"[MOCK EMAIL] Body: {body[:200]}...")
             email_log["status"] = "mocked"
-        
+
         await db.email_logs.insert_one(email_log)
         return email_log["status"] in ["sent", "mocked"]
     
@@ -2939,7 +2941,7 @@ class TestEmailRequest(BaseModel):
 
 @api_router.post("/test-email")
 async def test_email(request: TestEmailRequest, current_user: dict = Depends(get_current_user)):
-    """Send a test email to verify SendGrid integration"""
+    """Send a test email to verify SMTP integration"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -2966,7 +2968,7 @@ async def test_email(request: TestEmailRequest, current_user: dict = Depends(get
     if success:
         return {"status": "success", "message": f"Test email sent to {request.to_email}"}
     else:
-        raise HTTPException(status_code=500, detail="Failed to send email. Check SendGrid configuration and sender verification.")
+        raise HTTPException(status_code=500, detail="Failed to send email. Check SMTP configuration and sender mailbox.")
 
 @api_router.post("/trigger-weekly-summary")
 async def trigger_weekly_summary(current_user: dict = Depends(get_current_user)):
@@ -3072,12 +3074,12 @@ async def submit_contact_form(request: ContactFormRequest):
         logger.error(f"[CONTACT] Failed to persist contact submission: {e}")
 
     if not admin_sent:
-        # Pilot / pre-SendGrid state: the contact submission is
-        # persisted above; we surface a 202 Accepted so the website UI
-        # can still acknowledge receipt instead of showing a hard 5xx.
-        # Once SendGrid is wired up this branch stops firing.
+        # Email send failed (SMTP not configured or transport error).
+        # The contact submission is persisted above; we surface a 202
+        # Accepted so the website UI can still acknowledge receipt
+        # instead of showing a hard 5xx.
         logger.warning(
-            "/api/contact: email not delivered (SendGrid not configured); "
+            "/api/contact: email not delivered (SMTP not configured or send failed); "
             "submission persisted for manual follow-up."
         )
         return {
