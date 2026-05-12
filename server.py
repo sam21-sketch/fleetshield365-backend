@@ -10987,6 +10987,179 @@ async def delete_company(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@api_router.get("/developer/platform-stats")
+async def developer_platform_stats(
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Platform-wide stats for the owner dashboard.
+
+    One endpoint that returns:
+      * tenant + vehicle + inspection counts
+      * subscription expiry distribution by criticality bucket
+      * MinIO storage breakdown by bucket (raw bytes + object count)
+      * compression-savings estimate vs raw (per STORAGE-PLAN ratio)
+
+    All cheap — the heavy bit is the MinIO list, capped per bucket so
+    a tenant with millions of objects doesn't stall this call.
+    """
+    now = utcnow()
+
+    tenant_count = await db.companies.count_documents({
+        **_soft_delete_filter(),
+    })
+    vehicle_count = await db.vehicles.count_documents({
+        **_soft_delete_filter(),
+    })
+    inspection_count = await db.inspections.count_documents({})
+    driver_count = await db.users.count_documents({
+        **_soft_delete_filter(),
+        "role": UserRole.DRIVER,
+    })
+
+    # Subscription criticality buckets. We look at companies'
+    # ``trial_ends_at`` / ``subscription_ends_at`` whichever is later
+    # (the company is "active" until the later of the two passes).
+    companies = await db.companies.find(
+        {**_soft_delete_filter()},
+        {"_id": 1, "name": 1, "subdomain": 1, "subscription_status": 1,
+         "trial_ends_at": 1, "subscription_ends_at": 1, "suspended": 1},
+    ).to_list(2000)
+    buckets = {"expired": [], "lt7d": [], "7_30d": [], "gt30d": [], "no_expiry": []}
+    for co in companies:
+        trial_end = co.get("trial_ends_at") if isinstance(co.get("trial_ends_at"), datetime) else None
+        sub_end = co.get("subscription_ends_at") if isinstance(co.get("subscription_ends_at"), datetime) else None
+        # Pick the later of the two as the "effective end".
+        candidates = [d for d in (trial_end, sub_end) if d is not None]
+        eff_end = max(candidates) if candidates else None
+        item = {
+            "company_id": str(co["_id"]),
+            "name": co.get("name", ""),
+            "subdomain": co.get("subdomain"),
+            "suspended": bool(co.get("suspended")),
+            "effective_end": eff_end.isoformat() if eff_end else None,
+            "status": co.get("subscription_status"),
+        }
+        if eff_end is None:
+            buckets["no_expiry"].append(item)
+        else:
+            days_left = (eff_end - now).days
+            if days_left < 0:
+                buckets["expired"].append({**item, "days_left": days_left})
+            elif days_left < 7:
+                buckets["lt7d"].append({**item, "days_left": days_left})
+            elif days_left < 30:
+                buckets["7_30d"].append({**item, "days_left": days_left})
+            else:
+                buckets["gt30d"].append({**item, "days_left": days_left})
+
+    # MinIO storage: list every bucket and sum object sizes. Capped at
+    # 5000 objects per bucket to keep this call cheap on large
+    # tenants; we surface ``capped: true`` so the UI can flag the
+    # number as a lower bound.
+    BUCKETS = (
+        "logos", "compliance", "inspection-photos", "fuel-receipts",
+        "incident-photos", "incident-attachments", "service-records",
+        "maintenance", "signatures", "photos",
+    )
+    storage: dict = {"buckets": {}, "total_bytes": 0, "total_objects": 0, "capped": False}
+    for name in BUCKETS:
+        try:
+            paginator = object_store._s3_client.get_paginator("list_objects_v2")
+            total_b = 0
+            total_n = 0
+            scanned = 0
+            for page in paginator.paginate(Bucket=name, PaginationConfig={"MaxItems": 5000}):
+                for obj in page.get("Contents") or []:
+                    total_b += obj.get("Size", 0) or 0
+                    total_n += 1
+                    scanned += 1
+                    if scanned >= 5000:
+                        storage["capped"] = True
+                        break
+                if scanned >= 5000:
+                    break
+            storage["buckets"][name] = {"bytes": total_b, "objects": total_n}
+            storage["total_bytes"] += total_b
+            storage["total_objects"] += total_n
+        except Exception as exc:
+            storage["buckets"][name] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # Compression-savings estimate: STORAGE-PLAN.txt says ~89% reduction
+    # vs raw uncompressed. So raw size estimate = stored / (1 - 0.89).
+    if storage["total_bytes"] > 0:
+        estimated_raw = int(storage["total_bytes"] / 0.11)
+        savings = estimated_raw - storage["total_bytes"]
+    else:
+        estimated_raw = 0
+        savings = 0
+    storage["estimated_raw_bytes"] = estimated_raw
+    storage["estimated_saved_bytes"] = savings
+    storage["compression_ratio_pct"] = 89  # documented platform target
+
+    return {
+        "tenants": tenant_count,
+        "vehicles": vehicle_count,
+        "drivers": driver_count,
+        "inspections": inspection_count,
+        "subscriptions": {
+            "buckets": {
+                "expired": len(buckets["expired"]),
+                "critical_lt_7d": len(buckets["lt7d"]),
+                "warning_7_30d": len(buckets["7_30d"]),
+                "ok_gt_30d": len(buckets["gt30d"]),
+                "no_expiry": len(buckets["no_expiry"]),
+            },
+            # Surface the actual list of expiring tenants so the
+            # dashboard can show them inline (capped at 50 to keep the
+            # response bounded).
+            "expiring_soon": (buckets["expired"] + buckets["lt7d"] + buckets["7_30d"])[:50],
+        },
+        "storage": storage,
+        "generated_at": now.isoformat(),
+    }
+
+
+@api_router.get("/developer/recent-activity")
+async def developer_recent_activity(
+    limit: int = 100,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Platform-wide recent activity for the owner dashboard.
+
+    Pulls from audit_trail across all tenants (platform owner sees
+    everything). Capped at 200; default 100. Each row carries the
+    tenant context so the UI can render "company X · user Y · action Z".
+    """
+    actual_limit = max(1, min(limit, 200))
+    rows = await db.audit_trail.find({}).sort("timestamp", -1).limit(actual_limit).to_list(actual_limit)
+
+    # Enrich with user + company names (small joins; capped roster).
+    user_ids = list({str(r.get("user_id")) for r in rows if r.get("user_id")})
+    users = await db.users.find(
+        {"_id": {"$in": [ObjectId(u) for u in user_ids if ObjectId.is_valid(u)]}},
+        {"name": 1, "email": 1, "company_id": 1},
+    ).to_list(500)
+    user_map = {str(u["_id"]): u for u in users}
+    co_ids = list({u.get("company_id") for u in users if u.get("company_id")})
+    companies = await db.companies.find(
+        {"_id": {"$in": [ObjectId(c) for c in co_ids if ObjectId.is_valid(c)]}},
+        {"name": 1, "subdomain": 1},
+    ).to_list(500)
+    co_map = {str(c["_id"]): c for c in companies}
+
+    enriched = []
+    for r in rows:
+        u = user_map.get(str(r.get("user_id"))) or {}
+        co = co_map.get(str(u.get("company_id"))) or {}
+        enriched.append({
+            **serialize_doc(r),
+            "user_name": u.get("name") or u.get("email"),
+            "company_name": co.get("name"),
+            "company_subdomain": co.get("subdomain"),
+        })
+    return {"items": enriched, "count": len(enriched)}
+
+
 @api_router.post("/developer/companies/{company_id}/suspend")
 async def developer_suspend_company(
     company_id: str,
