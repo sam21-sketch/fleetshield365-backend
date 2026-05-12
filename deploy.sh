@@ -69,6 +69,24 @@ log "Installing Python dependencies"
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 "${VENV_DIR}/bin/pip" install --quiet --upgrade -r "${BACKEND_DIR}/requirements.txt"
 
+# Phase 2 of STORAGE-PLAN.txt — async PDF compression uses Ghostscript.
+# Install if missing (apt for Ubuntu / dnf for Amazon Linux 2023). If
+# neither package manager works, log and continue — backend tolerates
+# `gs` not on PATH (compression simply gets skipped, originals are kept).
+if ! command -v gs >/dev/null 2>&1; then
+  log "Installing ghostscript for PDF compression"
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y -qq \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ghostscript \
+      || log "WARN: ghostscript install failed; PDF compression will be skipped"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q ghostscript \
+      || log "WARN: ghostscript install failed; PDF compression will be skipped"
+  else
+    log "WARN: no apt-get or dnf found; install ghostscript manually"
+  fi
+fi
+
 # --- Step 3: materialize .env from SSM -------------------------------
 # Using --with-decryption so SecureString values come back in plaintext.
 # tmp file is created with mode 0600 *before* any secret is written, and

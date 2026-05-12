@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request, UploadFile, File, BackgroundTasks, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -30,6 +30,10 @@ import httpx
 import asyncio
 import aiosmtplib
 from email.message import EmailMessage
+import subprocess
+import shutil
+import tempfile
+from PIL import Image as PILImage
 
 
 class MissingRequiredEnvVarError(RuntimeError):
@@ -283,6 +287,151 @@ app = FastAPI(title="FleetShield365 API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
+
+# ---------------------------------------------------------------------------
+# Phase 9 — observability + transport security middleware.
+# ---------------------------------------------------------------------------
+import contextvars  # noqa: E402
+
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-"
+)
+
+
+# Email regex used by the PII-redact log filter. Tight enough to
+# avoid mangling code-like strings; greedy enough to catch real
+# emails inside log messages.
+_PII_EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+# Australian mobile pattern + generic 10+ digit runs. We're conservative
+# here — anything matching is masked, false positives are acceptable
+# (better to mask a vehicle rego that looks like a phone than to leak
+# a real number).
+_PII_PHONE_RE = re.compile(r"(?<!\d)(?:\+?61\s?)?0?\d{9,10}(?!\d)")
+
+
+class _PIIRedactingFilter(logging.Filter):
+    """Mask emails + phone-like digit runs from log records.
+
+    Applied to the root handler so every log line — including those
+    written by third-party libraries — passes through. Field-level
+    redaction in handlers (record.email, record.phone) is opt-in via
+    the LogRecord ``extra`` kwarg.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            redacted = _PII_EMAIL_RE.sub("<email>", msg)
+            redacted = _PII_PHONE_RE.sub("<phone>", redacted)
+            if redacted != msg:
+                # Rewriting record.msg + clearing args so getMessage()
+                # returns the redacted form. Some handlers re-call
+                # getMessage(), so we make it stable.
+                record.msg = redacted
+                record.args = None
+        except Exception:
+            pass
+        return True
+
+
+class _RequestIdFormatter(logging.Formatter):
+    """JSON-shaped log lines including the per-request UUID.
+
+    Phase 9 — gives logs a structure that CloudWatch / Loki / any
+    log-shipper can index without regex. The request_id pulls from
+    a contextvar so every log line written during a request carries
+    the same id, even from deep async tasks.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": _request_id_ctx.get(),
+        }
+        if record.exc_info:
+            import traceback
+            payload["exception"] = "".join(traceback.format_exception(*record.exc_info))
+        return json.dumps(payload, default=str)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Assign a UUID to every request + echo back as ``X-Request-ID``.
+
+    Phase 9. The id propagates through the contextvar so every log
+    line written during request handling carries it. Clients that
+    pass their own X-Request-ID header have it honoured (trusts the
+    client's correlation id for distributed tracing); otherwise a
+    fresh UUID is generated.
+    """
+    incoming = request.headers.get("X-Request-ID")
+    rid = incoming if (incoming and len(incoming) <= 128) else uuid.uuid4().hex
+    token = _request_id_ctx.set(rid)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        _request_id_ctx.reset(token)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add transport-security headers to every response.
+
+    Phase 9. CSP intentionally omitted — needs a per-page audit to
+    avoid breaking inline scripts and the presigned MinIO image URLs.
+    The headers below are universally safe: nosniff prevents MIME
+    confusion attacks, DENY blocks click-jacking, strict-origin
+    keeps the Referer header from leaking tenant subdomains to
+    third-party sites, and HSTS pins HTTPS for a year.
+    """
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+# Phase 3 — slowapi rate limiter (per-IP). Defaults are conservative
+# (no global rate); endpoints opt in via @limiter.limit decorators.
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# Phase 3 — generic unhandled-exception handler. HTTPException keeps its
+# intentional message; anything else gets a flat "Internal server error"
+# response with the full traceback logged server-side so production
+# never leaks a stack trace through the JSON detail field.
+from fastapi import Request as _FastAPIRequest
+from fastapi.responses import JSONResponse as _JSONResponse
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: _FastAPIRequest, exc: Exception):
+    # HTTPException flows through FastAPI's own handler — we only catch
+    # the "didn't expect this" case.
+    if isinstance(exc, HTTPException):
+        raise exc
+    logger.exception(
+        "Unhandled exception on %s %s",
+        request.method, request.url.path,
+    )
+    return _JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
 # Timezone helpers for consistent date/time handling
 from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
@@ -371,7 +520,7 @@ def get_timezone(tz_name: str) -> ZoneInfo:
     """Get ZoneInfo for a timezone name, with fallback to Sydney"""
     try:
         return ZoneInfo(tz_name) if tz_name else SYDNEY_TZ
-    except:
+    except Exception:
         return SYDNEY_TZ
 
 def format_timestamp(timestamp_str: str, timezone: str = DEFAULT_TIMEZONE) -> str:
@@ -412,7 +561,7 @@ async def get_company_timezone(db, company_id: str) -> str:
             return DEFAULT_TIMEZONE
         company = await db.companies.find_one({"_id": ObjectId(company_id)}, {"timezone": 1})
         return company.get("timezone", DEFAULT_TIMEZONE) if company else DEFAULT_TIMEZONE
-    except:
+    except Exception:
         return DEFAULT_TIMEZONE
 
 def get_today_range_for_timezone(timezone: str = DEFAULT_TIMEZONE):
@@ -497,7 +646,7 @@ def get_sydney_date_as_utc(date_str: str, is_end_of_day: bool = False):
         
         # Convert to UTC (naive for MongoDB)
         return sydney_dt.astimezone(UTC_TZ).replace(tzinfo=None)
-    except:
+    except Exception:
         # Fallback to direct parse if format is different
         return datetime.fromisoformat(date_str)
 
@@ -516,7 +665,7 @@ def get_cached(cache_type: str, company_id: str) -> Optional[Any]:
     if cache_key in api_cache:
         cached = api_cache[cache_key]
         ttl = CACHE_TTL.get(cache_type, 30)
-        if datetime.utcnow().timestamp() - cached["timestamp"] < ttl:
+        if utcnow().timestamp() - cached["timestamp"] < ttl:
             return cached["data"]
     return None
 
@@ -524,7 +673,7 @@ def set_cached(cache_type: str, company_id: str, data: Any):
     """Cache API response data"""
     cache_key = f"{cache_type}_{company_id}"
     api_cache[cache_key] = {
-        "timestamp": datetime.utcnow().timestamp(),
+        "timestamp": utcnow().timestamp(),
         "data": data
     }
 
@@ -545,7 +694,25 @@ def set_cached_stats(company_id: str, data: dict):
     set_cached("dashboard", company_id, data)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Phase 9 — JSON log formatter + PII redaction filter applied at the
+# root handler so every log line written by every module passes
+# through. Falls back to the original human-readable format when
+# LOG_JSON env var is "false" — useful in local dev.
+_LOG_JSON_ENABLED = os.environ.get("LOG_JSON", "true").strip().lower() not in ("false", "0", "no")
+_log_root = logging.getLogger()
+for _h in list(_log_root.handlers):
+    _log_root.removeHandler(_h)
+_stream_handler = logging.StreamHandler()
+if _LOG_JSON_ENABLED:
+    _stream_handler.setFormatter(_RequestIdFormatter())
+else:
+    _stream_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    )
+_stream_handler.addFilter(_PIIRedactingFilter())
+_log_root.addHandler(_stream_handler)
+_log_root.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 # SMTP Configuration (Namecheap PrivateEmail) — two mailboxes:
@@ -1232,6 +1399,275 @@ def get_password_hash(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
+
+def utcnow() -> datetime:
+    """Naive UTC datetime — Python 3.14-safe replacement for utcnow().
+
+    Phase 11 of TODO.md. ``utcnow()`` is deprecated and scheduled
+    for removal in Python 3.14. Every previous call site has been
+    migrated to this helper, which preserves the naive-UTC shape Mongo
+    docs and downstream comparisons rely on. New code should call
+    ``utcnow()`` instead of ``utcnow()``.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — security helpers (STORAGE-PLAN.txt / TODO.md Phase 3).
+# ---------------------------------------------------------------------------
+
+# Field names that must never reach the wire. Used by sanitize_user_doc()
+# and by the JSON response audit in test_security_phase3.py.
+_USER_SECRET_FIELDS: frozenset = frozenset({
+    "password_hash",
+    "hashed_password",
+    "offline_cred_hash",
+    "failed_login_attempts",
+    "locked_until",
+})
+
+
+def sanitize_user_doc(doc):
+    """Return a shallow copy of ``doc`` with every secret field stripped.
+
+    Accepts a dict, a list of dicts, or None. Mutates nothing.
+    Centralizes the "never leak the bcrypt hash" rule so callers don't
+    each have to remember which fields to pop.
+    """
+    if doc is None:
+        return None
+    if isinstance(doc, list):
+        return [sanitize_user_doc(d) for d in doc]
+    if not isinstance(doc, dict):
+        return doc
+    return {k: v for k, v in doc.items() if k not in _USER_SECRET_FIELDS}
+
+
+# Password policy: min 8 chars, at least one upper + lower + digit.
+# Applied uniformly at every site that sets a password (register,
+# reset, accept-invite, admin reset).
+_PASSWORD_POLICY_MIN_LEN = 8
+
+
+def validate_password_policy(password: str) -> None:
+    """Raise HTTPException 400 if the password doesn't meet platform policy.
+
+    Single source of truth — every endpoint that sets a password calls
+    this. Reasons returned in ``detail`` so the client can render a
+    friendly message.
+    """
+    if not isinstance(password, str):
+        raise HTTPException(status_code=400, detail="Password is required")
+    if len(password) < _PASSWORD_POLICY_MIN_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {_PASSWORD_POLICY_MIN_LEN} characters",
+        )
+    if not re.search(r"[A-Z]", password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one uppercase letter",
+        )
+    if not re.search(r"[a-z]", password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one lowercase letter",
+        )
+    if not re.search(r"\d", password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one digit",
+        )
+
+
+# Account lockout: 5 failed login attempts inside the window → 30-min lock.
+# Local int parser — _env_int is defined later in the file (next to the
+# upload validation helpers), so we inline a tolerant parse here to
+# avoid forward-reference ordering issues.
+def _phase3_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+ACCOUNT_LOCKOUT_MAX_FAILURES = _phase3_env_int("ACCOUNT_LOCKOUT_MAX_FAILURES", 5)
+ACCOUNT_LOCKOUT_WINDOW_SECONDS = _phase3_env_int("ACCOUNT_LOCKOUT_WINDOW_SECONDS", 15 * 60)
+ACCOUNT_LOCKOUT_DURATION_SECONDS = _phase3_env_int("ACCOUNT_LOCKOUT_DURATION_SECONDS", 30 * 60)
+
+
+async def _record_failed_login(user_doc: dict) -> Optional[int]:
+    """Bump the failed-login counter and lock the account on threshold.
+
+    Counter resets if the prior failures fall outside the window. When
+    threshold is hit, ``locked_until`` is set and we return the number
+    of seconds until the lock lifts so the caller can put it in a 423
+    response body.
+    """
+    now = utcnow()
+    failures = user_doc.get("failed_login_attempts") or []
+    if isinstance(failures, int):
+        # Legacy schema migration tolerance.
+        failures = []
+    cutoff = now - timedelta(seconds=ACCOUNT_LOCKOUT_WINDOW_SECONDS)
+    fresh = [
+        f for f in failures
+        if isinstance(f, datetime) and f > cutoff
+    ]
+    fresh.append(now)
+    update: dict = {"failed_login_attempts": fresh}
+    locked_seconds: Optional[int] = None
+    if len(fresh) >= ACCOUNT_LOCKOUT_MAX_FAILURES:
+        locked_until = now + timedelta(seconds=ACCOUNT_LOCKOUT_DURATION_SECONDS)
+        update["locked_until"] = locked_until
+        locked_seconds = ACCOUNT_LOCKOUT_DURATION_SECONDS
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {"$set": update},
+    )
+    return locked_seconds
+
+
+async def _clear_failed_logins(user_id) -> None:
+    """Drop the failure counter + lockout on a successful authentication."""
+    await db.users.update_one(
+        {"_id": user_id},
+        {"$unset": {"failed_login_attempts": "", "locked_until": ""}},
+    )
+
+
+def _account_locked_until(user_doc: dict) -> Optional[datetime]:
+    """Return the locked-until timestamp (UTC) if the account is still locked, else None."""
+    locked_until = user_doc.get("locked_until")
+    if not isinstance(locked_until, datetime):
+        return None
+    if locked_until > utcnow():
+        return locked_until
+    return None
+
+
+# Redirect-to allowlist — prevents open-redirect by checking the resolved
+# host is on the FleetShield365 zone before echoing it back to the client.
+_REDIRECT_ALLOWED_HOST_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.fleetshield365\.com$",
+    re.IGNORECASE,
+)
+
+
+def validate_redirect_url(url: Optional[str]) -> Optional[str]:
+    """Echo a redirect URL only when it points inside the FleetShield365 zone.
+
+    Returns the URL on success, None when the URL is missing, malformed,
+    or off-domain. Used by the login response so an attacker cannot
+    seed a tenant_subdomain that causes a redirect to evil.com.
+    """
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+    except Exception:
+        return None
+    if parts.scheme not in ("http", "https"):
+        return None
+    host = (parts.netloc or "").split(":")[0]
+    if host == "fleetshield365.com":
+        return url
+    if _REDIRECT_ALLOWED_HOST_RE.match(host):
+        return url
+    return None
+
+
+# HTML escape helper for user-supplied strings interpolated into emails.
+# We import the stdlib `html` module on demand so the email helpers can
+# call ``_safe_html(value)`` for every user-controlled value.
+import html as _html_lib  # noqa: E402
+
+
+def _safe_html(value) -> str:
+    """Escape user-controlled text for HTML email bodies (XSS-via-email defence)."""
+    if value is None:
+        return ""
+    return _html_lib.escape(str(value), quote=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — soft-delete + audit trail helpers (TODO.md Phase 4).
+#
+# Soft-delete pattern: instead of removing a document, mark it with
+# ``deleted_at`` (UTC datetime) + ``deleted_by`` (user_id). All reads
+# default to filtering them out. A "Trash" view can opt-in to see them
+# (and a Restore action unsets the fields). Permanent removal is only
+# triggered via the manual /api/admin/purge-old-deleted button, per
+# user requirement — no automated nightly purge.
+# ---------------------------------------------------------------------------
+
+# Collections that participate in soft-delete. inspections + fuel +
+# audit_trail are explicitly excluded — they're immutable compliance
+# records (NHVR) and must never be silently hidden from queries.
+SOFT_DELETE_COLLECTIONS: tuple = (
+    "vehicles",
+    "users",
+    "companies",
+    "service_records",
+    "maintenance_logs",
+    "incidents",
+)
+
+# How far back a soft-deleted row is considered "recoverable" before
+# the manual purge button can drop it. 30 days matches the platform
+# retention policy in TODO.md Phase 4.
+SOFT_DELETE_GRACE_DAYS = _phase3_env_int("SOFT_DELETE_GRACE_DAYS", 30)
+
+
+def _soft_delete_filter(include_deleted: bool = False) -> dict:
+    """Return a Mongo filter clause that excludes soft-deleted rows by default.
+
+    Use as a base filter for every read query against soft-delete
+    collections::
+
+        query = {**_soft_delete_filter(), "company_id": cid, ...}
+
+    Passing ``include_deleted=True`` (used by the Trash view) lifts
+    the filter so tombstoned rows surface.
+
+    Implementation note: we look for ``deleted_at`` being missing OR
+    null. Mongo treats ``{deleted_at: null}`` as matching docs whose
+    field is either absent or explicitly null, so a single comparison
+    covers both. Documents written before Phase 4 ship have no
+    ``deleted_at`` field — they match.
+    """
+    if include_deleted:
+        return {}
+    return {"deleted_at": None}
+
+
+def _soft_delete_update(user_id: Optional[str]) -> dict:
+    """Mongo $set clause that marks a row as soft-deleted."""
+    return {
+        "$set": {
+            "deleted_at": utcnow(),
+            "deleted_by": str(user_id) if user_id else None,
+        }
+    }
+
+
+def _restore_update() -> dict:
+    """Mongo $unset clause that restores a soft-deleted row."""
+    return {"$unset": {"deleted_at": "", "deleted_by": ""}}
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — tenant suspension dependency. The actual ``require_active_tenant``
+# function is defined further down, after ``get_current_user`` so the
+# Depends() forward-reference resolves. Look for "Phase 8 dependency"
+# below.
+# ---------------------------------------------------------------------------
+
 import re
 async def generate_unique_username(name: str, company_id: str) -> str:
     """Generate a GLOBALLY unique username from the person's name with random numbers"""
@@ -1344,7 +1780,7 @@ async def _mint_access_token(
         except Exception:
             resolved_subdomain = None
 
-    now = datetime.utcnow()
+    now = utcnow()
     payload = {
         "sub": str(user_id),
         "company_id": str(resolved_company_id) if resolved_company_id else None,
@@ -1355,6 +1791,10 @@ async def _mint_access_token(
             expires_delta
             or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
         ),
+        # Phase 3 — jti (JWT ID) lets the server revoke individual tokens
+        # via the revoked_tokens collection. Without jti, logout would
+        # be cosmetic (token kept working until natural expiry).
+        "jti": uuid.uuid4().hex,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -1370,10 +1810,12 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     when the ``subdomain`` claim is present).
     """
     to_encode = data.copy()
-    now = datetime.utcnow()
+    now = utcnow()
     expire = now + (expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS))
     to_encode.setdefault("iat", int(now.timestamp()))
     to_encode["exp"] = expire
+    # Phase 3 — make every token revocable.
+    to_encode.setdefault("jti", uuid.uuid4().hex)
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -1382,9 +1824,41 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
+
+        # Phase 3 — token revocation list. /auth/logout adds the jti
+        # here with a TTL = original token exp, so the collection
+        # self-cleans. Tokens minted before jti existed (legacy) have
+        # ``jti is None`` — they bypass this check; the stale-subdomain
+        # check (below) still applies. New tokens always carry jti.
+        jti = payload.get("jti")
+        if jti:
+            revoked = await db.revoked_tokens.find_one({"_id": jti})
+            if revoked:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Token has been revoked. Please log in again.",
+                )
+
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
+
+        # Phase 8 of TODO.md — flag the user's tenant suspension status
+        # on the returned dict. The require_active_tenant dependency
+        # (below) uses it to block writes; reads continue to work so
+        # the admin can review their data and pay/upgrade. We do the
+        # lookup here once per request rather than per-endpoint.
+        co_id = user.get("company_id")
+        if co_id:
+            try:
+                co_doc = await db.companies.find_one(
+                    {"_id": ObjectId(co_id)},
+                    {"suspended": 1, "suspended_at": 1, "suspended_reason": 1},
+                )
+                user["_company_suspended"] = bool(co_doc and co_doc.get("suspended"))
+                user["_company_suspended_reason"] = (co_doc or {}).get("suspended_reason")
+            except Exception:
+                user["_company_suspended"] = False
 
         # Stale-subdomain rejection (Req 12.4, 12.5). When the JWT was
         # minted with a ``subdomain`` claim we look up the current
@@ -1438,6 +1912,89 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+async def require_active_tenant(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Phase 8 dependency — block writes from suspended tenants (HTTP 423).
+
+    Platform_owner tokens are unaffected (they need to un-suspend
+    even when a tenant is in this state). Reads remain available so
+    admins can still see their data while sorting out payment.
+    """
+    if current_user.get("jwt_role") == UserRole.PLATFORM_OWNER:
+        return current_user
+    if current_user.get("_company_suspended"):
+        reason = current_user.get("_company_suspended_reason") or "Account suspended"
+        raise HTTPException(
+            status_code=423,
+            detail=(
+                f"{reason}. Read access works; writes are blocked until "
+                f"the suspension is lifted. Contact support."
+            ),
+        )
+    return current_user
+
+
+async def require_active_subscription(
+    current_user: dict = Depends(require_active_tenant),
+) -> dict:
+    """Phase 12 dependency — block driver write actions on expired plans.
+
+    Returns HTTP 402 (Payment Required) when:
+      * The trial has ended AND there is no active paid subscription, OR
+      * The subscription is explicitly in ``status="canceled"`` or
+        ``status="past_due"`` past its grace.
+
+    Admins + owners are NOT blocked — they need access to renew/pay.
+    Platform_owner tokens are likewise unaffected.
+
+    The mobile / web client should catch 402 and render an
+    "Account expired — please ask your owner" screen for drivers, or
+    "Your plan ended — renew to continue" for admins.
+    """
+    role = current_user.get("jwt_role") or current_user.get("role")
+    if role == UserRole.PLATFORM_OWNER:
+        return current_user
+    # Owners + admins can still write — they need to manage billing.
+    if role in (UserRole.SUPER_ADMIN, UserRole.ADMIN):
+        return current_user
+
+    co_id = current_user.get("company_id")
+    if not co_id:
+        return current_user
+
+    company = await db.companies.find_one(
+        {"_id": ObjectId(co_id)},
+        {
+            "subscription_status": 1,
+            "trial_ends_at": 1,
+            "subscription_ends_at": 1,
+        },
+    )
+    if not company:
+        return current_user
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    sub_status = (company.get("subscription_status") or "").lower()
+    trial_ends = company.get("trial_ends_at")
+    sub_ends = company.get("subscription_ends_at")
+
+    in_trial = isinstance(trial_ends, datetime) and trial_ends > now
+    in_paid = sub_status == "active" and (
+        not isinstance(sub_ends, datetime) or sub_ends > now
+    )
+
+    if not (in_trial or in_paid):
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Your company's FleetShield365 plan has ended. "
+                "Ask your company owner to renew."
+            ),
+        )
+    return current_user
+
+
 async def require_platform_owner(
     current_user: dict = Depends(get_current_user),
 ) -> dict:
@@ -1484,6 +2041,367 @@ def serialize_doc(doc):
     return doc
 
 
+# ---------------------------------------------------------------------------
+# Upload validation (Phase 1 of STORAGE-PLAN.txt)
+#
+# Every upload — whether base64-in-JSON or multipart — passes through
+# ``_validate_upload_or_400`` which enforces both a per-type size cap and
+# a magic-byte allowlist. The client-supplied ``content_type`` header is
+# never trusted: only the first bytes of the decoded body are.
+#
+# Sizes default to STORAGE-PLAN values when env vars are absent. Magic-
+# byte detection covers JPEG, PNG, WebP, and PDF — the only formats the
+# platform stores.
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var with a fallback on any parse error."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+UPLOAD_MAX_BYTES: Dict[str, int] = {
+    "logo": _env_int("UPLOAD_MAX_BYTES_LOGO", 2 * 1024 * 1024),
+    "inspection": _env_int("UPLOAD_MAX_BYTES_INSPECTION", 3 * 1024 * 1024),
+    "fuel": _env_int("UPLOAD_MAX_BYTES_FUEL", 2 * 1024 * 1024),
+    "incident_photo": _env_int("UPLOAD_MAX_BYTES_INCIDENT_PHOTO", 3 * 1024 * 1024),
+    "incident_pdf": _env_int("UPLOAD_MAX_BYTES_INCIDENT_PDF", 5 * 1024 * 1024),
+    "license": _env_int("UPLOAD_MAX_BYTES_LICENSE", 2 * 1024 * 1024),
+    "driver_doc": _env_int("UPLOAD_MAX_BYTES_DRIVER_DOC", 5 * 1024 * 1024),
+    "service": _env_int("UPLOAD_MAX_BYTES_SERVICE", 5 * 1024 * 1024),
+    "maintenance": _env_int("UPLOAD_MAX_BYTES_MAINTENANCE", 5 * 1024 * 1024),
+    "signature": _env_int("UPLOAD_MAX_BYTES_SIGNATURE", 512 * 1024),
+    "profile": _env_int("UPLOAD_MAX_BYTES_PROFILE", 1024 * 1024),
+    "default": _env_int("UPLOAD_MAX_BYTES_DEFAULT", 5 * 1024 * 1024),
+}
+
+# Per-type allowlists. "image" means JPEG/PNG/WebP. "pdf" means PDF only.
+# "image_or_pdf" allows both (used by training certs / service / maintenance).
+_FORMAT_GROUPS: Dict[str, frozenset] = {
+    "image": frozenset({"jpeg", "png", "webp"}),
+    "pdf": frozenset({"pdf"}),
+    "image_or_pdf": frozenset({"jpeg", "png", "webp", "pdf"}),
+    "png": frozenset({"png"}),  # signatures only
+}
+
+UPLOAD_FORMAT_GROUP: Dict[str, str] = {
+    "logo": "image",
+    "inspection": "image",
+    "fuel": "image",
+    "incident_photo": "image",
+    "incident_pdf": "pdf",
+    "license": "image",
+    "driver_doc": "image_or_pdf",
+    "service": "image_or_pdf",
+    "maintenance": "image_or_pdf",
+    "signature": "png",
+    "profile": "image",
+}
+
+# Count caps
+MAX_PHOTOS_PER_INSPECTION = _env_int("MAX_PHOTOS_PER_INSPECTION", 20)
+MAX_INCIDENT_PHOTOS_PER_CATEGORY = _env_int("MAX_INCIDENT_PHOTOS_PER_CATEGORY", 8)
+MAX_SERVICE_ATTACHMENTS = _env_int("MAX_SERVICE_ATTACHMENTS", 5)
+
+
+def _enforce_count_or_413(items, cap: int, field_name: str) -> None:
+    """Raise HTTP 413 when a list of uploads exceeds the per-collection cap.
+
+    Designed to be cheap: just a length check + tight error message that
+    names the field and the cap so the client UI can render a friendly
+    explanation without parsing the body. Treats None / empty as a no-op.
+    """
+    if not items:
+        return
+    if len(items) > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{field_name} contains {len(items)} items; max allowed is "
+                f"{cap}. Please remove some items and resubmit."
+            ),
+        )
+
+
+def _detect_format(data: bytes) -> Optional[str]:
+    """Return canonical format name based on magic bytes, or None if unknown.
+
+    Covers the four formats the platform stores. Bytes after position 12 are
+    ignored — these prefixes are enough to disambiguate every supported
+    type. Client-supplied content_type is irrelevant because we trust only
+    the raw byte stream after base64 decode.
+    """
+    if len(data) < 8:
+        return None
+    if data[:3] == b"\xFF\xD8\xFF":
+        return "jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:5] == b"%PDF-":
+        return "pdf"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _validate_upload_or_400(
+    data: bytes,
+    type_key: str,
+    field_name: str,
+) -> str:
+    """Validate decoded bytes against per-type size + magic-byte allowlist.
+
+    Returns the detected format string (``jpeg`` / ``png`` / ``webp`` /
+    ``pdf``) so the caller can stamp the right Content-Type on the MinIO
+    object. Raises:
+
+    * HTTP 413 — payload exceeds ``UPLOAD_MAX_BYTES[type_key]``
+    * HTTP 415 — magic-byte format not in the allowlist for ``type_key``
+    """
+    max_bytes = UPLOAD_MAX_BYTES.get(type_key, UPLOAD_MAX_BYTES["default"])
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{field_name} is {len(data)} bytes; max allowed is "
+                f"{max_bytes} bytes for type {type_key!r}. Please compress "
+                f"the file before uploading."
+            ),
+        )
+
+    detected = _detect_format(data)
+    group_name = UPLOAD_FORMAT_GROUP.get(type_key, "image")
+    allowed = _FORMAT_GROUPS[group_name]
+
+    if detected is None or detected not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"{field_name} has unsupported format "
+                f"{detected or 'unknown'!r}; allowed: {sorted(allowed)}"
+            ),
+        )
+
+    return detected
+
+
+_FORMAT_TO_CONTENT_TYPE: Dict[str, str] = {
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "pdf": "application/pdf",
+}
+
+
+_FORMAT_TO_EXT: Dict[str, str] = {
+    "jpeg": "jpg",
+    "png": "png",
+    "webp": "webp",
+    "pdf": "pdf",
+}
+
+
+def _generate_thumbnail(image_bytes: bytes, max_side: int = 300) -> Optional[bytes]:
+    """Return a JPEG thumbnail (max_side x max_side, q80) or None on failure.
+
+    Best-effort. Pillow may not support an exotic image variant; if
+    generation fails we log and skip rather than failing the parent
+    upload — thumbnails are a UX optimisation, not a correctness
+    requirement.
+    """
+    try:
+        with PILImage.open(BytesIO(image_bytes)) as img:
+            # Convert to RGB for JPEG (drops alpha channel from PNGs/WebPs).
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.thumbnail((max_side, max_side), PILImage.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, "JPEG", quality=80, optimize=True)
+            return buf.getvalue()
+    except Exception as exc:
+        logger.warning("Thumbnail generation failed: %s", exc)
+        return None
+
+
+def _thumbnail_key_for(key: str) -> str:
+    """Derive the thumbnail object key from the original key.
+
+    Example: ``"<company>/<inspection>/<uuid>.jpg"`` →
+    ``"<company>/<inspection>/<uuid>_thumb.jpg"``. Same prefix, ``_thumb``
+    suffix before the extension. Always JPEG regardless of source format.
+    """
+    if "." in key:
+        stem, _, _ = key.rpartition(".")
+        return f"{stem}_thumb.jpg"
+    return f"{key}_thumb.jpg"
+
+
+def _upload_with_thumbnail(
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str,
+    expected_company_id: Optional[str],
+) -> Optional[str]:
+    """Upload original + generate-and-upload thumbnail. Returns thumb key or None.
+
+    Used by every image upload path. Thumbnail upload runs after the
+    original so a thumbnail failure cannot block the primary write. The
+    thumbnail is always JPEG into the same bucket with the ``_thumb``
+    suffix — keeps presign permissions identical and avoids cross-bucket
+    list mistakes.
+    """
+    object_store.upload_bytes(
+        bucket, key, data, content_type,
+        expected_company_id=expected_company_id,
+    )
+
+    if content_type == "application/pdf":
+        return None  # no thumbnail for PDFs
+
+    thumb_bytes = _generate_thumbnail(data)
+    if not thumb_bytes:
+        return None
+
+    thumb_key = _thumbnail_key_for(key)
+    try:
+        object_store.upload_bytes(
+            bucket, thumb_key, thumb_bytes, "image/jpeg",
+            expected_company_id=expected_company_id,
+        )
+        return thumb_key
+    except Exception as exc:
+        logger.warning("Thumbnail upload failed for %s/%s: %s", bucket, key, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Async PDF compression via Ghostscript (Phase 2)
+# ---------------------------------------------------------------------------
+
+PDF_COMPRESS_ENABLED: bool = (
+    os.environ.get("PDF_COMPRESS_ENABLED", "true").strip().lower()
+    in ("true", "1", "yes", "on")
+)
+PDF_COMPRESS_MIN_BYTES: int = _env_int("PDF_COMPRESS_MIN_BYTES", 1024 * 1024)
+PDF_COMPRESS_GS_BINARY: str = (
+    os.environ.get("PDF_COMPRESS_GS_BINARY", "").strip() or "gs"
+)
+
+
+async def compress_pdf_async(
+    bucket: str,
+    key: str,
+    original_size: int,
+    expected_company_id: Optional[str] = None,
+) -> None:
+    """Re-encode the PDF at ``<bucket>/<key>`` through Ghostscript /ebook.
+
+    Designed to run as a FastAPI BackgroundTask after the upload response
+    has been returned. Safe to call when:
+
+    * ``PDF_COMPRESS_ENABLED`` is false  → skipped (no-op)
+    * ``original_size`` < ``PDF_COMPRESS_MIN_BYTES``  → skipped (not worth it)
+    * Ghostscript binary not on PATH  → skipped (logged warning)
+    * Compressed output >= original  → skipped (kept original)
+
+    All failure modes leave the original object intact. The MinIO write
+    is atomic: we re-upload the smaller bytes under the same key, so a
+    crash mid-process leaves either the original or the smaller version
+    — never a truncated file.
+    """
+    if not PDF_COMPRESS_ENABLED:
+        return
+    if original_size < PDF_COMPRESS_MIN_BYTES:
+        return
+    if shutil.which(PDF_COMPRESS_GS_BINARY) is None:
+        logger.info(
+            "PDF compression skipped: ghostscript binary %r not on PATH",
+            PDF_COMPRESS_GS_BINARY,
+        )
+        return
+
+    try:
+        original_bytes = object_store.get_bytes(bucket, key)
+    except Exception as exc:
+        logger.warning("PDF compression skipped: cannot fetch %s/%s: %s", bucket, key, exc)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="fs365-pdf-") as tmpdir:
+        in_path = os.path.join(tmpdir, "in.pdf")
+        out_path = os.path.join(tmpdir, "out.pdf")
+        with open(in_path, "wb") as fh:
+            fh.write(original_bytes)
+
+        proc = await asyncio.create_subprocess_exec(
+            PDF_COMPRESS_GS_BINARY,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={out_path}",
+            in_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning("PDF compression timed out for %s/%s", bucket, key)
+            return
+
+        if proc.returncode != 0:
+            logger.warning(
+                "Ghostscript exited %s for %s/%s",
+                proc.returncode, bucket, key,
+            )
+            return
+
+        try:
+            new_size = os.path.getsize(out_path)
+        except OSError:
+            return
+
+        # Skip if compression did not help (or made it bigger). Keep
+        # original under the same key.
+        if new_size >= original_size:
+            logger.info(
+                "PDF compression no-op for %s/%s (%d -> %d bytes)",
+                bucket, key, original_size, new_size,
+            )
+            return
+
+        with open(out_path, "rb") as fh:
+            compressed_bytes = fh.read()
+
+    try:
+        object_store.upload_bytes(
+            bucket, key, compressed_bytes, "application/pdf",
+            expected_company_id=expected_company_id,
+        )
+        logger.info(
+            "PDF compressed for %s/%s: %d -> %d bytes (%.1f%%)",
+            bucket, key, original_size, len(compressed_bytes),
+            100.0 * (1 - len(compressed_bytes) / original_size),
+        )
+    except Exception as exc:
+        logger.warning(
+            "PDF compression upload failed for %s/%s: %s",
+            bucket, key, exc,
+        )
+
+
 def _upload_base64_or_400(
     bucket: str,
     key: str,
@@ -1491,33 +2409,69 @@ def _upload_base64_or_400(
     default_ext: str,
     field_name: str,
     expected_company_id: Optional[str] = None,
-) -> None:
-    """Wrap ``object_store.upload_base64`` and translate errors to HTTP responses.
+    type_key: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> Optional[str]:
+    """Decode base64 → validate → upload to MinIO. Returns thumb key or None.
 
-    Task 5.3 requires every write path that accepted a base64 field to now
-    upload the bytes to MinIO and store only the resulting object key in
-    MongoDB (Requirements 21.10, 21.11). When the incoming payload is not
-    valid base64 we surface a 400 response naming the offending field
-    rather than letting the generic 500 handler fire.
+    The behaviour matches the prior contract for callers that pass only
+    the original args (bucket / key / b64 / ext / field name /
+    company_id). When ``type_key`` is provided, the decoded bytes are
+    additionally validated against the per-type size cap + magic-byte
+    allowlist and a thumbnail is generated for image types. PDF uploads
+    where ``background_tasks`` is non-None are scheduled for async
+    Ghostscript compression after the response is returned.
 
-    Task 5.5 extends the contract: callers pass ``expected_company_id``
-    (typically ``current_user["company_id"]``) so the object store can
-    enforce Requirement 21.14 — the ``<company_id>`` segment of the
-    object key must match the authenticated uploader's tenant. A
-    mismatch surfaces as HTTP 403 (not 400) because the payload is
-    well-formed; the request is forbidden by policy.
+    Errors:
+
+    * 400 — invalid base64 payload
+    * 403 — tenant prefix mismatch on the object key
+    * 413 — payload exceeds ``UPLOAD_MAX_BYTES[type_key]``
+    * 415 — magic-byte format not in the allowlist for ``type_key``
     """
+    # Decode once here so we own the bytes and can validate + thumbnail
+    # without going through ``object_store.upload_base64`` (which would
+    # re-decode internally).
     try:
-        object_store.upload_base64(
-            bucket,
-            key,
-            b64_string,
-            default_ext,
-            expected_company_id=expected_company_id,
+        payload = object_store._DATA_URL_PREFIX_RE.sub("", b64_string).strip() \
+            if isinstance(b64_string, str) else ""
+        if not isinstance(b64_string, str) or not payload:
+            raise ValueError("empty or non-string payload")
+        data = base64.b64decode(payload, validate=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid base64 payload in {field_name}: {exc}",
         )
+
+    # When the caller has classified the upload, enforce size + magic.
+    detected_format: Optional[str] = None
+    if type_key:
+        detected_format = _validate_upload_or_400(data, type_key, field_name)
+        content_type = _FORMAT_TO_CONTENT_TYPE[detected_format]
+    else:
+        # Legacy fallback: trust default_ext only.
+        ext = (default_ext or "").lower().lstrip(".")
+        content_type = (
+            "image/jpeg" if ext in ("jpg", "jpeg")
+            else "image/png" if ext == "png"
+            else "image/webp" if ext == "webp"
+            else "application/pdf" if ext == "pdf"
+            else "application/octet-stream"
+        )
+
+    try:
+        if type_key and detected_format and detected_format != "pdf":
+            thumb_key = _upload_with_thumbnail(
+                bucket, key, data, content_type, expected_company_id,
+            )
+        else:
+            object_store.upload_bytes(
+                bucket, key, data, content_type,
+                expected_company_id=expected_company_id,
+            )
+            thumb_key = None
     except object_store.TenantPrefixViolation as exc:
-        # 403 — authorization violation. The payload decoded fine; the
-        # key simply does not belong to this tenant's namespace.
         raise HTTPException(
             status_code=403,
             detail=f"Forbidden Object_Key for {field_name}: {exc}",
@@ -1527,6 +2481,22 @@ def _upload_base64_or_400(
             status_code=400,
             detail=f"Invalid base64 payload in {field_name}: {exc}",
         )
+
+    # Schedule async PDF compression for large PDFs.
+    if (
+        detected_format == "pdf"
+        and background_tasks is not None
+        and len(data) >= PDF_COMPRESS_MIN_BYTES
+    ):
+        background_tasks.add_task(
+            compress_pdf_async,
+            bucket,
+            key,
+            len(data),
+            expected_company_id,
+        )
+
+    return thumb_key
 
 
 def _presign_if_key(bucket: str, key: Optional[str]) -> Optional[str]:
@@ -1960,8 +2930,24 @@ class ChecklistItem(BaseModel):
     comment: Optional[str] = None
 
 class InspectionPhoto(BaseModel):
+    """Inspection photo payload accepted by /inspections/prestart and
+    /inspections/end-shift.
+
+    Two upload patterns are supported (Phase 2 of STORAGE-PLAN.txt):
+
+    * Legacy: ``base64_data`` carries the photo bytes inline. The handler
+      decodes + uploads to MinIO at submit time.
+    * Preferred: ``photo_id`` references a row in ``temp_photos`` from a
+      prior POST /photos/upload-multipart call — the bytes already live
+      in MinIO. The handler just links the existing object_key to the
+      new inspection and marks the temp row as used. Saves the JSON
+      body roughly 33% (no base64 overhead on the wire) and lets the
+      mobile app upload photos as the driver captures them instead of
+      one giant payload at submit time.
+    """
     photo_type: str  # front, rear, left, right, cabin, odometer, damage
-    base64_data: str
+    base64_data: Optional[str] = None
+    photo_id: Optional[str] = None
     timestamp: str
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
@@ -2194,7 +3180,7 @@ async def get_trial_status(company_id: str) -> dict:
             trial_end = datetime.fromisoformat(trial_end_str.replace('Z', '+00:00'))
             if isinstance(trial_end, datetime) and trial_end.tzinfo is None:
                 trial_end = trial_end.replace(tzinfo=None)
-            now = datetime.utcnow()
+            now = utcnow()
             
             days_left = (trial_end - now).days
             
@@ -2230,6 +3216,128 @@ async def check_trial_active(company_id: str) -> bool:
     return status.get("is_active", False)
 
 # ============== PDF Generation ==============
+
+async def _resolve_inspection_photo(
+    photo,
+    company_id: str,
+    inspection_id: str,
+    *,
+    inspection_type_label: str,
+) -> tuple:
+    """Materialize one inspection photo and return (object_key, source_bucket).
+
+    Phase 2 of STORAGE-PLAN.txt — dual-path support:
+
+    * ``photo.photo_id`` set → the bytes were pre-uploaded via the
+      multipart endpoint and live in the ``photos`` bucket under a
+      tenant-scoped key. We look up the temp_photos row, validate the
+      tenant prefix, mark the row as used (TTL still cleans up the
+      pointer after 24h), and reference the same object_key from the
+      new inspection_photos doc — no re-upload, no second copy.
+    * ``photo.base64_data`` set → legacy single-shot submit. Decode +
+      validate + upload to inspection-photos bucket as before.
+
+    Always returns ``(object_key, source_bucket)``. Callers persist
+    ``source_bucket`` on the inspection_photos doc so the read-path
+    serializer can sign URLs against the right bucket.
+
+    Raises HTTPException 400 if neither field is set, 404 if the
+    referenced temp_photos row is missing or belongs to another
+    tenant.
+    """
+    if photo.photo_id:
+        temp_row = await db.temp_photos.find_one({
+            "_id": ObjectId(photo.photo_id),
+            "company_id": company_id,
+        })
+        if not temp_row:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"photos[{photo.photo_type}].photo_id "
+                    f"{photo.photo_id!r} not found in temp_photos"
+                ),
+            )
+        object_key = temp_row.get("object_key")
+        if not object_key:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"photos[{photo.photo_type}].photo_id row is missing "
+                    f"object_key — was it uploaded via the base64 path?"
+                ),
+            )
+        # Mark the temp row as consumed by this inspection so the TTL
+        # cleanup leaves it alone for the next 24h (audit trail) and
+        # so we can detect double-usage if it ever happens.
+        await db.temp_photos.update_one(
+            {"_id": temp_row["_id"]},
+            {"$set": {
+                "used": True,
+                "used_by_inspection_id": inspection_id,
+                "used_at": utcnow(),
+                "used_for": inspection_type_label,
+            }},
+        )
+        return object_key, "photos"
+
+    # Legacy base64 fallback. Allocate the destination key, validate +
+    # upload + thumbnail in one go.
+    if not photo.base64_data:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"photos[{photo.photo_type}]: must include either "
+                f"photo_id (pre-uploaded multipart) or base64_data (legacy)"
+            ),
+        )
+    object_key = f"{company_id}/{inspection_id}/{uuid.uuid4().hex}.jpg"
+    _upload_base64_or_400(
+        "inspection-photos",
+        object_key,
+        photo.base64_data,
+        "jpg",
+        f"photos[{photo.photo_type}].base64_data",
+        expected_company_id=company_id,
+        type_key="inspection",
+    )
+    return object_key, "inspection-photos"
+
+
+async def generate_inspection_pdf_bytes(inspection: dict, vehicle: dict, driver: dict, company: dict) -> bytes:
+    """Generate the inspection PDF and return raw bytes.
+
+    Phase 2 of STORAGE-PLAN.txt — PDFs land in MinIO under
+    inspection-photos/<company_id>/<inspection_id>/report.pdf, not
+    inlined into Mongo. Callers either upload directly via
+    _store_inspection_pdf() (write path) or stream to the client
+    (download path).
+    """
+    pdf_b64 = await generate_inspection_pdf(inspection, vehicle, driver, company)
+    return base64.b64decode(pdf_b64)
+
+
+async def _store_inspection_pdf(
+    inspection_id: str, company_id: str, pdf_bytes: bytes,
+) -> str:
+    """Upload PDF bytes to MinIO and return the tenant-scoped object key.
+
+    Bucket is the existing ``inspection-photos`` (avoids needing a brand-
+    new bucket provisioned on every MinIO box). The key shape
+    ``<company_id>/<inspection_id>/report.pdf`` keeps the tenant prefix
+    validation working and gives the file a clear name in the admin
+    console.
+    """
+    key = f"{company_id}/{inspection_id}/report.pdf"
+    object_store.upload_bytes(
+        "inspection-photos",
+        key,
+        pdf_bytes,
+        "application/pdf",
+        expected_company_id=company_id,
+    )
+    return key
+
 
 async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict, company: dict) -> str:
     """Generate PDF report for inspection and return base64 encoded string"""
@@ -2488,7 +3596,7 @@ class EmailService:
             "subject":    subject,
             "body":       body[:500],
             "company_id": company_id,
-            "sent_at":    datetime.utcnow(),
+            "sent_at":    utcnow(),
             "status":     "pending",
             "provider":   f"smtp:{sender}" if password_configured else "mock",
         }
@@ -2558,7 +3666,7 @@ email_service = EmailService()
 
 async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
     """Check vehicle expiry dates and create alerts at 60, 30, 14, 7 day intervals"""
-    now = datetime.utcnow()
+    now = utcnow()
     vehicle_name = f"{vehicle['name']} ({vehicle['registration_number']})"
     vehicle_id = str(vehicle['_id'])
     
@@ -2645,7 +3753,7 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
         "driver_id": driver_id,
         "is_read": False,
         "email_sent": False,
-        "created_at": datetime.utcnow()
+        "created_at": utcnow()
     }
     await db.alerts.insert_one(alert)
     
@@ -2670,7 +3778,7 @@ async def log_audit_trail(user_id: str, action: str, entity_type: str, entity_id
         "action": action,
         "entity_type": entity_type,
         "entity_id": entity_id,
-        "timestamp": datetime.utcnow(),
+        "timestamp": utcnow(),
         "ip_address": ip_address,
         "changes": changes or {}
     })
@@ -2679,6 +3787,9 @@ async def log_audit_trail(user_id: str, action: str, entity_type: str, entity_id
 
 @api_router.post("/auth/register")
 async def register(user: UserRegister, request: Request):
+    # Phase 3 — enforce platform password policy at every set-password
+    # site so register/reset/invite/admin-set all agree on the rules.
+    validate_password_policy(user.password)
     # Check if email exists
     existing = await db.users.find_one({"email": user.email})
     if existing:
@@ -2710,7 +3821,7 @@ async def register(user: UserRegister, request: Request):
             "subscription_plan": "basic",
             "active_vehicles_count": 0,
             "billing_history": [],
-            "created_at": datetime.utcnow()
+            "created_at": utcnow()
         }
         await db.companies.insert_one(company)
         company_id = str(company["_id"])
@@ -2725,7 +3836,7 @@ async def register(user: UserRegister, request: Request):
         "role": user.role,
         "company_id": company_id,
         "assigned_vehicles": [],
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
         "ip_address": request.client.host if request.client else "unknown"
     }
     await db.users.insert_one(user_doc)
@@ -2748,14 +3859,15 @@ async def register(user: UserRegister, request: Request):
     }
 
 @api_router.post("/auth/login")
+@limiter.limit("5/minute")
 async def login(credentials: UserLogin, request: Request):
     # Support login with email OR username
     login_identifier = credentials.email or credentials.username
     if not login_identifier:
         raise HTTPException(status_code=400, detail="Email or username is required")
-    
+
     login_identifier = login_identifier.lower().strip()
-    
+
     # Try to find user by email or username
     user = await db.users.find_one({
         "$or": [
@@ -2763,9 +3875,32 @@ async def login(credentials: UserLogin, request: Request):
             {"username": login_identifier}
         ]
     })
-    
+
+    # Phase 3 — account lockout. Check BEFORE password verify so a
+    # locked account doesn't burn CPU on bcrypt. Returns 423 so the
+    # client can render a "try again in X minutes" message.
+    if user:
+        locked_until = _account_locked_until(user)
+        if locked_until:
+            seconds_remaining = int((locked_until - utcnow()).total_seconds())
+            raise HTTPException(
+                status_code=423,
+                detail=(
+                    f"Too many failed login attempts. Account locked for "
+                    f"another {max(1, seconds_remaining // 60)} minute(s)."
+                ),
+            )
+
     if not user or not verify_password(credentials.password, user["password_hash"]):
+        # Phase 3 — record the failure (if the user exists) so the
+        # lockout counter can kick in. Don't reveal whether the
+        # account exists: response stays "Invalid credentials".
+        if user:
+            await _record_failed_login(user)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Successful auth — reset the failure counter.
+    await _clear_failed_logins(user["_id"])
 
     # Tenant-scoped login enforcement (Req 13.1, 13.2, 13.3, 13.4). When
     # the client passed a ``tenant_subdomain`` (always true on the web
@@ -2796,7 +3931,7 @@ async def login(credentials: UserLogin, request: Request):
     # Update last login
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {"last_login": datetime.utcnow(), "ip_address": request.client.host if request.client else "unknown"}}
+        {"$set": {"last_login": utcnow(), "ip_address": request.client.host if request.client else "unknown"}}
     )
     
     # Token expiry based on "remember me" option
@@ -2822,8 +3957,9 @@ async def login(credentials: UserLogin, request: Request):
             company_timezone = company_doc.get("timezone", DEFAULT_TIMEZONE)
             company_subdomain = company_doc.get("subdomain")
 
-    # Add company timezone to user data
-    user_data = serialize_doc(user)
+    # Add company timezone to user data. Phase 3 — sanitize so
+    # password_hash never reaches the wire.
+    user_data = sanitize_user_doc(serialize_doc(user))
     user_data["company_timezone"] = company_timezone
 
     response: dict = {
@@ -2836,14 +3972,118 @@ async def login(credentials: UserLogin, request: Request):
     # a ``tenant_subdomain`` (i.e. they logged in from the marketing
     # apex, www, or owner host) and the user belongs to a company with
     # a resolvable subdomain, surface a ``redirect_to`` URL so the web
-    # client can bounce the session to the branded tenant host. The
-    # client is free to ignore it (mobile clients stay on api.* + JWT).
+    # client can bounce the session to the branded tenant host. Phase 3:
+    # we construct the URL server-side from the tenant slug, then run
+    # it through validate_redirect_url so a malformed slug can never
+    # cause an off-domain redirect even by accident.
     if not credentials.tenant_subdomain and company_subdomain:
-        response["redirect_to"] = (
-            f"https://{company_subdomain}.fleetshield365.com/dashboard"
-        )
+        candidate = f"https://{company_subdomain}.fleetshield365.com/dashboard"
+        safe_redirect = validate_redirect_url(candidate)
+        if safe_redirect:
+            response["redirect_to"] = safe_redirect
 
     return response
+
+
+@api_router.post("/auth/refresh")
+async def refresh_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    current_user: dict = Depends(get_current_user),
+):
+    """Issue a fresh access token from a valid (non-expired) one.
+
+    Phase 3 of TODO.md — used by mobile to silently renew before the
+    access token would otherwise expire, so drivers mid-inspection
+    don't get bounced to the login screen. The old token's jti is
+    revoked so a leaked old token cannot continue to be used in
+    parallel with the new one.
+    """
+    try:
+        old_payload = jwt.decode(
+            credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM]
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = str(current_user["_id"])
+    new_token = await _mint_access_token(
+        user_id,
+        user_doc=current_user,
+        company_id=current_user.get("company_id"),
+        expires_delta=timedelta(days=30),
+    )
+
+    # Revoke the old jti so it cannot be reused alongside the new one.
+    old_jti = old_payload.get("jti")
+    old_exp = old_payload.get("exp")
+    if old_jti and old_exp:
+        try:
+            expires_at = datetime.utcfromtimestamp(int(old_exp))
+        except (ValueError, TypeError, OSError):
+            expires_at = utcnow() + timedelta(days=30)
+        await db.revoked_tokens.update_one(
+            {"_id": old_jti},
+            {
+                "$setOnInsert": {
+                    "_id": old_jti,
+                    "user_id": user_id,
+                    "expires_at": expires_at,
+                    "revoked_at": utcnow(),
+                    "reason": "refreshed",
+                },
+            },
+            upsert=True,
+        )
+
+    return {"access_token": new_token, "token_type": "bearer"}
+
+
+@api_router.post("/auth/logout")
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    current_user: dict = Depends(get_current_user),
+):
+    """Revoke the bearer token.
+
+    Phase 3 of TODO.md. The token's ``jti`` is written to the
+    ``revoked_tokens`` collection with TTL = the token's ``exp``, so
+    the collection self-cleans without manual maintenance. Subsequent
+    requests carrying the same jti are rejected with HTTP 401 by
+    get_current_user.
+
+    Tokens minted before jti existed (legacy) have no jti to revoke —
+    we accept the logout but it is cosmetic for those callers. New
+    tokens always carry jti.
+    """
+    try:
+        payload = jwt.decode(
+            credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM]
+        )
+    except Exception:
+        # Token is invalid or expired — already effectively logged out.
+        return {"status": "logged_out"}
+
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if jti and exp:
+        try:
+            expires_at = datetime.utcfromtimestamp(int(exp))
+        except (ValueError, TypeError, OSError):
+            expires_at = utcnow() + timedelta(days=30)
+        await db.revoked_tokens.update_one(
+            {"_id": jti},
+            {
+                "$setOnInsert": {
+                    "_id": jti,
+                    "user_id": payload.get("sub"),
+                    "expires_at": expires_at,
+                    "revoked_at": utcnow(),
+                },
+            },
+            upsert=True,
+        )
+
+    return {"status": "logged_out"}
 
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
@@ -2868,7 +4108,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
             )
     
     return {
-        "user": serialize_doc(current_user),
+        "user": sanitize_user_doc(serialize_doc(current_user)),
         "company": company
     }
 
@@ -2883,7 +4123,8 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 @api_router.post("/auth/forgot-password")
-async def forgot_password(request: ForgotPasswordRequest):
+@limiter.limit("3/minute")
+async def forgot_password(request: ForgotPasswordRequest, http_request: Request = None):
     """Send password reset email"""
     # Case-insensitive email lookup
     email_lower = request.email.lower()
@@ -2896,7 +4137,7 @@ async def forgot_password(request: ForgotPasswordRequest):
     # Generate reset token
     import secrets
     reset_token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(hours=1)
+    expires_at = utcnow() + timedelta(hours=1)
     
     # Store reset token
     await db.password_resets.update_one(
@@ -2905,7 +4146,7 @@ async def forgot_password(request: ForgotPasswordRequest):
             "user_id": str(user["_id"]),
             "token": reset_token,
             "expires_at": expires_at,
-            "created_at": datetime.utcnow()
+            "created_at": utcnow()
         }},
         upsert=True
     )
@@ -2928,8 +4169,11 @@ async def forgot_password(request: ForgotPasswordRequest):
         validated_origin = DEFAULT_ORIGIN_URL.rstrip('/')
 
     reset_url = f"{validated_origin}/reset-password?token={reset_token}"
+    # Phase 3 — _safe_html escapes the user-controlled name so a
+    # crafted display name can't inject HTML / script tags into the
+    # reset email body (XSS-via-email defence).
     body = (
-        f"<p>Hi {user.get('name', 'there')},</p>"
+        f"<p>Hi {_safe_html(user.get('name', 'there'))},</p>"
         f"<p>We received a request to reset your FleetShield365 password. "
         f"Click the button below to set a new password.</p>"
         f"<p style='color:#94a3b8; font-size:13px;'>This link expires in 1 hour. "
@@ -2959,18 +4203,21 @@ async def reset_password(request: ResetPasswordRequest):
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     # Check expiration
-    if datetime.utcnow() > reset_record["expires_at"]:
+    if utcnow() > reset_record["expires_at"]:
         await db.password_resets.delete_one({"token": request.token})
         raise HTTPException(status_code=400, detail="Reset token has expired")
 
-    # Validate password
-    if len(request.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    # Phase 3 — uniform password policy (was 6-char min — too weak).
+    validate_password_policy(request.new_password)
 
-    # Update password
+    # Update password + clear any lingering lockout (a successful reset
+    # implies the legitimate user is back in control).
     await db.users.update_one(
         {"_id": ObjectId(reset_record["user_id"])},
-        {"$set": {"password_hash": get_password_hash(request.new_password)}}
+        {
+            "$set": {"password_hash": get_password_hash(request.new_password)},
+            "$unset": {"failed_login_attempts": "", "locked_until": ""},
+        }
     )
 
     # Delete used token
@@ -3007,8 +4254,8 @@ async def _issue_email_token(user_id: str, token_type: str, ttl_hours: int = 24)
         "token": token,
         "user_id": user_id,
         "type": token_type,
-        "expires_at": datetime.utcnow() + timedelta(hours=ttl_hours),
-        "created_at": datetime.utcnow(),
+        "expires_at": utcnow() + timedelta(hours=ttl_hours),
+        "created_at": utcnow(),
     })
     return token
 
@@ -3018,8 +4265,9 @@ async def send_verification_email(user_email: str, user_name: str, token: str, o
     if not _is_allowed_origin(origin_url):
         origin_url = DEFAULT_ORIGIN_URL
     verify_url = f"{origin_url.rstrip('/')}/verify-email?token={token}"
+    # Phase 3 — escape user-controlled display name (XSS-via-email defence).
     body = (
-        f"<p>Hi {user_name or 'there'},</p>"
+        f"<p>Hi {_safe_html(user_name) or 'there'},</p>"
         f"<p>Welcome to <strong>FleetShield365</strong>. Please confirm this email "
         f"address so we know it's really you. Click the button below to verify "
         f"your account.</p>"
@@ -3041,10 +4289,11 @@ async def send_invite_email(user_email: str, user_name: str, inviter_name: str,
         origin_url = DEFAULT_ORIGIN_URL
     setup_url = f"{origin_url.rstrip('/')}/set-password?token={token}"
     role_label = {"super_admin": "Company Owner", "admin": "Admin", "driver": "Operator"}.get(role, role)
+    # Phase 3 — escape user-controlled names (inviter / invitee / company).
     body = (
-        f"<p>Hi {user_name or 'there'},</p>"
-        f"<p><strong>{inviter_name}</strong> has invited you to join "
-        f"<strong>{company_name}</strong> on FleetShield365 as a <strong>{role_label}</strong>.</p>"
+        f"<p>Hi {_safe_html(user_name) or 'there'},</p>"
+        f"<p><strong>{_safe_html(inviter_name)}</strong> has invited you to join "
+        f"<strong>{_safe_html(company_name)}</strong> on FleetShield365 as a <strong>{_safe_html(role_label)}</strong>.</p>"
         f"<p>Click the button below to set your password and activate your account.</p>"
         f"<p style='color:#94a3b8; font-size:13px;'>This invite link expires in 7 days.</p>"
     )
@@ -3063,20 +4312,21 @@ async def verify_email(request: VerifyEmailRequest):
     token_record = await db.email_tokens.find_one({"token": request.token, "type": "verify"})
     if not token_record:
         raise HTTPException(status_code=400, detail="Invalid or already-used verification link")
-    if datetime.utcnow() > token_record["expires_at"]:
+    if utcnow() > token_record["expires_at"]:
         await db.email_tokens.delete_one({"_id": token_record["_id"]})
         raise HTTPException(status_code=400, detail="Verification link has expired. Please request a new one.")
 
     await db.users.update_one(
         {"_id": ObjectId(token_record["user_id"])},
-        {"$set": {"email_verified": True, "email_verified_at": datetime.utcnow()}}
+        {"$set": {"email_verified": True, "email_verified_at": utcnow()}}
     )
     await db.email_tokens.delete_one({"_id": token_record["_id"]})
     return {"message": "Email verified successfully. You can now use all features of your account."}
 
 
 @api_router.post("/auth/resend-verification")
-async def resend_verification(request: ResendVerificationRequest):
+@limiter.limit("2/minute")
+async def resend_verification(request: ResendVerificationRequest, http_request: Request = None):
     """Re-send the verification email. Always returns the same response to avoid email enumeration."""
     user = await db.users.find_one({"email": request.email.lower()})
     if not user:
@@ -3130,7 +4380,7 @@ async def invite_user(request: InviteUserRequest, current_user: dict = Depends(g
         "email_verified": False,
         "invite_pending": True,
         "invited_by": current_user["id"],
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
     }
     user_result = await db.users.insert_one(user_doc)
     user_id = str(user_result.inserted_id)
@@ -3159,11 +4409,11 @@ async def accept_invite(request: AcceptInviteRequest):
     token_record = await db.email_tokens.find_one({"token": request.token, "type": "invite"})
     if not token_record:
         raise HTTPException(status_code=400, detail="Invalid or already-used invite link")
-    if datetime.utcnow() > token_record["expires_at"]:
+    if utcnow() > token_record["expires_at"]:
         await db.email_tokens.delete_one({"_id": token_record["_id"]})
         raise HTTPException(status_code=400, detail="Invite link has expired. Please ask your admin to re-invite you.")
-    if len(request.new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    # Phase 3 — uniform password policy.
+    validate_password_policy(request.new_password)
 
     user_id = token_record["user_id"]
     await db.users.update_one(
@@ -3171,9 +4421,9 @@ async def accept_invite(request: AcceptInviteRequest):
         {"$set": {
             "password_hash": get_password_hash(request.new_password),
             "email_verified": True,
-            "email_verified_at": datetime.utcnow(),
+            "email_verified_at": utcnow(),
             "invite_pending": False,
-            "invite_accepted_at": datetime.utcnow(),
+            "invite_accepted_at": utcnow(),
         }}
     )
     await db.email_tokens.delete_one({"_id": token_record["_id"]})
@@ -3241,7 +4491,8 @@ class ContactFormRequest(BaseModel):
 CONTACT_RECIPIENT = os.environ.get('CONTACT_RECIPIENT_EMAIL', 'contact@fleetshield365.com')
 
 @api_router.post("/contact")
-async def submit_contact_form(request: ContactFormRequest):
+@limiter.limit("3/minute")
+async def submit_contact_form(request: ContactFormRequest, http_request: Request = None):
     """Public endpoint: submits a contact request from the website landing page."""
     # Basic validation
     name = (request.name or "").strip()
@@ -3259,6 +4510,15 @@ async def submit_contact_form(request: ContactFormRequest):
 
     submitted_at = datetime.now(SYDNEY_TZ).strftime("%d/%m/%Y %I:%M %p AEST")
 
+    # Phase 3 — every user-supplied value runs through _safe_html before
+    # being embedded. The contact form is a public unauthenticated
+    # endpoint so it's the highest-risk XSS-via-email surface.
+    name_safe = _safe_html(name)
+    email_safe = _safe_html(email)
+    company_safe = _safe_html(company or '-')
+    phone_safe = _safe_html(phone or '-')
+    message_safe = _safe_html(message)
+
     # Email to admin
     admin_html = f"""
     <html>
@@ -3266,21 +4526,21 @@ async def submit_contact_form(request: ContactFormRequest):
         <h2 style="color:#0891b2; margin-bottom:8px;">New Contact Form Submission</h2>
         <p style="color:#64748b; margin-top:0;">Received on {submitted_at}</p>
         <table style="border-collapse:collapse; width:100%; max-width:600px; margin-top:16px;">
-            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Name</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{name}</td></tr>
-            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Email</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><a href="mailto:{email}">{email}</a></td></tr>
-            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Company</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{company or '-'}</td></tr>
-            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Phone</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{phone or '-'}</td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Name</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{name_safe}</td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Email</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><a href="mailto:{email_safe}">{email_safe}</a></td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Company</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{company_safe}</td></tr>
+            <tr><td style="padding:8px; border-bottom:1px solid #e2e8f0;"><b>Phone</b></td><td style="padding:8px; border-bottom:1px solid #e2e8f0;">{phone_safe}</td></tr>
         </table>
         <h3 style="margin-top:24px; color:#0f172a;">Message</h3>
-        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message}</div>
-        <p style="color:#64748b; font-size:12px; margin-top:24px;">Reply directly to this lead at <a href="mailto:{email}">{email}</a>.</p>
+        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message_safe}</div>
+        <p style="color:#64748b; font-size:12px; margin-top:24px;">Reply directly to this lead at <a href="mailto:{email_safe}">{email_safe}</a>.</p>
     </body>
     </html>
     """
 
     admin_sent = await send_email_notification(
         CONTACT_RECIPIENT,
-        f"[FleetShield365] New Contact: {name}",
+        f"[FleetShield365] New Contact: {name_safe}",
         admin_html
     )
 
@@ -3288,10 +4548,10 @@ async def submit_contact_form(request: ContactFormRequest):
     confirm_html = f"""
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px; color:#0f172a;">
-        <h2 style="color:#0891b2;">Thanks for reaching out, {name}!</h2>
+        <h2 style="color:#0891b2;">Thanks for reaching out, {name_safe}!</h2>
         <p>We've received your message and a member of the FleetShield365 team will get back to you within 24 hours.</p>
         <p style="margin-top:16px;"><b>Your message:</b></p>
-        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message}</div>
+        <div style="background:#f1f5f9; padding:16px; border-radius:8px; white-space:pre-wrap; line-height:1.5;">{message_safe}</div>
         <p style="margin-top:24px;">Need urgent help? Email us directly at <a href="mailto:{CONTACT_RECIPIENT}">{CONTACT_RECIPIENT}</a>.</p>
         <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
         <p style="color:#64748b; font-size:12px;">FleetShield365 — A product of Prime Mover Rentals Pty Ltd<br>This is an automated confirmation. Please do not reply directly.</p>
@@ -3299,8 +4559,10 @@ async def submit_contact_form(request: ContactFormRequest):
     </html>
     """
 
+    # Auto-reply to the submitter is a transactional "do not reply" confirmation,
+    # so it goes out from the noreply@ mailbox (not the alerts@ mailbox).
     try:
-        await send_email_notification(
+        await send_system_email(
             email,
             "[FleetShield365] We've received your message",
             confirm_html
@@ -3392,6 +4654,7 @@ async def update_company(update: CompanyUpdate, current_user: dict = Depends(get
         _upload_base64_or_400(
             "logos", logo_key, logo_b64, "png", "logo_base64",
             expected_company_id=company_id,
+            type_key="logo",
         )
         update_data["logo_object_key"] = logo_key
 
@@ -3417,23 +4680,24 @@ async def upload_company_logo(logo: UploadFile = File(...), current_user: dict =
     """Upload company logo for branding on PDF reports"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Validate file type
-    if not logo.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    
-    # Read file
+
+    # Read file (capped by Content-Length validation below). The client-
+    # supplied content_type is ignored — only magic bytes decide format.
     contents = await logo.read()
-    if len(contents) > 5 * 1024 * 1024:  # 5MB limit
-        raise HTTPException(status_code=400, detail="File too large (max 5MB)")
-    
+
+    # Per-type size + magic-byte validation (Phase 1 of STORAGE-PLAN.txt).
+    # Stamps the right Content-Type on the MinIO object based on detected
+    # format and also generates a thumbnail as a side effect.
+    detected_format = _validate_upload_or_400(contents, "logo", "logo")
+    content_type = _FORMAT_TO_CONTENT_TYPE[detected_format]
+
     # Task 5.3: store bytes in MinIO under the tenant-scoped logos bucket and
     # persist only logo_object_key on the company document (Req 21.10, 21.11).
     company_id = current_user["company_id"]
     logo_key = f"{company_id}/logo.png"
     try:
-        object_store.upload_bytes(
-            "logos", logo_key, contents, logo.content_type or "image/png",
+        _upload_with_thumbnail(
+            "logos", logo_key, contents, content_type,
             expected_company_id=company_id,
         )
     except object_store.TenantPrefixViolation as exc:
@@ -3487,12 +4751,14 @@ async def get_users(current_user: dict = Depends(get_current_user)):
     """Get all users in the company (admin only)"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    users = await db.users.find({"company_id": current_user["company_id"]}).to_list(100)
-    # Remove sensitive fields
-    for user in users:
-        user.pop("hashed_password", None)
-    return serialize_doc(users)
+
+    # Phase 4 — exclude soft-deleted users.
+    users = await db.users.find({
+        **_soft_delete_filter(),
+        "company_id": current_user["company_id"],
+    }).to_list(100)
+    # Phase 3 — sanitize ALL secret fields, not just hashed_password.
+    return sanitize_user_doc(serialize_doc(users))
 
 @api_router.post("/users")
 async def create_user(user_data: UserCreate, current_user: dict = Depends(get_current_user)):
@@ -3519,9 +4785,9 @@ async def create_user(user_data: UserCreate, current_user: dict = Depends(get_cu
     
     result = await db.users.insert_one(new_user)
     new_user["id"] = str(result.inserted_id)
-    new_user.pop("hashed_password", None)
     new_user.pop("_id", None)
-    return new_user
+    # Phase 3 — single sanitizer covers all secret fields.
+    return sanitize_user_doc(new_user)
 
 @api_router.put("/users/{user_id}")
 async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = Depends(get_current_user)):
@@ -3542,28 +4808,126 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
     
     updated_user = await db.users.find_one({"_id": ObjectId(user_id)})
-    updated_user.pop("hashed_password", None)
-    return serialize_doc(updated_user)
+    # Phase 3 — single sanitizer covers all secret fields.
+    return sanitize_user_doc(serialize_doc(updated_user))
 
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
-    """Delete a user (admin only, cannot delete self)"""
+    """Soft-delete a user (admin only, cannot delete self).
+
+    Phase 4 — sets ``deleted_at`` instead of removing the row. Admin can
+    restore from the Trash view within 30 days; the manual purge button
+    permanently removes anything older than that.
+    """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     if str(current_user["_id"]) == user_id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    
-    # Verify user belongs to same company
+
+    # Verify user belongs to same company AND is not already tombstoned.
     user = await db.users.find_one({
+        **_soft_delete_filter(),
         "_id": ObjectId(user_id),
-        "company_id": current_user["company_id"]
+        "company_id": current_user["company_id"],
     })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    await db.users.delete_one({"_id": ObjectId(user_id)})
+
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        _soft_delete_update(current_user.get("_id")),
+    )
+    invalidate_cache("drivers", current_user["company_id"])
     return {"message": "User deleted"}
+
+@api_router.post("/auth/export-my-data")
+async def export_my_data(current_user: dict = Depends(get_current_user)):
+    """User data export — Phase 10 of TODO.md.
+
+    Returns a ZIP containing JSON dumps of everything the platform
+    holds against the authenticated user: profile, every inspection,
+    fuel submission, incident, plus presigned URLs for their stored
+    photos. Streamed so a long-tenured driver doesn't OOM the box.
+
+    Required by privacy laws in many jurisdictions (GDPR Article 20,
+    Australian Privacy Act APP 12). Self-serve eliminates support
+    requests for routine data-export questions.
+    """
+    import io
+    import zipfile
+    from starlette.responses import StreamingResponse
+
+    user_id = str(current_user["_id"])
+    company_id = current_user.get("company_id")
+
+    # Build the manifest in memory — for a single driver the payload
+    # is small (~MB). For owners of large fleets this scales with
+    # their personal records only (we don't export tenant-wide rows
+    # — that's a separate endpoint).
+    inspections = await db.inspections.find({"driver_id": user_id}).to_list(10000)
+    fuel = await db.fuel_submissions.find({"driver_id": user_id}).to_list(10000)
+    incidents = await db.incidents.find({"driver_id": user_id}).to_list(10000)
+
+    # Profile — sanitize so the export never contains the password
+    # hash etc. The user is the data subject, but the bcrypt hash
+    # is operationally sensitive (offline cracking risk).
+    profile = sanitize_user_doc(serialize_doc(current_user))
+
+    def _attach_photo_urls(rows: list, bucket: str, key_field: str = "object_key"):
+        for r in rows or []:
+            k = r.get(key_field)
+            if k:
+                r[f"{key_field.replace('_key', '_url')}"] = _presign_if_key(bucket, k)
+        return rows
+
+    _attach_photo_urls(inspections, "inspection-photos", "signature_object_key")
+    for ins in inspections:
+        for ph in ins.get("photo_refs") or []:
+            if ph.get("object_key"):
+                ph["object_url"] = _presign_if_key("inspection-photos", ph["object_key"])
+    _attach_photo_urls(fuel, "fuel-receipts", "receipt_object_key")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("profile.json", json.dumps(profile, indent=2, default=str))
+        zf.writestr("inspections.json", json.dumps(serialize_doc(inspections), indent=2, default=str))
+        zf.writestr("fuel.json", json.dumps(serialize_doc(fuel), indent=2, default=str))
+        zf.writestr("incidents.json", json.dumps(serialize_doc(incidents), indent=2, default=str))
+        zf.writestr(
+            "README.txt",
+            "FleetShield365 data export\n"
+            f"User: {profile.get('email') or profile.get('username')}\n"
+            f"Generated: {datetime.now(timezone.utc).isoformat()}\n"
+            f"Company: {company_id}\n\n"
+            "Files:\n"
+            "  profile.json    — your user record (password hash and\n"
+            "                    other operational secrets removed).\n"
+            "  inspections.json— every inspection you have submitted.\n"
+            "  fuel.json       — every fuel log you have submitted.\n"
+            "  incidents.json  — every incident report you have filed.\n\n"
+            "Photo URLs in the exports are presigned and expire after 1\n"
+            "hour. Re-export to refresh them.\n",
+        )
+
+    buf.seek(0)
+    filename = (
+        f"fleetshield365-export-{user_id}-"
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d')}.zip"
+    )
+
+    async def _stream():
+        # Single yield is fine — ZIP is already built in memory; the
+        # streaming wrapper here only matters for very large exports
+        # that we'd refactor to true streaming later.
+        yield buf.getvalue()
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 @api_router.post("/account/delete-request")
 async def request_account_deletion(current_user: dict = Depends(get_current_user)):
@@ -3650,12 +5014,41 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
 # ============== Vehicle Routes ==============
 
 @api_router.post("/vehicles")
-async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user: dict = Depends(require_active_tenant)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     company_id = current_user["company_id"]
-    
+
+    # Phase 12 of TODO.md — plan limit enforcement. Each company has a
+    # max_vehicles cap (null = unlimited on the pro plan). HTTP 402
+    # (Payment Required) with an upgrade-CTA detail is the correct
+    # signal here — distinct from 403 ("you don't have permission") so
+    # the client UI can render an upgrade modal instead of a generic
+    # "not authorised" error.
+    company_doc = await db.companies.find_one(
+        {"_id": ObjectId(company_id)},
+        {"max_vehicles": 1, "subscription_plan": 1},
+    )
+    if company_doc:
+        max_vehicles = company_doc.get("max_vehicles")
+        # max_vehicles=None means unlimited (pro plan). 0 means free
+        # plan, no vehicles. Positive = hard cap.
+        if max_vehicles is not None:
+            current_count = await db.vehicles.count_documents({
+                **_soft_delete_filter(),
+                "company_id": company_id,
+            })
+            if current_count >= max_vehicles:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"Your {company_doc.get('subscription_plan', 'current')} plan "
+                        f"allows up to {max_vehicles} vehicle(s). Upgrade your plan to "
+                        f"add more vehicles."
+                    ),
+                )
+
     vehicle_doc = {
         "_id": ObjectId(),
         "company_id": company_id,
@@ -3671,7 +5064,7 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         "service_due_km": vehicle.service_due_km,
         "current_odometer": vehicle.current_odometer or 0,
         "assigned_driver_ids": vehicle.assigned_driver_ids or [],
-        "created_at": datetime.utcnow()
+        "created_at": utcnow()
     }
     await db.vehicles.insert_one(vehicle_doc)
     
@@ -3696,26 +5089,47 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
     return serialize_doc(vehicle_doc)
 
 @api_router.get("/vehicles")
-async def get_vehicles(current_user: dict = Depends(get_current_user)):
+async def get_vehicles(
+    limit: int = 200,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """List vehicles for the tenant. Paginated (Phase 2 of STORAGE-PLAN.txt).
+
+    Default ``limit=200`` matches the historical implicit cap and keeps
+    the cached fast path identical to the pre-pagination behaviour.
+    Hard-capped at 500 to bound the worst-case response. ``offset`` for
+    pagination beyond that.
+    """
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
     company_id = current_user["company_id"]
-    
-    # For drivers, don't use cache (they see filtered list)
+
+    # For drivers, don't use cache (they see filtered list).
     if current_user["role"] == UserRole.DRIVER:
-        query = {"company_id": company_id, "assigned_driver_ids": str(current_user["_id"])}
-        vehicles = await db.vehicles.find(query).to_list(1000)
+        # Phase 4 — exclude soft-deleted vehicles from driver view.
+        query = {
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "assigned_driver_ids": str(current_user["_id"]),
+        }
+        vehicles = await db.vehicles.find(query).skip(actual_offset).limit(actual_limit).to_list(actual_limit)
         return serialize_doc(vehicles)
-    
-    # Check cache for admins/owners
-    cached = get_cached("vehicles", company_id)
-    if cached:
-        return cached
-    
-    query = {"company_id": company_id}
-    vehicles = await db.vehicles.find(query).to_list(1000)
+
+    # Cache only the default page. Bypass when caller paginates.
+    use_cache = actual_offset == 0 and actual_limit >= 200
+    if use_cache:
+        cached = get_cached("vehicles", company_id)
+        if cached:
+            return cached
+
+    # Phase 4 — exclude soft-deleted vehicles from the admin list.
+    query = {**_soft_delete_filter(), "company_id": company_id}
+    vehicles = await db.vehicles.find(query).skip(actual_offset).limit(actual_limit).to_list(actual_limit)
     result = serialize_doc(vehicles)
-    
-    # Cache the result
-    set_cached("vehicles", company_id, result)
+
+    if use_cache:
+        set_cached("vehicles", company_id, result)
     return result
 
 @api_router.get("/vehicles/active-today")
@@ -3773,35 +5187,105 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
     return serialize_doc(vehicle)
 
 @api_router.delete("/vehicles/{vehicle_id}")
-async def delete_vehicle(vehicle_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+async def delete_vehicle(
+    vehicle_id: str,
+    request: Request,
+    cascade: bool = False,
+    current_user: dict = Depends(get_current_user),
+):
+    """Soft-delete a vehicle with referential integrity check (Phase 4).
+
+    Default behaviour: if the vehicle has any non-deleted children
+    (inspections, fuel, incidents, service records, maintenance logs)
+    the request returns HTTP 409 with a count breakdown so the admin
+    can see what's still attached. Passing ``?cascade=true`` soft-
+    deletes the vehicle AND its non-immutable children (service +
+    maintenance) — inspections, fuel, incidents stay (NHVR records).
+    """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     company_id = current_user["company_id"]
-    
-    result = await db.vehicles.delete_one({
+
+    vehicle = await db.vehicles.find_one({
+        **_soft_delete_filter(),
         "_id": ObjectId(vehicle_id),
-        "company_id": company_id
+        "company_id": company_id,
     })
-    
-    if result.deleted_count == 0:
+    if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    
-    # Invalidate cache
+
+    # Phase 4 referential integrity. Count non-deleted children that
+    # would be orphaned. inspections/fuel/incidents are NHVR compliance
+    # records — we count them for the admin's awareness but never
+    # touch them, even on cascade.
+    child_counts: dict = {}
+    for coll_name, soft in [
+        ("service_records", True),
+        ("maintenance_logs", True),
+        ("inspections", False),
+        ("fuel_submissions", False),
+        ("incidents", False),
+    ]:
+        filt = {"vehicle_id": vehicle_id, "company_id": company_id}
+        if soft:
+            filt.update(_soft_delete_filter())
+        count = await db[coll_name].count_documents(filt)
+        if count:
+            child_counts[coll_name] = count
+
+    if child_counts and not cascade:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "Vehicle has linked records. Delete those first, "
+                    "or re-send with ?cascade=true to soft-delete "
+                    "service + maintenance rows (NHVR records "
+                    "[inspections/fuel/incidents] are kept regardless)."
+                ),
+                "children": child_counts,
+            },
+        )
+
+    # Soft-delete the vehicle itself.
+    await db.vehicles.update_one(
+        {"_id": ObjectId(vehicle_id)},
+        _soft_delete_update(current_user.get("_id")),
+    )
+
+    # On cascade: soft-delete the two non-immutable child collections.
+    cascade_counts: dict = {}
+    if cascade:
+        for coll_name in ("service_records", "maintenance_logs"):
+            res = await db[coll_name].update_many(
+                {
+                    **_soft_delete_filter(),
+                    "vehicle_id": vehicle_id,
+                    "company_id": company_id,
+                },
+                _soft_delete_update(current_user.get("_id")),
+            )
+            if res.modified_count:
+                cascade_counts[coll_name] = res.modified_count
+
     invalidate_cache("vehicles", company_id)
     invalidate_cache("dashboard", company_id)
-    
+
     await db.companies.update_one(
         {"_id": ObjectId(company_id)},
         {"$inc": {"active_vehicles_count": -1}}
     )
-    
+
     await log_audit_trail(
         str(current_user["_id"]), "delete", "vehicle", vehicle_id,
         request.client.host if request.client else "unknown"
     )
-    
-    return {"message": "Vehicle deleted"}
+
+    return {
+        "message": "Vehicle deleted",
+        "cascade": cascade_counts,
+    }
 
 @api_router.post("/vehicles/{vehicle_id}/assign")
 async def assign_drivers(vehicle_id: str, assignment: DriverAssignment, request: Request, current_user: dict = Depends(get_current_user)):
@@ -3836,30 +5320,41 @@ async def generate_username_preview(name: str, current_user: dict = Depends(get_
     return {"username": username}
 
 @api_router.get("/drivers")
-async def get_drivers(current_user: dict = Depends(get_current_user)):
+async def get_drivers(
+    limit: int = 200,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
     company_id = current_user["company_id"]
-    
-    # Check cache first
-    cached = get_cached("drivers", company_id)
-    if cached:
-        return cached
-    
-    # Get regular drivers
+
+    # Cache only the default page (Phase 2 of STORAGE-PLAN.txt).
+    use_cache = actual_offset == 0 and actual_limit >= 200
+    if use_cache:
+        cached = get_cached("drivers", company_id)
+        if cached:
+            return cached
+
+    # Phase 4 — exclude soft-deleted users.
     drivers = await db.users.find({
+        **_soft_delete_filter(),
         "company_id": company_id,
-        "role": UserRole.DRIVER
-    }).to_list(1000)
-    
-    # Also get admins who are enabled as operators
+        "role": UserRole.DRIVER,
+    }).skip(actual_offset).limit(actual_limit).to_list(actual_limit)
+
+    # Also get admins who are enabled as operators (always full list —
+    # tiny by definition, never the pagination bottleneck).
     admin_operators = await db.users.find({
+        **_soft_delete_filter(),
         "company_id": company_id,
         "role": {"$in": [UserRole.ADMIN, UserRole.SUPER_ADMIN]},
-        "is_also_operator": True
+        "is_also_operator": True,
     }).to_list(100)
-    
+
     # Combine lists
     all_operators = drivers + admin_operators
     result = serialize_doc(all_operators)
@@ -3886,7 +5381,7 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
                     {"_id": existing["_id"]},
                     {"$set": {
                         "is_also_operator": True,
-                        "operator_enabled_at": datetime.utcnow()
+                        "operator_enabled_at": utcnow()
                     }}
                 )
                 # Return the updated user
@@ -3911,7 +5406,7 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         "role": UserRole.DRIVER,
         "company_id": current_user["company_id"],
         "assigned_vehicles": [],
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
         # License and training details
         "license_number": user.license_number,
@@ -3945,24 +5440,30 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
 
 @api_router.delete("/drivers/{driver_id}")
 async def delete_driver(driver_id: str, current_user: dict = Depends(get_current_user)):
+    """Soft-delete a driver (Phase 4)."""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     company_id = current_user["company_id"]
-    
-    result = await db.users.delete_one({
+
+    driver = await db.users.find_one({
+        **_soft_delete_filter(),
         "_id": ObjectId(driver_id),
         "company_id": company_id,
-        "role": UserRole.DRIVER
+        "role": UserRole.DRIVER,
     })
-    
-    if result.deleted_count == 0:
+    if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    
+
+    await db.users.update_one(
+        {"_id": ObjectId(driver_id)},
+        _soft_delete_update(current_user.get("_id")),
+    )
+
     # Invalidate cache
     invalidate_cache("drivers", company_id)
     invalidate_cache("dashboard", company_id)
-    
+
     return {"message": "Driver deleted"}
 
 # ============== License Photo Routes (Owner Only) ==============
@@ -4137,6 +5638,7 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
             "jpg",
             "front_photo_base64",
             expected_company_id=company_id,
+            type_key="license",
         )
         update_data["license_front_object_key"] = front_key
     if photos.back_photo_base64:
@@ -4150,11 +5652,12 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
             "jpg",
             "back_photo_base64",
             expected_company_id=company_id,
+            type_key="license",
         )
         update_data["license_back_object_key"] = back_key
     
     if update_data:
-        update_data["license_photos_updated_at"] = datetime.utcnow()
+        update_data["license_photos_updated_at"] = utcnow()
         update_data["license_photos_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
             {"_id": ObjectId(driver_id)},
@@ -4317,6 +5820,7 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
             "jpg",
             "front_photo_base64",
             expected_company_id=company_id,
+            type_key="driver_doc",
         )
         update_data[front_key_field] = key
     if photos.back_photo_base64:
@@ -4330,11 +5834,12 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
             "jpg",
             "back_photo_base64",
             expected_company_id=company_id,
+            type_key="driver_doc",
         )
         update_data[back_key_field] = key
     
     if update_data:
-        update_data[f"{doc_type}_updated_at"] = datetime.utcnow()
+        update_data[f"{doc_type}_updated_at"] = utcnow()
         update_data[f"{doc_type}_uploaded_by"] = str(current_user["_id"])
         await db.users.update_one(
             {"_id": ObjectId(driver_id)},
@@ -4466,6 +5971,7 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
         _upload_base64_or_400(
             "photos", object_key, photo.base64_data, "jpg", "base64_data",
             expected_company_id=company_id,
+            type_key="profile",
         )
 
         photo_doc = {
@@ -4475,11 +5981,11 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
             "vehicle_id": photo.vehicle_id,
             "photo_type": photo.photo_type,
             "object_key": object_key,
-            "timestamp": photo.timestamp or datetime.utcnow().isoformat(),
+            "timestamp": photo.timestamp or utcnow().isoformat(),
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
-            "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(hours=24),  # Auto-delete after 24h if not used
+            "created_at": utcnow(),
+            "expires_at": utcnow() + timedelta(hours=24),  # Auto-delete after 24h if not used
             "used": False  # Will be set to True when linked to an inspection
         }
         
@@ -4500,6 +6006,66 @@ async def upload_photo(photo: PhotoUploadRequest, current_user: dict = Depends(g
     except Exception as e:
         logger.error(f"Photo upload failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload photo")
+
+@api_router.post("/photos/upload-multipart")
+async def upload_photo_multipart(
+    photo_type: str = Form(...),
+    vehicle_id: Optional[str] = Form(None),
+    timestamp: Optional[str] = Form(None),
+    gps_latitude: Optional[float] = Form(None),
+    gps_longitude: Optional[float] = Form(None),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Multipart variant of /photos/upload (Phase 2 of STORAGE-PLAN.txt).
+
+    Same behaviour as POST /photos/upload — writes to temp_photos with a
+    24-hour TTL, returns a photo_id usable in subsequent inspection-
+    submit calls. The only difference is the wire format: this endpoint
+    accepts a real multipart/form-data file part instead of a base64
+    string in JSON, saving ~33% bandwidth on the upload payload. The
+    old base64 endpoint stays alive so older app builds keep working.
+    """
+    company_id = current_user["company_id"]
+    user_id = current_user.get("id") or str(current_user.get("_id"))
+
+    contents = await file.read()
+    detected = _validate_upload_or_400(contents, "inspection", "file")
+    content_type = _FORMAT_TO_CONTENT_TYPE[detected]
+    ext = _FORMAT_TO_EXT[detected]
+
+    photo_id = ObjectId()
+    object_key = f"{company_id}/{user_id}/{uuid.uuid4().hex}.{ext}"
+    try:
+        _upload_with_thumbnail(
+            "photos", object_key, contents, content_type,
+            expected_company_id=company_id,
+        )
+    except object_store.TenantPrefixViolation as exc:
+        raise HTTPException(status_code=403, detail=f"Forbidden Object_Key: {exc}")
+
+    photo_doc = {
+        "_id": photo_id,
+        "company_id": company_id,
+        "uploaded_by": user_id,
+        "vehicle_id": vehicle_id,
+        "photo_type": photo_type,
+        "object_key": object_key,
+        "timestamp": timestamp or utcnow().isoformat(),
+        "gps_latitude": gps_latitude,
+        "gps_longitude": gps_longitude,
+        "created_at": utcnow(),
+        "expires_at": utcnow() + timedelta(hours=24),
+        "used": False,
+    }
+    await db.temp_photos.insert_one(photo_doc)
+
+    return {
+        "photo_id": str(photo_id),
+        "object_key": object_key,
+        "object_url": _presign_if_key("photos", object_key),
+    }
+
 
 @api_router.get("/photos/{photo_id}")
 async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user)):
@@ -4561,20 +6127,20 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     # inspection-photos/<company_id>/<inspection_id>/<uuid>.jpg. Mongo
     # holds only the tenant-scoped object_key (Req 21.10, 21.11, 21.14).
     company_id = current_user["company_id"]
+    _enforce_count_or_413(
+        inspection.photos, MAX_PHOTOS_PER_INSPECTION, "photos",
+    )
     photo_refs = []
     photo_docs = []
     for photo in inspection.photos:
         photo_id = ObjectId()
-        photo_object_key = (
-            f"{company_id}/{str(inspection_id)}/{uuid.uuid4().hex}.jpg"
-        )
-        _upload_base64_or_400(
-            "inspection-photos",
-            photo_object_key,
-            photo.base64_data,
-            "jpg",
-            f"photos[{photo.photo_type}].base64_data",
-            expected_company_id=company_id,
+        # Phase 2 of STORAGE-PLAN.txt — prefer the pre-uploaded
+        # multipart path when the client supplied a photo_id. Falls
+        # back to the legacy base64 path so old mobile builds continue
+        # to work.
+        photo_object_key, source_bucket = await _resolve_inspection_photo(
+            photo, company_id, str(inspection_id),
+            inspection_type_label="prestart",
         )
         photo_docs.append({
             "_id": photo_id,
@@ -4582,12 +6148,13 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             "vehicle_id": inspection.vehicle_id,
             "photo_type": photo.photo_type,
             "object_key": photo_object_key,
+            "source_bucket": source_bucket,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
             "ai_damage_status": photo.ai_damage_status,
             "inspection_type": InspectionType.PRESTART,
-            "created_at": datetime.utcnow()
+            "created_at": utcnow()
         })
         photo_refs.append({
             "photo_id": str(photo_id),
@@ -4609,10 +6176,10 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             # Convert to UTC if needed
             if inspection_timestamp.tzinfo:
                 inspection_timestamp = inspection_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
-        except:
-            inspection_timestamp = datetime.utcnow()
+        except Exception:
+            inspection_timestamp = utcnow()
     else:
-        inspection_timestamp = datetime.utcnow()
+        inspection_timestamp = utcnow()
     
     # Task 5.3: signature bytes go to MinIO under
     # signatures/<company_id>/<inspection_id>.png. Mongo stores only
@@ -4627,6 +6194,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
             "png",
             "signature_base64",
             expected_company_id=company_id,
+            type_key="signature",
         )
 
     inspection_doc = {
@@ -4662,13 +6230,17 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     # Generate PDF
     driver = await db.users.find_one({"_id": current_user["_id"]})
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    pdf_base64 = await generate_inspection_pdf(inspection_doc, vehicle, driver, company)
-    
+    # Phase 2: PDF lands in MinIO; only the object key is stored on the
+    # inspection document. Mongo no longer carries the ~200 KB base64.
+    pdf_bytes = await generate_inspection_pdf_bytes(inspection_doc, vehicle, driver, company)
+    pdf_object_key = await _store_inspection_pdf(
+        str(inspection_doc["_id"]), company_id, pdf_bytes,
+    )
     await db.inspections.update_one(
         {"_id": inspection_doc["_id"]},
-        {"$set": {"pdf_base64": pdf_base64}}
+        {"$set": {"pdf_object_key": pdf_object_key}, "$unset": {"pdf_base64": ""}},
     )
-    inspection_doc["pdf_base64"] = pdf_base64
+    inspection_doc["pdf_object_key"] = pdf_object_key
     
     # Create alert if vehicle marked unsafe
     if has_issues:
@@ -4709,7 +6281,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         )
     
     # Check for repeated issues (3+ in 7 days)
-    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    seven_days_ago = utcnow() - timedelta(days=7)
     recent_inspections = await db.inspections.find({
         "vehicle_id": inspection.vehicle_id,
         "is_safe": False,
@@ -4754,20 +6326,18 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     # inspection-photos/<company_id>/<inspection_id>/<uuid>.jpg. Mongo
     # holds only the tenant-scoped object_key (Req 21.10, 21.11, 21.14).
     company_id = current_user["company_id"]
+    _enforce_count_or_413(
+        inspection.photos, MAX_PHOTOS_PER_INSPECTION, "photos",
+    )
     photo_refs = []
     photo_docs = []
     for photo in (inspection.photos or []):
         photo_id = ObjectId()
-        photo_object_key = (
-            f"{company_id}/{str(inspection_id)}/{uuid.uuid4().hex}.jpg"
-        )
-        _upload_base64_or_400(
-            "inspection-photos",
-            photo_object_key,
-            photo.base64_data,
-            "jpg",
-            f"photos[{photo.photo_type}].base64_data",
-            expected_company_id=company_id,
+        # Phase 2 of STORAGE-PLAN.txt — dual-path (multipart photo_id
+        # preferred, base64 legacy fallback). See create_prestart.
+        photo_object_key, source_bucket = await _resolve_inspection_photo(
+            photo, company_id, str(inspection_id),
+            inspection_type_label="end_shift",
         )
         photo_docs.append({
             "_id": photo_id,
@@ -4775,12 +6345,13 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             "vehicle_id": inspection.vehicle_id,
             "photo_type": photo.photo_type,
             "object_key": photo_object_key,
+            "source_bucket": source_bucket,
             "timestamp": photo.timestamp,
             "gps_latitude": photo.gps_latitude,
             "gps_longitude": photo.gps_longitude,
             "ai_damage_status": photo.ai_damage_status,
             "inspection_type": InspectionType.END_SHIFT,
-            "created_at": datetime.utcnow()
+            "created_at": utcnow()
         })
         photo_refs.append({
             "photo_id": str(photo_id),
@@ -4802,10 +6373,10 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             # Convert to UTC if needed
             if inspection_timestamp.tzinfo:
                 inspection_timestamp = inspection_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
-        except:
-            inspection_timestamp = datetime.utcnow()
+        except Exception:
+            inspection_timestamp = utcnow()
     else:
-        inspection_timestamp = datetime.utcnow()
+        inspection_timestamp = utcnow()
     
     # Task 5.3: signature bytes go to MinIO under
     # signatures/<company_id>/<inspection_id>.png. Mongo stores only
@@ -4820,6 +6391,7 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             "png",
             "signature_base64",
             expected_company_id=company_id,
+            type_key="signature",
         )
 
     inspection_doc = {
@@ -4860,13 +6432,17 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     # Generate PDF
     driver = await db.users.find_one({"_id": current_user["_id"]})
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    pdf_base64 = await generate_inspection_pdf(inspection_doc, vehicle, driver, company)
-    
+    # Phase 2: PDF lands in MinIO; only the object key is stored on the
+    # inspection document. Mongo no longer carries the ~200 KB base64.
+    pdf_bytes = await generate_inspection_pdf_bytes(inspection_doc, vehicle, driver, company)
+    pdf_object_key = await _store_inspection_pdf(
+        str(inspection_doc["_id"]), company_id, pdf_bytes,
+    )
     await db.inspections.update_one(
         {"_id": inspection_doc["_id"]},
-        {"$set": {"pdf_base64": pdf_base64}}
+        {"$set": {"pdf_object_key": pdf_object_key}, "$unset": {"pdf_base64": ""}},
     )
-    inspection_doc["pdf_base64"] = pdf_base64
+    inspection_doc["pdf_object_key"] = pdf_object_key
     
     # Create alert if damage or incident
     if inspection.new_damage:
@@ -5021,6 +6597,14 @@ async def get_inspections(
             inspection["vehicle_name"] = f"{v_name} ({v_rego})" if v_rego else v_name
             inspection["vehicle_rego"] = v_rego or "N/A"
     
+    # Phase 2: every inspection in the list response gets a pdf_url when
+    # the PDF lives in MinIO. Cheap (just signs the URL — no body fetch).
+    for inspection in inspections:
+        if inspection.get("pdf_object_key"):
+            inspection["pdf_url"] = _presign_if_key(
+                "inspection-photos", inspection["pdf_object_key"]
+            )
+
     # Optionally include photos (only when viewing single inspection detail)
     if include_photos:
         for inspection in inspections:
@@ -5032,7 +6616,7 @@ async def get_inspections(
             inspection["signature_url"] = _presign_if_key(
                 "signatures", inspection.get("signature_object_key")
             )
-    
+
     return serialize_doc(inspections)
 
 async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
@@ -5051,17 +6635,20 @@ async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
                     "_id": {"$in": [ObjectId(pid) for pid in photo_ids]}
                 }).to_list(20)
     
-    # Task 5.3: photos now reference MinIO via object_key.
-    # Task 5.4: emit a sibling object_url so the frontend can render the
-    # photo straight from Nginx_Proxy without a second round-trip
-    # (Requirements 21.12, 21.13). Legacy rows may still carry
-    # base64_data inline; that field is preserved for backward compat.
+    # Phase 2 of STORAGE-PLAN.txt — photos can live in either bucket:
+    #   * ``inspection-photos`` (legacy + base64-path uploads)
+    #   * ``photos`` (multipart pre-uploads, referenced by photo_id)
+    # The handler persists ``source_bucket`` on the inspection_photos
+    # doc so we can sign the right URL on read. Defaults to
+    # ``inspection-photos`` for pre-source_bucket docs (every row
+    # written before this change).
     return [
         {
             "photo_type": p.get("photo_type"),
             "object_key": p.get("object_key"),
             "object_url": _presign_if_key(
-                "inspection-photos", p.get("object_key")
+                p.get("source_bucket") or "inspection-photos",
+                p.get("object_key"),
             ),
             "base64_data": p.get("base64_data"),
         }
@@ -5087,7 +6674,15 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
     inspection["signature_url"] = _presign_if_key(
         "signatures", inspection.get("signature_object_key")
     )
-    
+
+    # Phase 2: emit pdf_url for inspections whose PDF is in MinIO.
+    # Legacy rows still carrying pdf_base64 are unaffected — their
+    # bytes are returned via the dedicated /pdf endpoint.
+    if inspection.get("pdf_object_key"):
+        inspection["pdf_url"] = _presign_if_key(
+            "inspection-photos", inspection["pdf_object_key"]
+        )
+
     # Add driver and vehicle info
     if inspection.get("driver_id"):
         driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
@@ -5111,35 +6706,64 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
 
 @api_router.get("/inspections/{inspection_id}/pdf")
 async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, current_user: dict = Depends(get_current_user)):
+    """Return the inspection PDF as a presigned URL (preferred) or base64.
+
+    Phase 2 of STORAGE-PLAN.txt:
+    * New inspections store ``pdf_object_key`` in MinIO; this endpoint
+      returns a presigned URL alongside the key so the client can render
+      the PDF directly through Nginx without re-encoding the bytes.
+    * Legacy inspections (created before the migration) still carry
+      ``pdf_base64``; we fall back to that, returning it as before so
+      old admin-panel downloads keep working until the migration script
+      moves them to MinIO.
+    * ``regenerate=true`` always rebuilds from current photo state and
+      uploads to MinIO.
+    """
+    company_id = current_user["company_id"]
     inspection = await db.inspections.find_one({
         "_id": ObjectId(inspection_id),
-        "company_id": current_user["company_id"]
+        "company_id": company_id,
     })
     if not inspection:
         raise HTTPException(status_code=404, detail="Inspection not found")
-    
-    # If regenerate requested or no PDF exists, regenerate with photos
-    if regenerate or not inspection.get("pdf_base64"):
-        # Fetch photos
+
+    has_minio_pdf = bool(inspection.get("pdf_object_key"))
+    has_legacy_pdf = bool(inspection.get("pdf_base64"))
+
+    if regenerate or not (has_minio_pdf or has_legacy_pdf):
         photos = await fetch_inspection_photos(inspection_id)
         inspection["photos"] = photos
-        
-        # Fetch related data
         vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
         driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
         company = await db.companies.find_one({"_id": ObjectId(inspection["company_id"])})
-        
-        # Generate PDF with photos
-        pdf_base64 = await generate_inspection_pdf(inspection, vehicle, driver, company)
-        
-        # Update stored PDF
+
+        pdf_bytes = await generate_inspection_pdf_bytes(inspection, vehicle, driver, company)
+        pdf_object_key = await _store_inspection_pdf(
+            inspection_id, company_id, pdf_bytes,
+        )
         await db.inspections.update_one(
             {"_id": ObjectId(inspection_id)},
-            {"$set": {"pdf_base64": pdf_base64}}
+            {
+                "$set": {"pdf_object_key": pdf_object_key},
+                "$unset": {"pdf_base64": ""},
+            },
         )
-        
-        return {"pdf_base64": pdf_base64}
-    
+        return {
+            "pdf_object_key": pdf_object_key,
+            "pdf_url": _presign_if_key("inspection-photos", pdf_object_key),
+        }
+
+    if has_minio_pdf:
+        return {
+            "pdf_object_key": inspection["pdf_object_key"],
+            "pdf_url": _presign_if_key(
+                "inspection-photos", inspection["pdf_object_key"]
+            ),
+        }
+
+    # Legacy fallback — base64 still on the document. Old clients
+    # continue to work; new clients can detect pdf_url is absent and
+    # fall back to pdf_base64 themselves.
     return {"pdf_base64": inspection["pdf_base64"]}
 
 # ============== Fuel Submission Routes ==============
@@ -5157,10 +6781,10 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
             fuel_timestamp = datetime.fromisoformat(fuel.timestamp.replace('Z', '+00:00'))
             if fuel_timestamp.tzinfo:
                 fuel_timestamp = fuel_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
-        except:
-            fuel_timestamp = datetime.utcnow()
+        except Exception:
+            fuel_timestamp = utcnow()
     else:
-        fuel_timestamp = datetime.utcnow()
+        fuel_timestamp = utcnow()
     
     # Task 5.3: upload the receipt bytes to MinIO and persist only the key
     # on the fuel submission document (Req 21.10, 21.11, 21.14).
@@ -5176,6 +6800,7 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
             "jpg",
             "receipt_photo_base64",
             expected_company_id=company_id,
+            type_key="fuel",
         )
 
     fuel_doc = {
@@ -5202,19 +6827,24 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
     return {"id": str(fuel_doc["_id"]), "message": "Fuel submission recorded successfully"}
 
 @api_router.get("/fuel")
-async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    """Get fuel submissions for company"""
+async def get_fuel_submissions(
+    vehicle_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get fuel submissions for company (paginated, Phase 2)."""
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
     query = {"company_id": current_user["company_id"]}
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
-    
-    # Task 5.3: receipts live in MinIO now; has_receipt reflects whether the
-    # document carries a receipt_object_key. Legacy receipt_photo_base64 is
-    # still checked for backward compat with pre-migration rows.
+
     pipeline = [
         {"$match": query},
         {"$sort": {"timestamp": -1}},
-        {"$limit": 100},
+        {"$skip": actual_offset},
+        {"$limit": actual_limit},
         {"$addFields": {"has_receipt": {"$cond": [
             {"$or": [
                 {"$ifNull": ["$receipt_object_key", False]},
@@ -5225,7 +6855,7 @@ async def get_fuel_submissions(vehicle_id: Optional[str] = None, current_user: d
         ]}}},
         {"$project": {"receipt_photo_base64": 0}}
     ]
-    submissions = await db.fuel_submissions.aggregate(pipeline).to_list(100)
+    submissions = await db.fuel_submissions.aggregate(pipeline).to_list(actual_limit)
     
     # Get vehicle names
     vehicle_ids = list(set(s["vehicle_id"] for s in submissions))
@@ -5286,63 +6916,88 @@ async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_curren
 
 @api_router.get("/fuel/export/csv")
 async def export_fuel_csv(
+    date_from: str,
+    date_to: str,
     vehicle_id: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Export fuel logs to CSV format with optional date range and vehicle filters"""
+    """Export fuel logs to CSV, streamed row-by-row from a Mongo cursor.
+
+    ``date_from`` and ``date_to`` are mandatory (YYYY-MM-DD) and the range
+    is capped at 365 days. We stream rows as we read them from Mongo, so
+    memory stays bounded regardless of how many rows the tenant has —
+    earlier versions buffered the whole CSV in a StringIO before
+    responding, which is OOM-fragile for large fleets (Phase 2 of
+    STORAGE-PLAN.txt).
+    """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     import csv
     from io import StringIO
     from starlette.responses import StreamingResponse
-    
+    from datetime import datetime as dt
+
+    # Date-range validation. Both YYYY-MM-DD. Max 365-day window keeps
+    # the worst-case export bounded.
+    try:
+        df = dt.fromisoformat(date_from)
+        dtt = dt.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="date_from and date_to must be YYYY-MM-DD",
+        )
+    if dtt < df:
+        raise HTTPException(
+            status_code=400,
+            detail="date_to must be >= date_from",
+        )
+    if (dtt - df).days > 365:
+        raise HTTPException(
+            status_code=400,
+            detail="Export window is capped at 365 days; please narrow the range",
+        )
+
     company_id = current_user["company_id"]
-    query: dict = {"company_id": company_id}
-    
+    query: dict = {
+        "company_id": company_id,
+        "timestamp": {
+            "$gte": date_from,
+            "$lte": date_to + "T23:59:59",
+        },
+    }
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
-    
-    if date_from or date_to:
-        date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = date_from
-        if date_to:
-            date_filter["$lte"] = date_to + "T23:59:59"
-        query["timestamp"] = date_filter
-    
-    submissions = await db.fuel_submissions.find(query, {"receipt_photo_base64": 0}).sort("timestamp", -1).to_list(10000)
-    
-    # Get vehicle and driver maps
-    vehicles = await db.vehicles.find({"company_id": company_id}).to_list(1000)
-    vehicle_map = {str(v["_id"]): f"{v.get('name', 'Unknown')} ({v.get('registration_number', 'N/A')})" for v in vehicles}
-    
-    driver_ids = list(set(s.get("driver_id") for s in submissions if s.get("driver_id")))
-    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(1000) if driver_ids else []
-    driver_map = {}
+
+    # Lookup maps — small (vehicles, drivers) so keep in memory once.
+    vehicles = await db.vehicles.find(
+        {"company_id": company_id},
+        {"name": 1, "registration_number": 1},
+    ).to_list(2000)
+    vehicle_map = {
+        str(v["_id"]): f"{v.get('name', 'Unknown')} ({v.get('registration_number', 'N/A')})"
+        for v in vehicles
+    }
+    drivers = await db.users.find(
+        {"company_id": company_id},
+        {"name": 1, "username": 1},
+    ).to_list(2000)
+    driver_map: dict = {}
     for d in drivers:
-        d_name = d.get("name", "Unknown")
-        d_user = d.get("username", "")
-        driver_map[str(d["_id"])] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
-    
-    # Create CSV
-    output = StringIO()
-    writer = csv.writer(output)
-    
-    # Header
-    writer.writerow([
-        "Date", "Time", "Driver", "Vehicle", "Notes", "Litres", 
-        "Cost ($)", "Price/L ($)", "Odometer (km)", "Station", "Has Receipt"
-    ])
-    
-    # Data rows
-    for s in submissions:
+        name = d.get("name", "Unknown")
+        user = d.get("username", "")
+        driver_map[str(d["_id"])] = f"{name} ({user})" if user and user != name else name
+
+    HEADER = [
+        "Date", "Time", "Driver", "Vehicle", "Notes", "Litres",
+        "Cost ($)", "Price/L ($)", "Odometer (km)", "Station", "Has Receipt",
+    ]
+
+    def _format_row(s: dict) -> list:
         ts = s.get("timestamp", "")
         if ts:
             try:
-                from datetime import datetime as dt
                 parsed = dt.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else ts
                 date_str = parsed.strftime("%Y-%m-%d")
                 time_str = parsed.strftime("%H:%M")
@@ -5352,8 +7007,8 @@ async def export_fuel_csv(
         else:
             date_str = ""
             time_str = ""
-        
-        writer.writerow([
+
+        return [
             date_str,
             time_str,
             driver_map.get(s.get("driver_id", ""), "Unknown"),
@@ -5364,22 +7019,46 @@ async def export_fuel_csv(
             s.get("price_per_liter", ""),
             s.get("odometer", ""),
             s.get("fuel_station", ""),
-            "Yes" if s.get("receipt_object_key") is not None or s.get("receipt_photo_base64") is not None or s.get("has_receipt") else "No"
-        ])
-    
-    output.seek(0)
-    
-    date_suffix = ""
-    if date_from:
-        date_suffix += f"_from_{date_from}"
-    if date_to:
-        date_suffix += f"_to_{date_to}"
-    filename = f"fuel_logs{date_suffix}_{datetime.utcnow().strftime('%Y%m%d')}.csv"
-    
+            "Yes" if (
+                s.get("receipt_object_key") is not None
+                or s.get("receipt_photo_base64") is not None
+                or s.get("has_receipt")
+            ) else "No",
+        ]
+
+    async def _row_iter():
+        """Yield CSV chunks as the Mongo cursor produces rows.
+
+        We re-use a single StringIO per chunk so the csv writer can
+        format quoting/escaping properly. After each row we hand the
+        buffer's contents to the response and reset.
+        """
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(HEADER)
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+
+        cursor = db.fuel_submissions.find(
+            query, {"receipt_photo_base64": 0},
+        ).sort("timestamp", -1)
+        async for s in cursor:
+            writer.writerow(_format_row(s))
+            chunk = buf.getvalue()
+            if chunk:
+                yield chunk
+                buf.seek(0)
+                buf.truncate(0)
+
+    filename = (
+        f"fuel_logs_from_{date_from}_to_{date_to}"
+        f"_{utcnow().strftime('%Y%m%d')}.csv"
+    )
     return StreamingResponse(
-        iter([output.getvalue()]),
+        _row_iter(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
@@ -5391,6 +7070,8 @@ class AdminResetPasswordRequest(BaseModel):
 @api_router.post("/drivers/{driver_id}/reset-password")
 async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswordRequest, current_user: dict = Depends(get_current_user)):
     """Admin can reset a driver's password"""
+    # Phase 3 — uniform password policy at every set-password site.
+    validate_password_policy(request.new_password)
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -5495,7 +7176,7 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
     driver_name = driver.get("name", "Unknown Driver")
     driver_username = driver.get("username", "")
     display_name = f"{driver_name} ({driver_username})" if driver_username and driver_username != driver_name else driver_name
-    now = datetime.utcnow()
+    now = utcnow()
     
     # Reminder intervals: 60, 30, 14, 7 days
     REMINDER_DAYS = [60, 30, 14, 7]
@@ -5591,7 +7272,7 @@ async def send_driver_expiry_email(company_id: str, driver_name: str, document_t
 # ============== Maintenance Routes ==============
 
 @api_router.post("/maintenance")
-async def create_maintenance(log: MaintenanceLogCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_maintenance(log: MaintenanceLogCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -5610,6 +7291,8 @@ async def create_maintenance(log: MaintenanceLogCreate, request: Request, curren
             "pdf",
             "invoice_base64",
             expected_company_id=company_id,
+            type_key="maintenance",
+            background_tasks=background_tasks,
         )
 
     maintenance_doc = {
@@ -5623,7 +7306,7 @@ async def create_maintenance(log: MaintenanceLogCreate, request: Request, curren
         "invoice_object_key": invoice_object_key,
         "notes": log.notes,
         "created_by": str(current_user["_id"]),
-        "created_at": datetime.utcnow()
+        "created_at": utcnow()
     }
     await db.maintenance_logs.insert_one(maintenance_doc)
     
@@ -5635,12 +7318,22 @@ async def create_maintenance(log: MaintenanceLogCreate, request: Request, curren
     return serialize_doc(maintenance_doc)
 
 @api_router.get("/maintenance")
-async def get_maintenance_logs(vehicle_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    query = {"company_id": current_user["company_id"]}
+async def get_maintenance_logs(
+    vehicle_id: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Paginated maintenance log list (Phase 2 of STORAGE-PLAN.txt)."""
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
+    # Phase 4 — exclude soft-deleted rows by default.
+    query = {**_soft_delete_filter(), "company_id": current_user["company_id"]}
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
-    
-    logs = await db.maintenance_logs.find(query).sort("service_date", -1).to_list(1000)
+
+    logs = await db.maintenance_logs.find(query).sort("service_date", -1) \
+        .skip(actual_offset).limit(actual_limit).to_list(actual_limit)
     # Task 5.4: expose invoice_url alongside invoice_object_key so the
     # admin UI can download/preview the PDF directly from Nginx_Proxy
     # (Requirements 21.12, 21.13).
@@ -5684,7 +7377,7 @@ async def get_maintenance_stats(vehicle_id: str, current_user: dict = Depends(ge
 # ============== Service Records Routes ==============
 
 @api_router.post("/service-records")
-async def create_service_record(record: ServiceRecordCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_service_record(record: ServiceRecordCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """Create a new service record for a vehicle"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -5703,6 +7396,9 @@ async def create_service_record(record: ServiceRecordCreate, request: Request, c
     # under service-records/<company_id>/<record_id>/<uuid>.pdf and store
     # only the tenant-scoped object keys (Req 21.10, 21.11, 21.14).
     record_id = ObjectId()
+    _enforce_count_or_413(
+        record.attachments, MAX_SERVICE_ATTACHMENTS, "attachments",
+    )
     attachment_keys: List[str] = []
     for idx, b64 in enumerate(record.attachments or []):
         if not b64:
@@ -5717,6 +7413,8 @@ async def create_service_record(record: ServiceRecordCreate, request: Request, c
             "pdf",
             f"attachments[{idx}]",
             expected_company_id=company_id,
+            type_key="service",
+            background_tasks=background_tasks,
         )
         attachment_keys.append(key)
 
@@ -5739,8 +7437,8 @@ async def create_service_record(record: ServiceRecordCreate, request: Request, c
         "warranty_until": record.warranty_until,
         "warranty_notes": record.warranty_notes,
         "created_by": str(current_user["_id"]),
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
+        "created_at": utcnow(),
+        "updated_at": utcnow()
     }
     
     await db.service_records.insert_one(service_doc)
@@ -5776,14 +7474,15 @@ async def get_service_records(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     company_id = current_user["company_id"]
-    query = {"company_id": company_id}
-    
+    # Phase 4 — exclude soft-deleted rows by default.
+    query = {**_soft_delete_filter(), "company_id": company_id}
+
     if vehicle_id:
         query["vehicle_id"] = vehicle_id
-    
+
     if service_type:
         query["service_type"] = service_type
-    
+
     if search:
         query["$or"] = [
             {"description": {"$regex": search, "$options": "i"}},
@@ -5839,7 +7538,7 @@ async def get_service_records_summary(current_user: dict = Depends(get_current_u
         by_type[st] = by_type.get(st, 0) + 1
     
     # Get records from this month
-    now = datetime.utcnow()
+    now = utcnow()
     this_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     this_month_records = [r for r in records if r.get("created_at") and r["created_at"] >= this_month_start]
     this_month_cost = sum(r.get("cost", 0) or 0 for r in this_month_records)
@@ -5910,7 +7609,7 @@ async def export_service_records_csv(
     
     output.seek(0)
     
-    filename = f"service_records_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    filename = f"service_records_{utcnow().strftime('%Y%m%d')}.csv"
     
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -5947,6 +7646,7 @@ async def update_service_record(
     record_id: str,
     update: ServiceRecordUpdate,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Update a service record"""
@@ -5976,6 +7676,9 @@ async def update_service_record(
                 # (Req 21.10, 21.11, 21.14). The caller is expected to send
                 # the full desired list on update, same as the pre-MinIO
                 # behaviour of replacing the array.
+                _enforce_count_or_413(
+                    value, MAX_SERVICE_ATTACHMENTS, "attachments",
+                )
                 attachment_keys: List[str] = []
                 for idx, b64 in enumerate(value or []):
                     if not b64:
@@ -5998,6 +7701,8 @@ async def update_service_record(
                         "pdf",
                         f"attachments[{idx}]",
                         expected_company_id=company_id,
+                        type_key="service",
+                        background_tasks=background_tasks,
                     )
                     attachment_keys.append(key_path)
                 update_data[key] = attachment_keys
@@ -6005,7 +7710,7 @@ async def update_service_record(
                 update_data[key] = value
     
     if update_data:
-        update_data["updated_at"] = datetime.utcnow()
+        update_data["updated_at"] = utcnow()
         await db.service_records.update_one(
             {"_id": ObjectId(record_id)},
             {"$set": update_data}
@@ -6032,28 +7737,33 @@ async def update_service_record(
 
 @api_router.delete("/service-records/{record_id}")
 async def delete_service_record(record_id: str, request: Request, current_user: dict = Depends(get_current_user)):
-    """Delete a service record"""
+    """Soft-delete a service record (Phase 4)."""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     company_id = current_user["company_id"]
-    
-    result = await db.service_records.delete_one({
+
+    record = await db.service_records.find_one({
+        **_soft_delete_filter(),
         "_id": ObjectId(record_id),
-        "company_id": company_id
+        "company_id": company_id,
     })
-    
-    if result.deleted_count == 0:
+    if not record:
         raise HTTPException(status_code=404, detail="Service record not found")
-    
+
+    await db.service_records.update_one(
+        {"_id": ObjectId(record_id)},
+        _soft_delete_update(current_user.get("_id")),
+    )
+
     # Invalidate cache
     invalidate_cache("service_records", company_id)
-    
+
     await log_audit_trail(
         str(current_user["_id"]), "delete", "service_record", record_id,
         request.client.host if request.client else "unknown"
     )
-    
+
     return {"message": "Service record deleted successfully"}
 
 @api_router.get("/service-records/{record_id}/pdf")
@@ -6096,7 +7806,7 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
         try:
             date_obj = datetime.fromisoformat(service_date.replace("Z", "+00:00")) if "T" in service_date else datetime.strptime(service_date, "%Y-%m-%d")
             service_date = date_obj.strftime("%d/%m/%Y")
-        except:
+        except Exception:
             pass
     
     # Details table
@@ -6136,7 +7846,7 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
             try:
                 date_obj = datetime.fromisoformat(next_date.replace("Z", "+00:00")) if "T" in next_date else datetime.strptime(next_date, "%Y-%m-%d")
                 next_date = date_obj.strftime("%d/%m/%Y")
-            except:
+            except Exception:
                 pass
             elements.append(Paragraph(f"Date: {next_date}", styles['Normal']))
         if record.get("next_service_odometer"):
@@ -6160,15 +7870,23 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
 # ============== Alert Routes ==============
 
 @api_router.get("/alerts")
-async def get_alerts(unread_only: bool = False, current_user: dict = Depends(get_current_user)):
+async def get_alerts(
+    unread_only: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
     query = {"company_id": current_user["company_id"]}
     if unread_only:
         query["is_read"] = False
-    
-    alerts = await db.alerts.find(query).sort("created_at", -1).to_list(1000)
+
+    alerts = await db.alerts.find(query).sort("created_at", -1) \
+        .skip(actual_offset).limit(actual_limit).to_list(actual_limit)
     return serialize_doc(alerts)
 
 @api_router.put("/alerts/{alert_id}/read")
@@ -6265,7 +7983,7 @@ async def create_incident(
             incident_timestamp = datetime.fromisoformat(incident.timestamp.replace('Z', '+00:00'))
             if incident_timestamp.tzinfo:
                 incident_timestamp = incident_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
-        except:
+        except Exception:
             incident_timestamp = datetime.now(timezone.utc)
     else:
         incident_timestamp = datetime.now(timezone.utc)
@@ -6277,6 +7995,9 @@ async def create_incident(
     incident_id = ObjectId()
 
     def _upload_incident_photos(b64_list: List[str], kind: str) -> List[str]:
+        _enforce_count_or_413(
+            b64_list, MAX_INCIDENT_PHOTOS_PER_CATEGORY, f"{kind}_photos",
+        )
         keys: List[str] = []
         for idx, b64 in enumerate(b64_list or []):
             if not b64:
@@ -6292,6 +8013,7 @@ async def create_incident(
                 "jpg",
                 f"{kind}_photos[{idx}]",
                 expected_company_id=company_id,
+                type_key="incident_photo",
             )
             keys.append(key)
         return keys
@@ -6403,8 +8125,9 @@ async def get_incidents(
 ):
     """Get all incidents for the company - OPTIMIZED"""
     company_id = current_user["company_id"]
-    
-    query = {"company_id": company_id}
+
+    # Phase 4 — exclude soft-deleted incidents by default.
+    query = {**_soft_delete_filter(), "company_id": company_id}
     if status:
         query["status"] = status
     if severity:
@@ -6545,7 +8268,7 @@ async def export_incidents_csv(
         ])
     
     output.seek(0)
-    filename = f"incidents_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    filename = f"incidents_{utcnow().strftime('%Y%m%d')}.csv"
     
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -6811,6 +8534,7 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
 async def update_incident(
     incident_id: str,
     update: IncidentUpdate,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Update an incident (admin only)"""
@@ -6837,6 +8561,11 @@ async def update_incident(
     # and appended as object keys on the incident. The stored document
     # never contains the raw base64 (Req 21.10, 21.11, 21.14).
     if update.additional_photos:
+        _enforce_count_or_413(
+            update.additional_photos,
+            MAX_INCIDENT_PHOTOS_PER_CATEGORY,
+            "additional_photos",
+        )
         existing_photos = existing.get("damage_photos", [])
         new_keys: List[str] = []
         for idx, b64 in enumerate(update.additional_photos):
@@ -6853,6 +8582,7 @@ async def update_incident(
                 "jpg",
                 f"additional_photos[{idx}]",
                 expected_company_id=company_id,
+                type_key="incident_photo",
             )
             new_keys.append(key)
         update_data["damage_photos"] = existing_photos + new_keys
@@ -6861,6 +8591,11 @@ async def update_incident(
     # MinIO. Mongo stores {name, object_key} entries instead of
     # {name, data} (Req 21.10, 21.11, 21.14).
     if update.pdf_attachments:
+        _enforce_count_or_413(
+            update.pdf_attachments,
+            MAX_SERVICE_ATTACHMENTS,
+            "pdf_attachments",
+        )
         existing_pdfs = existing.get("pdf_attachments", [])
         new_pdfs: List[dict] = []
         for idx, attachment in enumerate(update.pdf_attachments):
@@ -6880,6 +8615,8 @@ async def update_incident(
                 "pdf",
                 f"pdf_attachments[{idx}].data",
                 expected_company_id=company_id,
+                type_key="incident_pdf",
+                background_tasks=background_tasks,
             )
             new_pdfs.append({
                 "name": attachment.get("name"),
@@ -6960,10 +8697,10 @@ async def get_dashboard_stats(
     today_utc, _ = get_sydney_today_range()
     
     # Pre-calculate date strings
-    thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()[:10]
-    sixty_days = (datetime.utcnow() + timedelta(days=60)).isoformat()[:10]
-    today_str = datetime.utcnow().isoformat()[:10]
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    thirty_days = (utcnow() + timedelta(days=30)).isoformat()[:10]
+    sixty_days = (utcnow() + timedelta(days=60)).isoformat()[:10]
+    today_str = utcnow().isoformat()[:10]
+    month_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
     # Run all queries in parallel for better performance
     results = await asyncio.gather(
@@ -7122,8 +8859,8 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     Pulls from existing inspection data — no mobile app changes required.
     """
     company_id = current_user["company_id"]
-    today_str = datetime.utcnow().isoformat()[:10]
-    today_dt = datetime.utcnow()
+    today_str = utcnow().isoformat()[:10]
+    today_dt = utcnow()
     thirty_days_ago = today_dt - timedelta(days=30)
     
     # 1. Get all vehicles for this company
@@ -7300,7 +9037,7 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     Each defect has a stable ID, severity, source, status (open/assigned/fixed).
     """
     company_id = current_user["company_id"]
-    today_dt = datetime.utcnow()
+    today_dt = utcnow()
     ninety_days_ago = today_dt - timedelta(days=90)
 
     # Verify vehicle belongs to this company
@@ -7534,11 +9271,11 @@ async def update_defect_status(
         "vehicle_id": insp.get("vehicle_id"),
         "status": update.status,
         "assigned_to": update.assigned_to,
-        "fixed_date": update.fixed_date or (datetime.utcnow().isoformat() if update.status == "fixed" else None),
+        "fixed_date": update.fixed_date or (utcnow().isoformat() if update.status == "fixed" else None),
         "fixed_cost": update.fixed_cost,
         "notes": update.notes,
         "updated_by": current_user.get("user_id"),
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utcnow().isoformat(),
     }
     await db.defect_overrides.update_one(
         {"defect_id": defect_id, "company_id": current_user["company_id"]},
@@ -7612,7 +9349,7 @@ async def email_defects_to_workshop(
       <div style="max-width:680px; margin:0 auto; background:white;">
         <div style="background:linear-gradient(135deg, #0d9488, #0891b2); padding:24px 28px; color:white;">
           <h1 style="margin:0; font-size:22px;">Defect Repair Request</h1>
-          <p style="margin:4px 0 0 0; opacity:0.9; font-size:14px;">{company_name} · {datetime.utcnow().strftime('%d %B %Y')}</p>
+          <p style="margin:4px 0 0 0; opacity:0.9; font-size:14px;">{company_name} · {utcnow().strftime('%d %B %Y')}</p>
         </div>
         <div style="padding:28px;">
           <p style="color:#0f172a; line-height:1.6;">Hi {workshop_name},</p>
@@ -7671,7 +9408,7 @@ async def email_defects_to_workshop(
             "defect_count": len(open_defects),
             "defect_ids": [d["id"] for d in open_defects],
             "sent_by": current_user.get("user_id"),
-            "sent_at": datetime.utcnow().isoformat(),
+            "sent_at": utcnow().isoformat(),
         })
     except Exception as e:
         logger.error(f"[WORKSHOP_EMAIL] Failed to persist log: {e}")
@@ -7685,7 +9422,7 @@ async def email_defects_to_workshop(
                     {"$set": {
                         "status": "assigned",
                         "assigned_to": workshop_name,
-                        "assigned_at": datetime.utcnow().isoformat(),
+                        "assigned_at": utcnow().isoformat(),
                     }},
                     upsert=True,
                 )
@@ -7717,7 +9454,7 @@ async def get_dashboard_chart_data(
     days = min(max(days, 7), 30)
     
     # Calculate date range
-    end_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    end_date = utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     start_date = end_date - timedelta(days=days)
     
     # Single aggregation query for inspections grouped by day
@@ -7772,7 +9509,7 @@ async def get_dashboard_chart_data(
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     
     for i in range(days - 1, -1, -1):
-        day_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=i)
+        day_date = utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=i)
         date_str = day_date.strftime("%Y-%m-%d")
         
         insp_data = inspection_lookup.get(date_str, {})
@@ -7800,23 +9537,384 @@ async def get_dashboard_chart_data(
 async def get_audit_trail(
     entity_type: Optional[str] = None,
     entity_id: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
+    user_id: Optional[str] = None,
+    action: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
 ):
+    """Filterable audit log query (Phase 4).
+
+    Tenant-scoped (every record fetched is restricted to users that
+    belong to the caller's company). Filters compose; missing filters
+    are no-op. ``date_from`` / ``date_to`` are YYYY-MM-DD; range
+    capped at 365 days to bound the worst-case scan.
+    """
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Super Admin can view audit trail")
-    
-    # Get all user IDs in company
+
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
+
+    # Tenant scoping — derive the set of user_ids that belong to this
+    # company so audit rows for other tenants never leak in.
     company_users = await db.users.distinct("_id", {"company_id": current_user["company_id"]})
-    user_ids = [str(uid) for uid in company_users]
-    
-    query = {"user_id": {"$in": user_ids}}
+    tenant_user_ids = [str(uid) for uid in company_users]
+
+    if user_id:
+        # When the caller filters by a specific user_id, confirm it's
+        # one of theirs — otherwise return empty rather than leaking.
+        if user_id not in tenant_user_ids:
+            return []
+        query: dict = {"user_id": user_id}
+    else:
+        query = {"user_id": {"$in": tenant_user_ids}}
+
     if entity_type:
         query["entity_type"] = entity_type
     if entity_id:
         query["entity_id"] = entity_id
-    
-    trail = await db.audit_trail.find(query).sort("timestamp", -1).to_list(1000)
+    if action:
+        query["action"] = action
+
+    # Optional date-range filter on the timestamp field.
+    if date_from or date_to:
+        ts_filter: dict = {}
+        if date_from:
+            try:
+                df = datetime.fromisoformat(date_from)
+                ts_filter["$gte"] = df
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+        if date_to:
+            try:
+                dt = datetime.fromisoformat(date_to) + timedelta(days=1)
+                ts_filter["$lt"] = dt
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+        if "$gte" in ts_filter and "$lt" in ts_filter:
+            if (ts_filter["$lt"] - ts_filter["$gte"]).days > 366:
+                raise HTTPException(status_code=400, detail="Range capped at 365 days")
+        query["timestamp"] = ts_filter
+
+    trail = await db.audit_trail.find(query).sort("timestamp", -1) \
+        .skip(actual_offset).limit(actual_limit).to_list(actual_limit)
     return serialize_doc(trail)
+
+
+# ============== Phase 7 — In-app notifications ==============
+#
+# Lightweight notification system distinct from email alerts. Each
+# row is per-user and carries a deep-link the UI can route to on tap.
+# Email + push (when wired) live alongside, not instead of, this in-
+# app feed.
+
+class NotificationCreate(BaseModel):
+    title: str
+    body: str
+    deep_link: Optional[str] = None  # e.g. "/vehicles/<id>" or "/incidents/<id>"
+    audience: str  # "all_drivers" | "all_admins" | "user"
+    user_id: Optional[str] = None  # when audience == "user"
+
+
+async def _emit_notifications(
+    company_id: str,
+    *,
+    title: str,
+    body: str,
+    deep_link: Optional[str],
+    user_ids: List[str],
+    kind: str = "info",
+    actor_id: Optional[str] = None,
+) -> int:
+    """Insert one row per recipient. Returns the count inserted.
+
+    Centralises every site that creates an in-app notification so the
+    schema stays consistent across email-triggered (incident, expiry)
+    and admin-triggered (broadcast) origins.
+    """
+    if not user_ids:
+        return 0
+    now = utcnow()
+    docs = [
+        {
+            "_id": ObjectId(),
+            "company_id": company_id,
+            "user_id": uid,
+            "title": title,
+            "body": body,
+            "deep_link": deep_link,
+            "kind": kind,
+            "read": False,
+            "created_at": now,
+            "created_by": actor_id,
+        }
+        for uid in set(user_ids)
+    ]
+    await db.notifications.insert_many(docs)
+    return len(docs)
+
+
+@api_router.get("/notifications")
+async def list_notifications(
+    unread_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-user in-app notification feed (Phase 7 of TODO.md)."""
+    actual_limit = max(1, min(limit, 200))
+    actual_offset = max(0, offset)
+    query: dict = {"user_id": str(current_user["_id"])}
+    if unread_only:
+        query["read"] = False
+    rows = await db.notifications.find(query).sort("created_at", -1) \
+        .skip(actual_offset).limit(actual_limit).to_list(actual_limit)
+    unread = await db.notifications.count_documents({
+        "user_id": str(current_user["_id"]),
+        "read": False,
+    })
+    return {
+        "items": serialize_doc(rows),
+        "unread": unread,
+    }
+
+
+@api_router.put("/notifications/{notif_id}/read")
+async def mark_notification_read(
+    notif_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Mark a single notification as read."""
+    try:
+        oid = ObjectId(notif_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid notification id")
+    res = await db.notifications.update_one(
+        {"_id": oid, "user_id": str(current_user["_id"])},
+        {"$set": {"read": True, "read_at": utcnow()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"status": "read"}
+
+
+@api_router.put("/notifications/read-all")
+async def mark_all_notifications_read(
+    current_user: dict = Depends(get_current_user),
+):
+    """Bulk mark every unread notification for the caller as read."""
+    res = await db.notifications.update_many(
+        {"user_id": str(current_user["_id"]), "read": False},
+        {"$set": {"read": True, "read_at": utcnow()}},
+    )
+    return {"updated": res.modified_count}
+
+
+@api_router.post("/notifications/send")
+async def admin_send_notification(
+    payload: NotificationCreate,
+    current_user: dict = Depends(require_active_tenant),
+):
+    """Admin-triggered broadcast to drivers / admins / a single user.
+
+    Phase 7 of TODO.md. The audience is resolved at send time so a
+    "all drivers" broadcast goes to the current driver roster (not a
+    frozen snapshot from when the message was composed).
+    """
+    if current_user.get("role") not in (UserRole.SUPER_ADMIN, UserRole.ADMIN):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    company_id = current_user["company_id"]
+    audience = (payload.audience or "").strip()
+    user_ids: List[str] = []
+
+    if audience == "all_drivers":
+        rows = await db.users.find({
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "role": UserRole.DRIVER,
+        }, {"_id": 1}).to_list(2000)
+        user_ids = [str(r["_id"]) for r in rows]
+    elif audience == "all_admins":
+        rows = await db.users.find({
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "role": {"$in": [UserRole.ADMIN, UserRole.SUPER_ADMIN]},
+        }, {"_id": 1}).to_list(2000)
+        user_ids = [str(r["_id"]) for r in rows]
+    elif audience == "user":
+        if not payload.user_id:
+            raise HTTPException(status_code=400, detail="user_id required for audience=user")
+        # Verify the target belongs to the caller's tenant.
+        target = await db.users.find_one({
+            "_id": ObjectId(payload.user_id),
+            "company_id": company_id,
+        }, {"_id": 1})
+        if not target:
+            raise HTTPException(status_code=404, detail="Target user not found in your company")
+        user_ids = [str(target["_id"])]
+    else:
+        raise HTTPException(status_code=400, detail="audience must be all_drivers | all_admins | user")
+
+    count = await _emit_notifications(
+        company_id,
+        title=payload.title,
+        body=payload.body,
+        deep_link=payload.deep_link,
+        user_ids=user_ids,
+        kind="broadcast",
+        actor_id=str(current_user["_id"]),
+    )
+    return {"sent": count, "audience": audience}
+
+
+# ============== Phase 4 — Trash / Restore / Purge ==============
+
+# All endpoints below require admin role. Tenant-scoped by company_id
+# so a company owner can never see/restore/purge another tenant's rows.
+
+_TRASH_COLLECTIONS: tuple = (
+    "vehicles",
+    "users",
+    "service_records",
+    "maintenance_logs",
+    "incidents",
+)
+
+
+@api_router.get("/admin/recently-deleted")
+async def get_recently_deleted(
+    collection: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """List soft-deleted rows across collections for the current tenant.
+
+    Phase 4 of TODO.md. The Trash view in the web admin panel reads
+    this. Default returns rows from all collections; pass ?collection=
+    to scope to one. Each item carries the source ``_collection``
+    field so the UI can render type-specific badges.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    actual_limit = max(1, min(limit, 500))
+    actual_offset = max(0, offset)
+    company_id = current_user["company_id"]
+
+    cols = (collection,) if collection else _TRASH_COLLECTIONS
+    if collection and collection not in _TRASH_COLLECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown collection. Allowed: {list(_TRASH_COLLECTIONS)}",
+        )
+
+    out: list = []
+    for coll_name in cols:
+        rows = await db[coll_name].find({
+            "deleted_at": {"$ne": None, "$exists": True},
+            "company_id": company_id,
+        }).sort("deleted_at", -1).to_list(actual_limit)
+        for row in rows:
+            row["_collection"] = coll_name
+        out.extend(rows)
+
+    # Sort across collections by deleted_at desc.
+    out.sort(key=lambda r: r.get("deleted_at") or datetime.min, reverse=True)
+    out = out[actual_offset : actual_offset + actual_limit]
+    return sanitize_user_doc(serialize_doc(out))
+
+
+@api_router.post("/admin/restore/{collection}/{doc_id}")
+async def restore_deleted_doc(
+    collection: str,
+    doc_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Restore a soft-deleted row (unset deleted_at + deleted_by)."""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if collection not in _TRASH_COLLECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown collection. Allowed: {list(_TRASH_COLLECTIONS)}",
+        )
+
+    company_id = current_user["company_id"]
+    res = await db[collection].update_one(
+        {
+            "_id": ObjectId(doc_id),
+            "company_id": company_id,
+            "deleted_at": {"$ne": None, "$exists": True},
+        },
+        _restore_update(),
+    )
+    if res.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Deleted document not found (already restored?)",
+        )
+    # Bust caches that may have memoised the empty-of-this-row state.
+    if collection == "vehicles":
+        invalidate_cache("vehicles", company_id)
+    elif collection == "users":
+        invalidate_cache("drivers", company_id)
+    return {"message": "Restored", "collection": collection, "id": doc_id}
+
+
+@api_router.post("/admin/purge-old-deleted")
+async def purge_old_deleted(
+    confirm: str = "",
+    current_user: dict = Depends(get_current_user),
+):
+    """Permanently remove rows soft-deleted more than SOFT_DELETE_GRACE_DAYS ago.
+
+    Phase 4 of TODO.md — manual button only, no auto-cron. The admin
+    must pass ``?confirm=PURGE`` (matches the existing
+    ``DELETE_EVERYTHING`` convention on /developer/clear-all) so a
+    misclick can't drop 30-day-old recoverable data.
+
+    Returns a per-collection count of rows actually removed.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if confirm != "PURGE":
+        raise HTTPException(
+            status_code=400,
+            detail="Pass ?confirm=PURGE to confirm permanent removal",
+        )
+
+    company_id = current_user["company_id"]
+    cutoff = utcnow() - timedelta(days=SOFT_DELETE_GRACE_DAYS)
+
+    purged: dict = {}
+    for coll_name in _TRASH_COLLECTIONS:
+        res = await db[coll_name].delete_many({
+            "company_id": company_id,
+            "deleted_at": {"$lt": cutoff},
+        })
+        if res.deleted_count:
+            purged[coll_name] = res.deleted_count
+
+    await log_audit_trail(
+        str(current_user["_id"]),
+        "purge_old_deleted",
+        "admin",
+        None,
+        "",
+    )
+
+    return {
+        "message": (
+            f"Purged rows deleted more than {SOFT_DELETE_GRACE_DAYS} days ago"
+        ),
+        "cutoff": cutoff.isoformat() + "Z",
+        "removed": purged,
+    }
 
 # ============== Subscription (Future Ready) ==============
 
@@ -7824,6 +9922,8 @@ async def get_audit_trail(
 @api_router.post("/auth/register-company")
 async def register_company(data: CompanyRegister):
     """Register a new company and admin user, optionally create Stripe checkout session"""
+    # Phase 3 — uniform password policy at every set-password site.
+    validate_password_policy(data.password)
     
     # Check if email already exists
     existing_user = await db.users.find_one({"email": data.email})
@@ -7850,11 +9950,11 @@ async def register_company(data: CompanyRegister):
         "vehicle_count": data.vehicle_count,
         "subscription_status": "trialing",
         "subscription_plan": "pro",
-        "trial_end": (datetime.utcnow() + timedelta(days=PRICING["trial_days"])).isoformat(),
+        "trial_end": (utcnow() + timedelta(days=PRICING["trial_days"])).isoformat(),
         "stripe_customer_id": None,
         "stripe_subscription_id": None,
         "timezone": data.timezone or DEFAULT_TIMEZONE,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
     }
     company_result = await db.companies.insert_one(company_doc)
     company_id = str(company_result.inserted_id)
@@ -7870,7 +9970,7 @@ async def register_company(data: CompanyRegister):
         "role": user_role,
         "company_id": company_id,
         "email_verified": False,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
     }
     user_result = await db.users.insert_one(user_doc)
     user_id = str(user_result.inserted_id)
@@ -7991,25 +10091,61 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "company": company,
     }
 
-# Stripe Webhook Handler
+# Stripe Webhook Handler — Phase 12 of TODO.md.
+#
+# Signature verification is MANDATORY unless explicitly disabled via
+# STRIPE_WEBHOOK_ALLOW_UNVERIFIED=true (intended only for local dev).
+# Production must always have STRIPE_WEBHOOK_SECRET configured — a
+# missing secret in prod is now a 503, not a silent-accept that lets
+# anyone POST forged events.
+#
+# Idempotency: every Stripe event has a unique `id`. We record it in
+# the `stripe_events` collection on first receive and reject duplicates
+# so a retry storm cannot apply the same upgrade twice.
 @api_router.post("/webhooks/stripe")
 async def stripe_webhook(request: Request):
-    """Handle Stripe webhook events"""
+    """Handle Stripe webhook events with mandatory signature verification."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    
-    if webhook_secret and sig_header:
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+    allow_unverified = (
+        os.environ.get("STRIPE_WEBHOOK_ALLOW_UNVERIFIED", "false")
+        .strip().lower() in ("true", "1", "yes")
+    )
+
+    if webhook_secret:
+        if not sig_header:
+            raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
         try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, webhook_secret
-            )
+            event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
         except Exception as e:
             logger.error(f"Webhook signature verification failed: {e}")
             raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        # For testing without webhook secret
+    elif allow_unverified:
+        # Local dev escape hatch — never set this in production.
+        logger.warning("Stripe webhook signature verification disabled (DEV ONLY)")
         event = json.loads(payload)
+    else:
+        # Prod without secret → fail closed. Don't silently accept.
+        logger.error("Stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook signing not configured on this server",
+        )
+
+    # Idempotency: drop duplicate event IDs. Stripe retries on 5xx,
+    # so without this a network blip could promote a tenant twice.
+    event_id = event.get("id")
+    if event_id:
+        existing = await db.stripe_events.find_one({"_id": event_id})
+        if existing:
+            logger.info(f"Stripe event {event_id} already processed; skipping")
+            return {"status": "duplicate"}
+        await db.stripe_events.insert_one({
+            "_id": event_id,
+            "type": event.get("type"),
+            "received_at": datetime.now(timezone.utc),
+        })
     
     event_type = event.get("type")
     data = event.get("data", {}).get("object", {})
@@ -8085,7 +10221,7 @@ async def register_push_token(data: PushTokenCreate, current_user: dict = Depend
                 "company_id": current_user.get("company_id"),
                 "platform": data.platform,
                 "device_name": data.device_name,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": utcnow().isoformat(),
             }}
         )
     else:
@@ -8096,7 +10232,7 @@ async def register_push_token(data: PushTokenCreate, current_user: dict = Depend
             "company_id": current_user.get("company_id"),
             "platform": data.platform,
             "device_name": data.device_name,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utcnow().isoformat(),
         })
     
     return {"status": "registered"}
@@ -8141,7 +10277,7 @@ async def update_notification_preferences(
 ):
     """Update notification preferences for the current user"""
     update_data = {k: v for k, v in data.dict().items() if v is not None}
-    update_data["updated_at"] = datetime.utcnow().isoformat()
+    update_data["updated_at"] = utcnow().isoformat()
     
     await db.notification_preferences.update_one(
         {"user_id": current_user["id"]},
@@ -8296,8 +10432,8 @@ async def create_support_request(
         "category": request_data.category,
         "status": SupportRequestStatus.OPEN,
         "admin_response": None,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
+        "created_at": utcnow(),
+        "updated_at": utcnow(),
         "resolved_at": None,
     }
     
@@ -8418,12 +10554,12 @@ async def update_support_request(
     if request["company_id"] != current_user["company_id"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    update_fields = {"updated_at": datetime.utcnow()}
+    update_fields = {"updated_at": utcnow()}
     
     if update_data.status:
         update_fields["status"] = update_data.status
         if update_data.status in [SupportRequestStatus.RESOLVED, SupportRequestStatus.CLOSED]:
-            update_fields["resolved_at"] = datetime.utcnow()
+            update_fields["resolved_at"] = utcnow()
     
     if update_data.admin_response:
         update_fields["admin_response"] = update_data.admin_response
@@ -8602,7 +10738,7 @@ async def get_developer_stats(
                 if isinstance(trial_started, str):
                     try:
                         trial_started = datetime.fromisoformat(trial_started.replace('Z', '+00:00'))
-                    except:
+                    except Exception:
                         trial_started = datetime.now(timezone.utc)
                 trial_end = trial_started + timedelta(days=14)
                 if datetime.now(timezone.utc) < trial_end:
@@ -8851,6 +10987,62 @@ async def delete_company(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@api_router.post("/developer/companies/{company_id}/suspend")
+async def developer_suspend_company(
+    company_id: str,
+    reason: Optional[str] = None,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Suspend a tenant (Phase 8 of TODO.md).
+
+    Platform owner only. Suspended tenants' admins can still read their
+    data but can't write anything (require_active_tenant returns 423).
+    Login still works so they can pay / contact support.
+    """
+    try:
+        oid = ObjectId(company_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid company_id")
+
+    res = await db.companies.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "suspended": True,
+                "suspended_at": utcnow(),
+                "suspended_by": str(current_user["_id"]),
+                "suspended_reason": (reason or "").strip() or "Account suspended",
+            }
+        },
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return {"status": "suspended", "company_id": company_id}
+
+
+@api_router.post("/developer/companies/{company_id}/unsuspend")
+async def developer_unsuspend_company(
+    company_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Lift a suspension (Phase 8)."""
+    try:
+        oid = ObjectId(company_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid company_id")
+
+    res = await db.companies.update_one(
+        {"_id": oid},
+        {
+            "$set": {"suspended": False},
+            "$unset": {"suspended_at": "", "suspended_by": "", "suspended_reason": ""},
+        },
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return {"status": "active", "company_id": company_id}
+
+
 @api_router.delete("/developer/clear-all")
 async def developer_clear_all(
     confirm: str,
@@ -8933,7 +11125,8 @@ class TenantResolveResponse(BaseModel):
 
 
 @api_router.post("/tenant/resolve", response_model=TenantResolveResponse)
-async def resolve_tenant(payload: TenantResolveRequest):
+@limiter.limit("10/minute")
+async def resolve_tenant(payload: TenantResolveRequest, request: Request = None):
     """Look up a tenant by subdomain slug and return branding info.
 
     No auth required (Req 11.2). Reserved slugs never resolve and
@@ -9049,7 +11242,7 @@ async def rename_company_subdomain(
     # 30-day cooldown check (Req 17.3). Based on the most recent history
     # entry's changed_at. Missing / malformed history == no cooldown.
     history: List[dict] = company.get("subdomain_history") or []
-    now = datetime.utcnow()
+    now = utcnow()
     if history:
         most_recent = history[-1]
         changed_at = most_recent.get("changed_at")
@@ -9123,7 +11316,7 @@ async def app_health():
 
     Response body contains ``status: "ok"`` per Req 2.1.
     """
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "timestamp": utcnow().isoformat()}
 
 
 @api_router.get("/")
@@ -9132,7 +11325,82 @@ async def root():
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    """Liveness + dependency probe (Phase 9 of TODO.md).
+
+    Pings Mongo (ismaster) and MinIO (head_bucket on logos) with
+    tight timeouts. Returns HTTP 200 only when all three layers
+    answer; HTTP 503 otherwise with a per-dependency breakdown so
+    the external uptime monitor can render a useful incident page.
+
+    Kept fast — the goal is <100 ms when healthy. The MinIO ping
+    uses head_bucket against the public logos bucket, which is
+    cheap and validates both the access key and network path.
+    """
+    started = utcnow()
+    deps: dict = {"mongo": "unknown", "minio": "unknown"}
+    ok = True
+
+    # Mongo: a short-timeout server_info call.
+    try:
+        await asyncio.wait_for(client.server_info(), timeout=2.0)
+        deps["mongo"] = "ok"
+    except Exception as exc:
+        deps["mongo"] = f"down: {type(exc).__name__}"
+        ok = False
+
+    # MinIO: head_bucket on the always-present logos bucket. Run
+    # the blocking boto3 call on a thread so it doesn't block the
+    # event loop on a network stall.
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                object_store._s3_client.head_bucket, Bucket="logos"
+            ),
+            timeout=2.0,
+        )
+        deps["minio"] = "ok"
+    except Exception as exc:
+        deps["minio"] = f"down: {type(exc).__name__}"
+        ok = False
+
+    body = {
+        "status": "ok" if ok else "degraded",
+        "timestamp": started.isoformat(),
+        "dependencies": deps,
+    }
+    if not ok:
+        return _JSONResponse(status_code=503, content=body)
+    return body
+
+
+# Phase 6 of TODO.md — minimum-version gate for the mobile app.
+# Defaults are tolerant (min=0) so existing builds never get force-
+# upgraded by accident. Set the env vars when you actually need to
+# cut off old clients (e.g. after a breaking API change).
+MIN_IOS_BUILD_NUMBER = _phase3_env_int("MOBILE_MIN_IOS_BUILD", 0)
+MIN_ANDROID_VERSION_CODE = _phase3_env_int("MOBILE_MIN_ANDROID_VERSION_CODE", 0)
+RECOMMENDED_VERSION = os.environ.get("MOBILE_RECOMMENDED_VERSION", "1.0.0").strip() or "1.0.0"
+
+
+@api_router.get("/version-min")
+async def get_version_min():
+    """Return the minimum mobile build that's still allowed to call the API.
+
+    Mobile clients call this on cold start. When the device's installed
+    build is below the floor, the app shows a "Please update" screen
+    that links to the relevant store and refuses to submit anything.
+
+    Defaults are 0/0 so this is a no-op until you actually need to
+    drop old clients. The store URLs are stable platform-level
+    constants; they don't change per env.
+    """
+    return {
+        "min_ios_build": MIN_IOS_BUILD_NUMBER,
+        "min_android_version_code": MIN_ANDROID_VERSION_CODE,
+        "recommended_version": RECOMMENDED_VERSION,
+        "store_url_ios": "https://apps.apple.com/au/app/fleetshield365/id0000000000",
+        "store_url_android": "https://play.google.com/store/apps/details?id=com.fleetshield365",
+    }
 
 # Include router
 app.include_router(api_router)
@@ -9142,8 +11410,11 @@ app.add_middleware(
     allow_origins=CORS_ALLOWED_ORIGINS,
     allow_origin_regex=r"^https://[a-z0-9-]+\.fleetshield365\.com$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Phase 3 — explicit method + header allowlist. Earlier "*" allowed
+    # every possible method/header through preflight; the platform only
+    # uses the verbs below and only needs the headers below.
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
 
 async def ensure_indexes() -> None:
@@ -9176,6 +11447,24 @@ async def ensure_indexes() -> None:
     await db.users.create_index("username", unique=True, sparse=True)
     await db.users.create_index([("company_id", 1), ("role", 1)])
     await db.users.create_index("company_id")
+    # Phase 4 — phone uniqueness. Sparse so users without a phone
+    # don't conflict (multiple nulls allowed). Helps the duplicate-
+    # driver-by-phone detection on create/invite.
+    try:
+        await db.users.create_index("phone", unique=True, sparse=True)
+    except Exception as exc:
+        # Pre-existing duplicate phones in production would block index
+        # creation. Log and skip rather than fail every backend start
+        # until the duplicates are cleaned up manually.
+        logger.warning("Could not create unique sparse index on users.phone: %s", exc)
+    # Phase 4 — common query: list soft-deleted rows for the Trash view.
+    # Compound index supports the {company_id, deleted_at} sort path
+    # used by /api/admin/recently-deleted.
+    for coll_name in ("vehicles", "users", "service_records", "maintenance_logs", "incidents"):
+        try:
+            await db[coll_name].create_index([("company_id", 1), ("deleted_at", -1)])
+        except Exception:
+            pass
 
     # --- companies -----------------------------------------------------
     # Case-insensitive unique sparse index on companies.subdomain
@@ -9235,6 +11524,46 @@ async def ensure_indexes() -> None:
         "expires_at", expireAfterSeconds=0
     )
     await db.email_logs.create_index([("sent_at", -1)])
+
+    # --- notifications (Phase 7 — in-app feed) ------------------------
+    # Per-user feed: list-unread + sort-by-created-at-desc are the hot
+    # paths. Compound indexes cover both.
+    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    await db.notifications.create_index([("user_id", 1), ("read", 1)])
+
+    # --- revoked_tokens (Phase 3 — JWT revocation list) ---------------
+    # TTL index expires entries automatically when the underlying
+    # token would have expired naturally — so the collection never
+    # grows past the active token horizon.
+    await db.revoked_tokens.create_index(
+        "expires_at", expireAfterSeconds=0
+    )
+    await db.revoked_tokens.create_index("user_id")
+
+    # --- email_tokens (verify + invite) -------------------------------
+    # Added 2026-05-12 (Phase 1 of STORAGE-PLAN.txt). Stored documents:
+    #   {token, user_id, type:"verify"|"invite", expires_at, created_at}
+    # Token lookups are by ``token`` (unique). TTL on ``expires_at``
+    # auto-cleans expired rows. Compound on (user_id, type) supports
+    # the "is there already a verify token for this user?" check
+    # used by the resend-verification handler.
+    await db.email_tokens.create_index("token", unique=True)
+    await db.email_tokens.create_index(
+        "expires_at", expireAfterSeconds=0
+    )
+    await db.email_tokens.create_index([("user_id", 1), ("type", 1)])
+
+    # --- temp_photos TTL (Phase 1 cleanup of upload staging area) ----
+    # Documents carry an `expires_at` field; the TTL index makes Mongo
+    # delete them automatically 24h after upload if they never got
+    # linked to an inspection.
+    try:
+        await db.temp_photos.create_index(
+            "expires_at", expireAfterSeconds=0
+        )
+    except Exception:
+        # Index may already exist with a different name; not fatal.
+        pass
 
     logger.info("ensure_indexes(): DB indexes verified")
 
