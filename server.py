@@ -917,7 +917,7 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
         <div style="background-color: #DC2626; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0;">🚨 DEFECT ALERT - Immediate Attention Required</h2>
+            <h2 style="margin: 0;">DEFECT ALERT — Immediate Attention Required</h2>
         </div>
         
         <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
@@ -933,7 +933,7 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
                     {extra_rows}
                 </table>
                 <hr style="border: none; border-top: 1px solid #FECACA; margin: 15px 0;" />
-                <p style="color: #DC2626; font-weight: bold; margin: 0;">⚠️ Issue Reported:</p>
+                <p style="color: #DC2626; font-weight: bold; margin: 0;">Issue Reported:</p>
                 <p style="color: #991B1B; margin: 8px 0 0 0;">{issue_summary}</p>
             </div>
             
@@ -951,7 +951,7 @@ async def send_issue_alert_email(admin_email: str, company_name: str, vehicle_na
     </body>
     </html>
     """
-    return await send_email_notification(admin_email, f"🚨 [DEFECT ALERT] {vehicle_name} - {issue_summary[:50]}", html_content)
+    return await send_email_notification(admin_email, f"[DEFECT ALERT] {vehicle_name} — {issue_summary[:50]}", html_content)
 
 async def send_missed_inspection_email(admin_email: str, company_name: str, vehicles: List[dict]):
     """Send missed inspection alert email"""
@@ -1018,7 +1018,7 @@ async def send_repeated_issues_email(company_id: str, vehicle_name: str, recent_
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px; max-width: 650px; margin: 0 auto;">
         <div style="background-color: #F97316; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0;">⚠️ REPEATED ISSUES - {vehicle_name}</h2>
+            <h2 style="margin: 0;">REPEATED ISSUES — {vehicle_name}</h2>
         </div>
         
         <div style="border: 1px solid #E5E7EB; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
@@ -1067,7 +1067,7 @@ async def send_repeated_issues_email(company_id: str, vehicle_name: str, recent_
         if admin.get("email"):
             await send_email_notification(
                 admin["email"],
-                f"⚠️ [PATTERN ALERT] {vehicle_name} - {count} issues in 7 days",
+                f"[PATTERN ALERT] {vehicle_name} — {count} issues in 7 days",
                 html_content
             )
 
@@ -1350,6 +1350,35 @@ async def notify_admins(company_id: str, notification_type: str, title: str, bod
         if prefs.get("email_enabled", True) and email_func and email_args:
             await email_func(admin.get("email"), company_name, *email_args)
 
+async def send_activity_email(
+    company_id: str,
+    activity_pref_key: str,
+    subject: str,
+    html_body: str,
+):
+    """Per-activity admin notification (prestart / end-shift / fuel).
+
+    Only sends to admins where both ``email_enabled`` AND the matching
+    activity flag (e.g. ``prestart_email``) are True. Default for these
+    activity flags is OFF for prestart / end-shift / fuel — so a
+    company that hasn't opted in will not get one email per inspection
+    submission. Incident emails default ON and are wired separately.
+    """
+    admins = await db.users.find({
+        "company_id": company_id,
+        "role": {"$in": ["super_admin", "admin"]},
+    }).to_list(100)
+    for admin in admins:
+        prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
+        if not prefs.get("email_enabled", True):
+            continue
+        # default OFF for prestart/endshift/fuel — admins must opt in
+        if not prefs.get(activity_pref_key, False):
+            continue
+        if admin.get("email"):
+            await send_email_notification(admin["email"], subject, html_body)
+
+
 async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_name: str, issue_summary: str, inspection_type: str, photos: List[dict], inspection_id: str, extra_details: dict = None):
     """Send issue alert notifications to admins with photos included"""
     # Get all admins for this company
@@ -1377,7 +1406,7 @@ async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_n
             push_tokens = [t["token"] for t in tokens if t.get("token")]
             await send_push_notification(
                 push_tokens, 
-                f"🚨 DEFECT: {vehicle_name}", 
+                f"DEFECT: {vehicle_name}",
                 f"Driver reported: {issue_summary}",
                 {"inspection_id": inspection_id, "type": "defect_alert"}
             )
@@ -3152,12 +3181,46 @@ class CompanyRegister(BaseModel):
     # handler calls slug_generator() to derive one from ``company_name``.
     subdomain: Optional[str] = None
 
-# Pricing Configuration
+# Pricing configuration — fallback defaults. Live values are stored in
+# the ``platform_config`` collection under ``_id == "pricing"`` and are
+# read via ``get_pricing()``. The legacy PRICING dict is retained as a
+# fallback so a fresh install (or a missing config doc) still serves
+# sensible prices.
 PRICING = {
     "base_price": 29,
     "per_vehicle": 3,
     "trial_days": 14,
+    "currency": "AUD",
+    "cadence": "monthly",
 }
+
+
+async def get_pricing() -> dict:
+    """Read live pricing config from ``platform_config``.
+
+    Falls back to the module-level ``PRICING`` defaults on miss. Returns
+    a dict with keys ``base_price``, ``per_vehicle``, ``vehicle_price``
+    (alias for backwards compat), ``trial_days``, ``currency``,
+    ``cadence``, plus any ``stripe`` sub-dict the owner panel wrote.
+    """
+    try:
+        doc = await db.platform_config.find_one({"_id": "pricing"})
+    except Exception:
+        doc = None
+    base = dict(PRICING)
+    if doc:
+        for k in ("base_price", "per_vehicle", "trial_days", "currency", "cadence"):
+            v = doc.get(k)
+            if v is not None:
+                base[k] = v
+        if doc.get("stripe"):
+            base["stripe"] = doc["stripe"]
+        if doc.get("updated_at"):
+            base["updated_at"] = doc["updated_at"].isoformat() if isinstance(doc["updated_at"], datetime) else doc["updated_at"]
+    # Backwards-compat alias so older callers reading ``vehicle_price``
+    # still work.
+    base["vehicle_price"] = base["per_vehicle"]
+    return base
 
 # ============== Trial Status Helpers ==============
 
@@ -3621,13 +3684,13 @@ class EmailService:
     async def send_alert_email(alert_type: str, message: str, admin_emails: list, company_id: str):
         """Send alert notification to admins with styled HTML"""
         subject_map = {
-            "unsafe_vehicle": "🚨 URGENT: Vehicle Marked Unsafe",
-            "repeated_issues": "⚠️ Alert: Repeated Vehicle Issues",
-            "expiry_warning": "📅 Reminder: Upcoming Vehicle Expiry",
-            "expiry_critical": "🚨 CRITICAL: Document Has Expired",
-            "driver_expiry_warning": "📅 Reminder: Driver Document Expiring",
-            "driver_expiry_critical": "🚨 CRITICAL: Driver Document Expired",
-            "vehicle_offline": "🔴 Vehicle Status: Offline"
+            "unsafe_vehicle": "URGENT: Vehicle Marked Unsafe",
+            "repeated_issues": "Alert: Repeated Vehicle Issues",
+            "expiry_warning": "Reminder: Upcoming Vehicle Expiry",
+            "expiry_critical": "CRITICAL: Document Has Expired",
+            "driver_expiry_warning": "Reminder: Driver Document Expiring",
+            "driver_expiry_critical": "CRITICAL: Driver Document Expired",
+            "vehicle_offline": "Vehicle Status: Offline",
         }
         subject = subject_map.get(alert_type, "FleetShield365 Alert")
         
@@ -3706,9 +3769,9 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                     })
                     
                     if not existing_alert:
-                        message = f"🚨 {label} for {vehicle_name} has EXPIRED! (was due {display_date})"
+                        message = f"{label} for {vehicle_name} has EXPIRED (was due {display_date})"
                         await create_alert(company_id, "expiry_critical", message, vehicle_id)
-                
+
                 # Check each reminder interval
                 else:
                     for reminder_day in REMINDER_DAYS:
@@ -3717,29 +3780,25 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                             if days_until_expiry <= 7:
                                 alert_type = "expiry_critical"
                                 urgency = "CRITICAL"
-                                emoji = "🚨"
                             elif days_until_expiry <= 14:
                                 alert_type = "expiry_warning"
                                 urgency = "URGENT"
-                                emoji = "⚠️"
                             elif days_until_expiry <= 30:
                                 alert_type = "expiry_warning"
                                 urgency = "ACTION NEEDED"
-                                emoji = "📅"
                             else:  # 60 days
                                 alert_type = "expiry_warning"
                                 urgency = "HEADS UP"
-                                emoji = "📋"
-                            
+
                             # Check if alert already exists for this specific reminder
                             existing_alert = await db.alerts.find_one({
                                 "vehicle_id": vehicle_id,
                                 "type": alert_type,
                                 "message": {"$regex": f"{label}.*{vehicle_name}.*{reminder_day}"}
                             })
-                            
+
                             if not existing_alert:
-                                message = f"{emoji} [{urgency}] {label} for {vehicle_name} expires in {days_until_expiry} days ({display_date})"
+                                message = f"[{urgency}] {label} for {vehicle_name} expires in {days_until_expiry} days ({display_date})"
                                 await create_alert(company_id, alert_type, message, vehicle_id)
                             
                             break  # Only create alert for the most urgent matching interval
@@ -6314,7 +6373,23 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         str(current_user["_id"]), "create", "inspection", str(inspection_doc["_id"]),
         request.client.host if request.client else "unknown"
     )
-    
+
+    # Per-activity opt-in email — defaults off so we don't spam admins.
+    try:
+        driver_display = current_user.get("name") or current_user.get("full_name") or "Driver"
+        status_word = "with defects" if has_issues else "all clear"
+        await send_activity_email(
+            company_id,
+            "prestart_email",
+            f"[Pre-start] {vehicle.get('name', 'Vehicle')} — {status_word}",
+            f"<p>{driver_display} completed a pre-start check for "
+            f"<b>{vehicle.get('name', 'Vehicle')} ({vehicle.get('registration_number', 'N/A')})</b>.</p>"
+            f"<p>Status: <b>{status_word}</b>. Odometer: {inspection.odometer}.</p>"
+            f"<p><a href=\"https://www.fleetshield365.com/reports\">View in dashboard</a></p>",
+        )
+    except Exception:
+        pass
+
     return serialize_doc(inspection_doc)
 
 @api_router.post("/inspections/end-shift")
@@ -6516,12 +6591,30 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
             photos_for_email,
             str(inspection_id)
         )
-    
+
     await log_audit_trail(
         str(current_user["_id"]), "create", "inspection", str(inspection_doc["_id"]),
         request.client.host if request.client else "unknown"
     )
-    
+
+    try:
+        driver_display = current_user.get("name") or current_user.get("full_name") or "Driver"
+        flags = []
+        if inspection.new_damage:    flags.append("new damage")
+        if inspection.incident_today: flags.append("incident")
+        status_word = ", ".join(flags) if flags else "no issues"
+        await send_activity_email(
+            current_user["company_id"],
+            "endshift_email",
+            f"[End-shift] {vehicle.get('name', 'Vehicle')} — {status_word}",
+            f"<p>{driver_display} completed an end-of-shift report for "
+            f"<b>{vehicle.get('name', 'Vehicle')} ({vehicle.get('registration_number', 'N/A')})</b>.</p>"
+            f"<p>Status: <b>{status_word}</b>. Odometer: {inspection.odometer}.</p>"
+            f"<p><a href=\"https://www.fleetshield365.com/reports\">View in dashboard</a></p>",
+        )
+    except Exception:
+        pass
+
     return serialize_doc(inspection_doc)
 
 @api_router.get("/inspections")
@@ -6831,7 +6924,22 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
     }
     
     await db.fuel_submissions.insert_one(fuel_doc)
-    
+
+    try:
+        driver_display = current_user.get("name") or current_user.get("full_name") or "Driver"
+        await send_activity_email(
+            company_id,
+            "fuel_email",
+            f"[Fuel] {vehicle.get('name', 'Vehicle')} — ${fuel.amount:.2f}",
+            f"<p>{driver_display} logged a fuel entry for "
+            f"<b>{vehicle.get('name', 'Vehicle')} ({vehicle.get('registration_number', 'N/A')})</b>.</p>"
+            f"<p>Amount: <b>${fuel.amount:.2f}</b> · Litres: <b>{fuel.liters:.2f}</b> · "
+            f"Station: {fuel.fuel_station or 'N/A'}.</p>"
+            f"<p><a href=\"https://www.fleetshield365.com/fuel-logs\">View in dashboard</a></p>",
+        )
+    except Exception:
+        pass
+
     return {"id": str(fuel_doc["_id"]), "message": "Fuel submission recorded successfully"}
 
 @api_router.get("/fuel")
@@ -7217,10 +7325,10 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                         "message": {"$regex": f"{label}.*EXPIRED"}
                     })
                     if not existing:
-                        message = f"🚨 {label} for {display_name} has EXPIRED! (was due {display_date})"
+                        message = f"{label} for {display_name} has EXPIRED (was due {display_date})"
                         await create_alert(company_id, "driver_expiry_critical", message, driver_id=driver_id)
                         await send_driver_expiry_email(company_id, display_name, label, days_until, display_date, expired=True)
-                
+
                 # Check each reminder interval
                 else:
                     for reminder_day in REMINDER_DAYS:
@@ -7229,29 +7337,25 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                             if days_until <= 7:
                                 alert_type = "driver_expiry_critical"
                                 urgency = "CRITICAL"
-                                emoji = "🚨"
                             elif days_until <= 14:
                                 alert_type = "driver_expiry_warning"
                                 urgency = "URGENT"
-                                emoji = "⚠️"
                             elif days_until <= 30:
                                 alert_type = "driver_expiry_warning"
                                 urgency = "ACTION NEEDED"
-                                emoji = "📅"
                             else:  # 60 days
                                 alert_type = "driver_expiry_warning"
                                 urgency = "HEADS UP"
-                                emoji = "📋"
-                            
+
                             # Check if alert already exists for this specific reminder
                             existing = await db.alerts.find_one({
                                 "driver_id": driver_id,
                                 "type": alert_type,
                                 "message": {"$regex": f"{label}.*{reminder_day}"}
                             })
-                            
+
                             if not existing:
-                                message = f"{emoji} [{urgency}] {label} for {display_name} expires in {days_until} days ({display_date})"
+                                message = f"[{urgency}] {label} for {display_name} expires in {days_until} days ({display_date})"
                                 await create_alert(company_id, alert_type, message, driver_id=driver_id)
                                 await send_driver_expiry_email(company_id, display_name, label, days_until, display_date)
                             
@@ -7269,10 +7373,10 @@ async def send_driver_expiry_email(company_id: str, driver_name: str, document_t
     
     for admin in admins:
         if expired:
-            subject = f"🚨 URGENT: {driver_name}'s {document_type} has EXPIRED"
+            subject = f"URGENT: {driver_name}'s {document_type} has EXPIRED"
             body = f"URGENT: {driver_name}'s {document_type} expired on {expiry_date}.\n\nPlease ensure this is updated immediately to maintain compliance."
         else:
-            subject = f"⚠️ Reminder: {driver_name}'s {document_type} expires in {days_until} days"
+            subject = f"Reminder: {driver_name}'s {document_type} expires in {days_until} days"
             body = f"{driver_name}'s {document_type} will expire on {expiry_date} ({days_until} days remaining).\n\nPlease arrange renewal before expiry."
         
         await send_email_notification(admin.get("email"), subject, body)
@@ -7936,7 +8040,7 @@ async def send_incident_alert_email(admin_email: str, company_name: str, inciden
     <html>
     <body style="font-family: Arial, sans-serif; padding: 20px;">
         <div style="background-color: {severity_color}; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0;">🚨 INCIDENT REPORT - {sev.upper()}</h2>
+            <h2 style="margin: 0;">INCIDENT REPORT — {sev.upper()}</h2>
         </div>
         
         <div style="border: 1px solid {border_color}; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
@@ -8096,7 +8200,10 @@ async def create_incident(
     
     for admin in admin_users:
         prefs = prefs_map.get(str(admin["_id"]), {})
-        if prefs.get("email_issue_alerts", True):
+        # Respect both the master email toggle and the per-activity
+        # incident_email switch. Default for incidents is on (the most
+        # important class of event) so blank/missing prefs still alert.
+        if prefs.get("email_enabled", True) and prefs.get("incident_email", True):
             background_tasks.add_task(
                 send_incident_alert_email,
                 admin["email"],
@@ -8115,7 +8222,7 @@ async def create_incident(
         background_tasks.add_task(
             send_push_notification,
             push_tokens,
-            f"🚨 Incident Report - {incident.severity.upper()}",
+            f"Incident Report — {incident.severity.upper()}",
             f"{vehicle_name}: {incident.description[:100]}",
             {"type": "incident", "incident_id": str(result.inserted_id)}
         )
@@ -9952,13 +10059,14 @@ async def register_company(data: CompanyRegister):
         raise _subdomain_error_to_http(exc)
 
     # Create company
+    pricing_now = await get_pricing()
     company_doc = {
         "name": data.company_name,
         "subdomain": resolved_subdomain,
         "vehicle_count": data.vehicle_count,
         "subscription_status": "trialing",
         "subscription_plan": "pro",
-        "trial_end": (utcnow() + timedelta(days=PRICING["trial_days"])).isoformat(),
+        "trial_end": (utcnow() + timedelta(days=pricing_now["trial_days"])).isoformat(),
         "stripe_customer_id": None,
         "stripe_subscription_id": None,
         "timezone": data.timezone or DEFAULT_TIMEZONE,
@@ -10012,19 +10120,22 @@ async def register_company(data: CompanyRegister):
                 {"$set": {"stripe_customer_id": customer.id}}
             )
             
-            # Calculate price
-            total_monthly = PRICING["base_price"] + (data.vehicle_count * PRICING["per_vehicle"])
-            
+            # Calculate price from live config (falls back to PRICING)
+            base_price = pricing_now["base_price"]
+            per_vehicle = pricing_now["per_vehicle"]
+            currency = (pricing_now.get("currency") or "AUD").lower()
+            total_monthly = base_price + (data.vehicle_count * per_vehicle)
+
             # Create checkout session for subscription
             checkout_session = stripe.checkout.Session.create(
                 customer=customer.id,
                 payment_method_types=["card"],
                 line_items=[{
                     "price_data": {
-                        "currency": "aud",
+                        "currency": currency,
                         "product_data": {
                             "name": f"FleetShield365 Pro - {data.vehicle_count} vehicles",
-                            "description": f"Base ${PRICING['base_price']}/mo + ${PRICING['per_vehicle']}/vehicle",
+                            "description": f"Base ${base_price}/mo + ${per_vehicle}/vehicle",
                         },
                         "unit_amount": total_monthly * 100,  # Stripe uses cents
                         "recurring": {"interval": "month"},
@@ -10035,7 +10146,7 @@ async def register_company(data: CompanyRegister):
                 success_url=f"{data.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
                 cancel_url=f"{data.origin_url}/pricing",
                 subscription_data={
-                    "trial_period_days": PRICING["trial_days"],
+                    "trial_period_days": pricing_now["trial_days"],
                     "metadata": {
                         "company_id": company_id,
                         "vehicle_count": str(data.vehicle_count),
@@ -10214,6 +10325,14 @@ class NotificationPreferencesUpdate(BaseModel):
     daily_summary: Optional[bool] = None
     push_enabled: Optional[bool] = None
     email_enabled: Optional[bool] = None
+    # Per-activity email toggles. These mirror the admin web settings
+    # so the user can opt in/out of each event class without disabling
+    # email entirely. Defaults match the historical "always send"
+    # behaviour except for prestart/endshift/fuel which default off.
+    prestart_email: Optional[bool] = None
+    endshift_email: Optional[bool] = None
+    fuel_email: Optional[bool] = None
+    incident_email: Optional[bool] = None
 
 @api_router.post("/push-tokens")
 async def register_push_token(data: PushTokenCreate, current_user: dict = Depends(get_current_user)):
@@ -10267,8 +10386,12 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
             "daily_summary": False,
             "push_enabled": True,
             "email_enabled": True,
+            "prestart_email": False,
+            "endshift_email": False,
+            "fuel_email": False,
+            "incident_email": True,
         }
-    
+
     return {
         "expiry_alerts": prefs.get("expiry_alerts", True),
         "issue_alerts": prefs.get("issue_alerts", True),
@@ -10276,6 +10399,10 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
         "daily_summary": prefs.get("daily_summary", False),
         "push_enabled": prefs.get("push_enabled", True),
         "email_enabled": prefs.get("email_enabled", True),
+        "prestart_email": prefs.get("prestart_email", False),
+        "endshift_email": prefs.get("endshift_email", False),
+        "fuel_email": prefs.get("fuel_email", False),
+        "incident_email": prefs.get("incident_email", True),
     }
 
 @api_router.put("/notification-preferences")
@@ -11166,6 +11293,389 @@ async def developer_recent_activity(
             "company_subdomain": co.get("subdomain"),
         })
     return {"items": enriched, "count": len(enriched)}
+
+
+# ============== Public pricing ==============
+#
+# Anonymous endpoint so the landing + /pricing pages can render the
+# live numbers without authenticating. Cached via the existing
+# `get_pricing()` helper which reads platform_config.
+
+@api_router.get("/pricing")
+async def public_pricing():
+    """Public pricing — used by landing page + /pricing."""
+    p = await get_pricing()
+    return {
+        "base_price": p["base_price"],
+        "vehicle_price": p["per_vehicle"],
+        "trial_days": p["trial_days"],
+        "currency": p.get("currency", "AUD"),
+        "cadence": p.get("cadence", "monthly"),
+    }
+
+
+# ============== Developer: pricing config ==============
+
+@api_router.get("/developer/pricing")
+async def developer_get_pricing(
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Read the platform-wide pricing config + Stripe sync state."""
+    p = await get_pricing()
+    return {
+        "base_price": p["base_price"],
+        "per_vehicle": p["per_vehicle"],
+        "trial_days": p["trial_days"],
+        "currency": p.get("currency", "AUD"),
+        "cadence": p.get("cadence", "monthly"),
+        "stripe": p.get("stripe"),
+        "stripe_configured": bool(stripe.api_key),
+        "updated_at": p.get("updated_at"),
+    }
+
+
+class PricingUpdate(BaseModel):
+    base_price: Optional[float] = None
+    per_vehicle: Optional[float] = None
+    trial_days: Optional[int] = None
+    currency: Optional[str] = None
+    cadence: Optional[str] = None  # "monthly" | "annual"
+
+
+@api_router.put("/developer/pricing")
+async def developer_set_pricing(
+    payload: PricingUpdate,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Update platform pricing. Persists to platform_config and, when
+    Stripe is configured, also pushes new Price objects to Stripe.
+
+    Stripe push failures DO NOT fail the request — the local save is
+    authoritative; the response carries ``stripe_synced=false`` so the
+    UI can show a banner.
+    """
+    update: dict = {}
+    for k in ("base_price", "per_vehicle", "trial_days", "currency", "cadence"):
+        v = getattr(payload, k)
+        if v is None:
+            continue
+        if k in {"base_price", "per_vehicle"} and (v < 0 or v > 10000):
+            raise HTTPException(status_code=400, detail=f"{k} out of range")
+        if k == "trial_days" and (v < 0 or v > 365):
+            raise HTTPException(status_code=400, detail="trial_days must be 0-365")
+        if k == "cadence" and v not in {"monthly", "annual"}:
+            raise HTTPException(status_code=400, detail="cadence must be monthly or annual")
+        update[k] = v
+    if not update:
+        raise HTTPException(status_code=400, detail="No pricing fields provided")
+
+    update["updated_at"] = utcnow()
+    update["updated_by"] = str(current_user.get("_id"))
+
+    await db.platform_config.update_one(
+        {"_id": "pricing"},
+        {"$set": update},
+        upsert=True,
+    )
+
+    stripe_synced = False
+    stripe_error: Optional[str] = None
+    stripe_state: Optional[dict] = None
+    if stripe.api_key:
+        try:
+            current = await get_pricing()
+            currency = (current.get("currency") or "AUD").lower()
+            interval = "year" if current.get("cadence") == "annual" else "month"
+            # Create new Price for the base; vehicle add-on stays as a
+            # separate price object so we can vary per_vehicle without
+            # touching base. Stripe Prices are immutable, so we make
+            # new ones and archive the previous IDs (best-effort).
+            base_price_obj = stripe.Price.create(
+                currency=currency,
+                unit_amount=int(round(current["base_price"] * 100)),
+                recurring={"interval": interval},
+                product_data={"name": "FleetShield365 Pro — Base"},
+                metadata={"role": "base", "updated_at": update["updated_at"].isoformat()},
+            )
+            vehicle_price_obj = stripe.Price.create(
+                currency=currency,
+                unit_amount=int(round(current["per_vehicle"] * 100)),
+                recurring={"interval": interval},
+                product_data={"name": "FleetShield365 Pro — Per Vehicle"},
+                metadata={"role": "per_vehicle", "updated_at": update["updated_at"].isoformat()},
+            )
+
+            # Archive previous prices (non-fatal)
+            try:
+                prev = await db.platform_config.find_one({"_id": "pricing"})
+                old = (prev or {}).get("stripe") or {}
+                for old_id in [old.get("base_price_id"), old.get("vehicle_price_id")]:
+                    if old_id:
+                        try:
+                            stripe.Price.modify(old_id, active=False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            stripe_state = {
+                "base_price_id": base_price_obj.id,
+                "vehicle_price_id": vehicle_price_obj.id,
+                "synced_at": utcnow().isoformat(),
+            }
+            await db.platform_config.update_one(
+                {"_id": "pricing"},
+                {"$set": {"stripe": stripe_state}},
+            )
+            stripe_synced = True
+        except Exception as e:
+            logger.error(f"developer_set_pricing: Stripe sync failed: {e}")
+            stripe_error = str(e)
+
+    # Audit
+    try:
+        await log_audit_trail(
+            str(current_user.get("_id")),
+            "update", "pricing_config", "pricing",
+            "platform-owner-panel",
+            {"changes": {k: update.get(k) for k in update if k != "updated_at"}, "stripe_synced": stripe_synced},
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "stripe_configured": bool(stripe.api_key),
+        "stripe_synced": stripe_synced,
+        "stripe_error": stripe_error,
+        "stripe": stripe_state,
+    }
+
+
+# ============== Developer: server disk usage ==============
+
+@api_router.get("/developer/server-disk")
+async def developer_server_disk(
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Server-side disk usage for the owner Storage page.
+
+    Uses ``shutil.disk_usage`` on the EC2 root partition + a handful
+    of well-known mount points (Mongo data dir, MinIO data dir). All
+    sizes in bytes. The frontend formats to GB.
+    """
+    import shutil as _shutil
+    import os as _os
+
+    def _safe(p: str) -> Optional[dict]:
+        try:
+            usage = _shutil.disk_usage(p)
+            return {
+                "path": p,
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                "percent": round((usage.used / usage.total) * 100, 1) if usage.total else 0.0,
+            }
+        except Exception:
+            return None
+
+    def _dir_size(p: str) -> Optional[int]:
+        try:
+            total = 0
+            for dirpath, _dirnames, filenames in _os.walk(p):
+                for f in filenames:
+                    fp = _os.path.join(dirpath, f)
+                    try:
+                        total += _os.path.getsize(fp)
+                    except OSError:
+                        pass
+            return total
+        except Exception:
+            return None
+
+    root = _safe("/")
+    mongo = _safe("/var/lib/fleetshield365/mongo")
+    minio = _safe("/var/lib/fleetshield365/MinIO")
+    return {
+        "root": root,
+        "mongo": mongo,
+        "minio": minio,
+        "mongo_size_bytes": _dir_size("/var/lib/fleetshield365/mongo"),
+        "minio_size_bytes": _dir_size("/var/lib/fleetshield365/MinIO"),
+        "generated_at": utcnow().isoformat(),
+    }
+
+
+# ============== Developer: audit log viewer ==============
+
+@api_router.get("/developer/audit")
+async def developer_audit_log(
+    user_id: Optional[str] = None,
+    action: Optional[str] = None,
+    company_id: Optional[str] = None,
+    start: Optional[str] = None,  # ISO date
+    end: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Filterable audit-trail viewer for the owner panel."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+
+    query: dict = {}
+    if user_id:
+        query["user_id"] = user_id
+    if action:
+        query["action"] = {"$regex": action, "$options": "i"}
+    if company_id:
+        # audit_trail rows don't always store company_id — fall back to
+        # looking up which users belong to the company and filtering by
+        # those user_ids.
+        co_users = await db.users.find(
+            {"company_id": company_id},
+            {"_id": 1},
+        ).to_list(2000)
+        co_user_ids = [str(u["_id"]) for u in co_users]
+        if co_user_ids:
+            existing = query.get("user_id")
+            if existing:
+                # combine — both filters must match. user_id is single,
+                # so override with $in only if compatible.
+                query["user_id"] = {"$in": [existing] if isinstance(existing, str) else co_user_ids}
+            else:
+                query["user_id"] = {"$in": co_user_ids}
+        else:
+            return {"items": [], "total": 0, "page": page, "page_size": page_size}
+    if start:
+        try:
+            query.setdefault("timestamp", {})["$gte"] = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if end:
+        try:
+            query.setdefault("timestamp", {})["$lte"] = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    total = await db.audit_trail.count_documents(query)
+    rows = (
+        await db.audit_trail
+        .find(query)
+        .sort("timestamp", -1)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+        .to_list(page_size)
+    )
+
+    # Enrich
+    user_ids = list({str(r.get("user_id")) for r in rows if r.get("user_id")})
+    users = await db.users.find(
+        {"_id": {"$in": [ObjectId(u) for u in user_ids if ObjectId.is_valid(u)]}},
+        {"name": 1, "email": 1, "company_id": 1},
+    ).to_list(500)
+    user_map = {str(u["_id"]): u for u in users}
+    co_ids = list({u.get("company_id") for u in users if u.get("company_id")})
+    companies = await db.companies.find(
+        {"_id": {"$in": [ObjectId(c) for c in co_ids if ObjectId.is_valid(c)]}},
+        {"name": 1, "subdomain": 1},
+    ).to_list(500)
+    co_map = {str(c["_id"]): c for c in companies}
+
+    items = []
+    for r in rows:
+        u = user_map.get(str(r.get("user_id"))) or {}
+        co = co_map.get(str(u.get("company_id"))) or {}
+        items.append({
+            **serialize_doc(r),
+            "user_name": u.get("name") or u.get("email"),
+            "company_name": co.get("name"),
+            "company_subdomain": co.get("subdomain"),
+        })
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+# ============== Developer: broadcast email ==============
+
+_BROADCAST_LAST_RUN: dict = {"at": None}
+
+
+class BroadcastRequest(BaseModel):
+    subject: str
+    body: str
+    active_only: bool = True
+
+
+@api_router.post("/developer/broadcast")
+async def developer_broadcast(
+    payload: BroadcastRequest,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Send a broadcast email to every super_admin (per filter)."""
+    subj = (payload.subject or "").strip()
+    body = (payload.body or "").strip()
+    if not subj or not body:
+        raise HTTPException(status_code=400, detail="Subject and body are required")
+    if len(subj) > 200:
+        raise HTTPException(status_code=400, detail="Subject too long")
+    if len(body) > 20000:
+        raise HTTPException(status_code=400, detail="Body too long")
+
+    # 60-second rate limit so an accidental double-click doesn't double-blast.
+    now = utcnow()
+    last = _BROADCAST_LAST_RUN.get("at")
+    if last and (now - last).total_seconds() < 60:
+        raise HTTPException(status_code=429, detail="Broadcasts are limited to one per minute")
+    _BROADCAST_LAST_RUN["at"] = now
+
+    # Resolve company filter
+    company_query: dict = {}
+    if payload.active_only:
+        # Treat anything that's not explicitly "trial_expired" or
+        # "suspended" as active.
+        company_query["subscription_status"] = {"$nin": ["trial_expired", "suspended"]}
+    co_docs = await db.companies.find(company_query, {"_id": 1}).to_list(2000)
+    co_ids = [str(c["_id"]) for c in co_docs]
+    if not co_ids:
+        return {"sent": 0, "failed": 0, "recipients": 0}
+
+    recipients = await db.users.find(
+        {"company_id": {"$in": co_ids}, "role": UserRole.SUPER_ADMIN},
+        {"email": 1, "name": 1},
+    ).to_list(5000)
+
+    html_body = (
+        "<div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">"
+        + body.replace("\n", "<br/>")
+        + "<hr style=\"margin-top:24px; border:none; border-top:1px solid #e5e7eb;\"/>"
+        + "<p style=\"color:#94a3b8; font-size:12px;\">Sent from FleetShield365 platform team.</p>"
+        + "</div>"
+    )
+
+    sent = 0
+    failed = 0
+    for r in recipients:
+        addr = r.get("email")
+        if not addr:
+            continue
+        try:
+            await send_system_email(addr, subj, html_body) if "send_system_email" in globals() else await send_email_notification(addr, subj, html_body)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    try:
+        await log_audit_trail(
+            str(current_user.get("_id")),
+            "broadcast", "platform_email", "broadcast",
+            "platform-owner-panel",
+            {"subject": subj, "sent": sent, "failed": failed, "active_only": payload.active_only},
+        )
+    except Exception:
+        pass
+
+    return {"sent": sent, "failed": failed, "recipients": len(recipients)}
 
 
 @api_router.post("/developer/companies/{company_id}/suspend")
