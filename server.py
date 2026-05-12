@@ -437,6 +437,35 @@ async def _unhandled_exception_handler(request: _FastAPIRequest, exc: Exception)
         content={"detail": "Internal server error"},
     )
 
+
+# Log Pydantic validation errors with the offending fields so 422s are
+# debuggable in production without having to wire up a request body
+# logger. FastAPI's default handler returns the detail list to the
+# client but doesn't log it server-side — which means the first
+# investigation step (journalctl) yielded only "422 Unprocessable" and
+# we had to guess.
+from fastapi.exceptions import RequestValidationError as _RequestValidationError
+
+
+@app.exception_handler(_RequestValidationError)
+async def _validation_error_handler(request: _FastAPIRequest, exc: _RequestValidationError):
+    try:
+        compact = [
+            {
+                "loc": ".".join(str(p) for p in e.get("loc", []) if p != "body"),
+                "msg": e.get("msg"),
+                "type": e.get("type"),
+            }
+            for e in exc.errors()
+        ]
+    except Exception:
+        compact = []
+    logger.warning(
+        "422 validation on %s %s — %s",
+        request.method, request.url.path, compact,
+    )
+    return _JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 # Timezone helpers for consistent date/time handling
 from zoneinfo import ZoneInfo
 SYDNEY_TZ = ZoneInfo('Australia/Sydney')
