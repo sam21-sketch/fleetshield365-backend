@@ -548,23 +548,85 @@ def set_cached_stats(company_id: str, data: dict):
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# SMTP Configuration (Namecheap PrivateEmail)
-SMTP_HOST     = os.environ.get('SMTP_HOST', 'mail.privateemail.com')
-SMTP_PORT     = int(os.environ.get('SMTP_PORT', '465') or 465)
-SMTP_USER     = os.environ.get('SMTP_USER', '')
-SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
-SENDER_EMAIL  = os.environ.get('SENDER_EMAIL', 'alerts@fleetshield365.com')
+# SMTP Configuration (Namecheap PrivateEmail) — two mailboxes:
+#   alerts@   — operational alerts (inspections, incidents, expiries, summaries, contact)
+#   noreply@  — system emails (verification, invites, password reset)
+SMTP_HOST             = os.environ.get('SMTP_HOST', 'mail.privateemail.com')
+SMTP_PORT             = int(os.environ.get('SMTP_PORT', '465') or 465)
+SMTP_USER             = os.environ.get('SMTP_USER', '')
+SMTP_PASSWORD         = os.environ.get('SMTP_PASSWORD', '')
+SMTP_NOREPLY_USER     = os.environ.get('SMTP_NOREPLY_USER', '')
+SMTP_NOREPLY_PASSWORD = os.environ.get('SMTP_NOREPLY_PASSWORD', '')
+SENDER_EMAIL          = os.environ.get('SENDER_EMAIL', 'alerts@fleetshield365.com')
+NOREPLY_EMAIL         = os.environ.get('NOREPLY_EMAIL', 'noreply@fleetshield365.com')
 
-# ============== Email Notification Service ==============
+# Brand colour used in email templates.
+_BRAND_PRIMARY = "#0d9488"
+_BRAND_DARK    = "#0f172a"
 
-async def send_email_notification(to_email: str, subject: str, html_content: str):
-    """Send email notification via SMTP (Namecheap PrivateEmail)."""
-    if not SMTP_PASSWORD:
-        logger.warning("SMTP_PASSWORD not configured, skipping email")
+
+def _email_template_branded(heading: str, body_html: str, button_label: str = None, button_url: str = None) -> str:
+    """Render a branded FleetShield365 HTML email.
+
+    `body_html` is the main content block (one or more <p> tags). When
+    `button_label` and `button_url` are both supplied, a primary CTA button is
+    inserted between body and footer.
+    """
+    button_html = ""
+    if button_label and button_url:
+        button_html = (
+            f'<div style="text-align:center; margin:32px 0;">'
+            f'  <a href="{button_url}" '
+            f'     style="background-color:{_BRAND_PRIMARY}; color:#ffffff; padding:14px 32px; '
+            f'            text-decoration:none; border-radius:8px; font-weight:600; display:inline-block;">'
+            f'{button_label}</a>'
+            f'</div>'
+        )
+    return f"""
+    <html>
+    <body style="font-family:Arial,Helvetica,sans-serif; padding:20px; background-color:#f8fafc; margin:0;">
+      <div style="max-width:560px; margin:0 auto; background:#ffffff; padding:36px 32px; border-radius:14px; box-shadow:0 2px 8px rgba(15,23,42,0.06);">
+        <div style="text-align:center; margin-bottom:24px;">
+          <div style="display:inline-block; padding:10px 18px; background-color:{_BRAND_DARK}; border-radius:10px;">
+            <span style="color:{_BRAND_PRIMARY}; font-size:20px; font-weight:700; letter-spacing:0.5px;">FleetShield365</span>
+          </div>
+        </div>
+        <h2 style="color:{_BRAND_DARK}; margin:0 0 16px 0; font-size:22px;">{heading}</h2>
+        <div style="color:#475569; font-size:15px; line-height:1.6;">
+          {body_html}
+        </div>
+        {button_html}
+        <hr style="border:none; border-top:1px solid #e2e8f0; margin:28px 0 16px 0;">
+        <p style="color:#94a3b8; font-size:12px; margin:0; text-align:center;">
+          FleetShield365 — Equipment Inspection &amp; Fleet Management<br>
+          This is an automated message. Please do not reply directly.
+        </p>
+      </div>
+    </body>
+    </html>
+    """
+
+
+async def _send_via_smtp(to_email: str, subject: str, html_content: str, *, sender: str = "alerts") -> bool:
+    """Internal helper. Routes to one of two mailboxes:
+       sender="alerts"  → alerts@   (operational alerts; uses SMTP_USER/SMTP_PASSWORD)
+       sender="noreply" → noreply@  (system emails; uses SMTP_NOREPLY_USER/SMTP_NOREPLY_PASSWORD)
+    """
+    if sender == "noreply":
+        from_addr = SMTP_NOREPLY_USER or NOREPLY_EMAIL
+        password  = SMTP_NOREPLY_PASSWORD
+        from_name = "FleetShield365"
+    else:
+        from_addr = SMTP_USER or SENDER_EMAIL
+        password  = SMTP_PASSWORD
+        from_name = "FleetShield365 Alerts"
+
+    if not password:
+        logger.warning(f"[SMTP:{sender}] mailbox password not configured, skipping email to {to_email}")
         return False
     try:
         msg = EmailMessage()
-        msg["From"]    = f"FleetShield365 Alerts <{SENDER_EMAIL}>"
+        msg["From"]    = f"{from_name} <{from_addr}>"
         msg["To"]      = to_email
         msg["Subject"] = subject
         msg.set_content("This email requires an HTML-capable mail client.")
@@ -573,17 +635,27 @@ async def send_email_notification(to_email: str, subject: str, html_content: str
             msg,
             hostname=SMTP_HOST,
             port=SMTP_PORT,
-            username=SMTP_USER or SENDER_EMAIL,
-            password=SMTP_PASSWORD,
+            username=from_addr,
+            password=password,
             use_tls=(SMTP_PORT == 465),
             start_tls=(SMTP_PORT == 587),
             timeout=30,
         )
-        logger.info(f"[SMTP] Email sent to {to_email}: {subject}")
+        logger.info(f"[SMTP:{sender}] Email sent to {to_email}: {subject}")
         return True
     except Exception as e:
-        logger.error(f"[SMTP] Error sending email to {to_email}: {e}")
+        logger.error(f"[SMTP:{sender}] Error sending email to {to_email}: {e}")
         return False
+
+
+async def send_email_notification(to_email: str, subject: str, html_content: str):
+    """Send an operational/alert email via the alerts@ mailbox."""
+    return await _send_via_smtp(to_email, subject, html_content, sender="alerts")
+
+
+async def send_system_email(to_email: str, subject: str, html_content: str):
+    """Send a system email (verification, invite, password reset) via the noreply@ mailbox."""
+    return await _send_via_smtp(to_email, subject, html_content, sender="noreply")
 
 async def send_expiry_alert_email(admin_email: str, company_name: str, alerts: List[dict]):
     """Send expiry alert email to admin"""
@@ -2405,10 +2477,12 @@ class EmailService:
     """SMTP email service for sending notifications, with DB logging."""
 
     @staticmethod
-    async def send_email(to_email: str, subject: str, body: str, company_id: str = None, is_html: bool = True):
+    async def send_email(to_email: str, subject: str, body: str, company_id: str = None, is_html: bool = True, sender: str = "alerts"):
         """
-        Send email via SMTP (Namecheap PrivateEmail). Falls back to mock-log when SMTP is not configured.
+        Send email via SMTP (Namecheap PrivateEmail). Falls back to mock-log when the mailbox
+        password is not configured. `sender` selects which mailbox: "alerts" or "noreply".
         """
+        password_configured = (SMTP_NOREPLY_PASSWORD if sender == "noreply" else SMTP_PASSWORD)
         email_log = {
             "to_email":   to_email,
             "subject":    subject,
@@ -2416,41 +2490,15 @@ class EmailService:
             "company_id": company_id,
             "sent_at":    datetime.utcnow(),
             "status":     "pending",
-            "provider":   "smtp" if SMTP_PASSWORD else "mock",
+            "provider":   f"smtp:{sender}" if password_configured else "mock",
         }
 
-        if SMTP_PASSWORD:
-            try:
-                msg = EmailMessage()
-                msg["From"]    = SENDER_EMAIL
-                msg["To"]      = to_email
-                msg["Subject"] = subject
-                if is_html:
-                    msg.set_content("This email requires an HTML-capable mail client.")
-                    msg.add_alternative(body, subtype="html")
-                else:
-                    msg.set_content(body)
-                await aiosmtplib.send(
-                    msg,
-                    hostname=SMTP_HOST,
-                    port=SMTP_PORT,
-                    username=SMTP_USER or SENDER_EMAIL,
-                    password=SMTP_PASSWORD,
-                    use_tls=(SMTP_PORT == 465),
-                    start_tls=(SMTP_PORT == 587),
-                    timeout=30,
-                )
-                email_log["status"] = "sent"
-                logger.info(f"[SMTP] Email sent to {to_email}: {subject}")
-            except Exception as e:
-                email_log["status"] = "failed"
-                email_log["error"]  = str(e)
-                logger.error(f"[SMTP] Error sending email to {to_email}: {e}")
+        if password_configured:
+            html_body = body if is_html else f"<pre>{body}</pre>"
+            ok = await _send_via_smtp(to_email, subject, html_body, sender=sender)
+            email_log["status"] = "sent" if ok else "failed"
         else:
-            # Mock mode — log only, do not actually send
-            logger.info(f"[MOCK EMAIL] To: {to_email}")
-            logger.info(f"[MOCK EMAIL] Subject: {subject}")
-            logger.info(f"[MOCK EMAIL] Body: {body[:200]}...")
+            logger.info(f"[MOCK EMAIL:{sender}] To: {to_email} | Subject: {subject}")
             email_log["status"] = "mocked"
 
         await db.email_logs.insert_one(email_log)
@@ -2880,28 +2928,24 @@ async def forgot_password(request: ForgotPasswordRequest):
         validated_origin = DEFAULT_ORIGIN_URL.rstrip('/')
 
     reset_url = f"{validated_origin}/reset-password?token={reset_token}"
-    html_content = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f8fafc;">
-        <div style="max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px;">
-            <h2 style="color: #0f172a; margin-bottom: 20px;">Reset Your Password</h2>
-            <p style="color: #475569;">Hi {user.get('name', 'there')},</p>
-            <p style="color: #475569;">We received a request to reset your FleetShield365 password. Click the button below to set a new password:</p>
-            <div style="text-align: center; margin: 30px 0;">
-                <a href="{reset_url}" style="background-color: #0d9488; color: white; padding: 12px 30px; text-decoration: none; border-radius: 8px; font-weight: bold;">Reset Password</a>
-            </div>
-            <p style="color: #94a3b8; font-size: 14px;">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
-            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;">
-            <p style="color: #94a3b8; font-size: 12px;">FleetShield365 - Equipment Inspection Management</p>
-        </div>
-    </body>
-    </html>
-    """
-    
-    await send_email_notification(
+    body = (
+        f"<p>Hi {user.get('name', 'there')},</p>"
+        f"<p>We received a request to reset your FleetShield365 password. "
+        f"Click the button below to set a new password.</p>"
+        f"<p style='color:#94a3b8; font-size:13px;'>This link expires in 1 hour. "
+        f"If you didn't request a reset, you can safely ignore this email.</p>"
+    )
+    html_content = _email_template_branded(
+        heading="Reset your password",
+        body_html=body,
+        button_label="Reset Password",
+        button_url=reset_url,
+    )
+
+    await send_system_email(
         request.email,
-        "[FleetShield365] Reset Your Password",
-        html_content
+        "[FleetShield365] Reset your password",
+        html_content,
     )
     
     return {"message": "If an account exists with this email, you will receive a password reset link."}
@@ -2910,29 +2954,235 @@ async def forgot_password(request: ForgotPasswordRequest):
 async def reset_password(request: ResetPasswordRequest):
     """Reset password using token"""
     reset_record = await db.password_resets.find_one({"token": request.token})
-    
+
     if not reset_record:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
-    
+
     # Check expiration
     if datetime.utcnow() > reset_record["expires_at"]:
         await db.password_resets.delete_one({"token": request.token})
         raise HTTPException(status_code=400, detail="Reset token has expired")
-    
+
     # Validate password
     if len(request.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    
+
     # Update password
     await db.users.update_one(
         {"_id": ObjectId(reset_record["user_id"])},
         {"$set": {"password_hash": get_password_hash(request.new_password)}}
     )
-    
+
     # Delete used token
     await db.password_resets.delete_one({"token": request.token})
-    
+
     return {"message": "Password reset successfully. You can now log in with your new password."}
+
+
+# ============== Email Verification + Invite Flow ==============
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+    origin_url: str = DEFAULT_ORIGIN_URL
+
+class InviteUserRequest(BaseModel):
+    email: str
+    name: str
+    role: str  # "admin" or "driver" (super_admin can also invite admin; admin can invite driver)
+    origin_url: str = DEFAULT_ORIGIN_URL
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+async def _issue_email_token(user_id: str, token_type: str, ttl_hours: int = 24) -> str:
+    """Create a fresh single-use token of `token_type` ("verify" or "invite") for `user_id`."""
+    import secrets
+    token = secrets.token_urlsafe(32)
+    await db.email_tokens.insert_one({
+        "token": token,
+        "user_id": user_id,
+        "type": token_type,
+        "expires_at": datetime.utcnow() + timedelta(hours=ttl_hours),
+        "created_at": datetime.utcnow(),
+    })
+    return token
+
+
+async def send_verification_email(user_email: str, user_name: str, token: str, origin_url: str) -> bool:
+    """Send a branded email-verification email via the noreply mailbox."""
+    if not _is_allowed_origin(origin_url):
+        origin_url = DEFAULT_ORIGIN_URL
+    verify_url = f"{origin_url.rstrip('/')}/verify-email?token={token}"
+    body = (
+        f"<p>Hi {user_name or 'there'},</p>"
+        f"<p>Welcome to <strong>FleetShield365</strong>. Please confirm this email "
+        f"address so we know it's really you. Click the button below to verify "
+        f"your account.</p>"
+        f"<p style='color:#94a3b8; font-size:13px;'>This link expires in 24 hours.</p>"
+    )
+    html = _email_template_branded(
+        heading="Verify your email",
+        body_html=body,
+        button_label="Verify Email",
+        button_url=verify_url,
+    )
+    return await send_system_email(user_email, "[FleetShield365] Verify your email address", html)
+
+
+async def send_invite_email(user_email: str, user_name: str, inviter_name: str,
+                            company_name: str, role: str, token: str, origin_url: str) -> bool:
+    """Send a branded invite email with a set-password link via the noreply mailbox."""
+    if not _is_allowed_origin(origin_url):
+        origin_url = DEFAULT_ORIGIN_URL
+    setup_url = f"{origin_url.rstrip('/')}/set-password?token={token}"
+    role_label = {"super_admin": "Company Owner", "admin": "Admin", "driver": "Operator"}.get(role, role)
+    body = (
+        f"<p>Hi {user_name or 'there'},</p>"
+        f"<p><strong>{inviter_name}</strong> has invited you to join "
+        f"<strong>{company_name}</strong> on FleetShield365 as a <strong>{role_label}</strong>.</p>"
+        f"<p>Click the button below to set your password and activate your account.</p>"
+        f"<p style='color:#94a3b8; font-size:13px;'>This invite link expires in 7 days.</p>"
+    )
+    html = _email_template_branded(
+        heading="You've been invited to FleetShield365",
+        body_html=body,
+        button_label="Set Password & Sign In",
+        button_url=setup_url,
+    )
+    return await send_system_email(user_email, f"[FleetShield365] You've been invited to {company_name}", html)
+
+
+@api_router.post("/auth/verify-email")
+async def verify_email(request: VerifyEmailRequest):
+    """Mark the user's email as verified using a token from the verification email."""
+    token_record = await db.email_tokens.find_one({"token": request.token, "type": "verify"})
+    if not token_record:
+        raise HTTPException(status_code=400, detail="Invalid or already-used verification link")
+    if datetime.utcnow() > token_record["expires_at"]:
+        await db.email_tokens.delete_one({"_id": token_record["_id"]})
+        raise HTTPException(status_code=400, detail="Verification link has expired. Please request a new one.")
+
+    await db.users.update_one(
+        {"_id": ObjectId(token_record["user_id"])},
+        {"$set": {"email_verified": True, "email_verified_at": datetime.utcnow()}}
+    )
+    await db.email_tokens.delete_one({"_id": token_record["_id"]})
+    return {"message": "Email verified successfully. You can now use all features of your account."}
+
+
+@api_router.post("/auth/resend-verification")
+async def resend_verification(request: ResendVerificationRequest):
+    """Re-send the verification email. Always returns the same response to avoid email enumeration."""
+    user = await db.users.find_one({"email": request.email.lower()})
+    if not user:
+        return {"message": "If an account with this email exists, a verification email has been sent."}
+    if user.get("email_verified"):
+        return {"message": "This email is already verified. You can sign in."}
+
+    # Invalidate any prior verify tokens for this user.
+    await db.email_tokens.delete_many({"user_id": str(user["_id"]), "type": "verify"})
+    token = await _issue_email_token(str(user["_id"]), "verify", ttl_hours=24)
+    await send_verification_email(user["email"], user.get("name", ""), token, request.origin_url)
+    return {"message": "If an account with this email exists, a verification email has been sent."}
+
+
+@api_router.post("/users/invite")
+async def invite_user(request: InviteUserRequest, current_user: dict = Depends(get_current_user)):
+    """Invite an admin or driver to the current user's company.
+
+    - super_admin can invite admin OR driver.
+    - admin can invite driver only (not another admin).
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized to invite users")
+
+    target_role = request.role.strip().lower()
+    if target_role not in {"admin", "driver"}:
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'driver'")
+    if target_role == "admin" and current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only the Company Owner can invite other admins")
+
+    email_lower = request.email.strip().lower()
+    if not email_lower or "@" not in email_lower:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+
+    # Reject if a user with this email already exists (any company)
+    existing = await db.users.find_one({"email": email_lower})
+    if existing:
+        raise HTTPException(status_code=409, detail="A user with this email already exists")
+
+    # Look up company for the email body
+    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
+    company_name = company.get("name", "your team") if company else "your team"
+
+    # Create the invited user in a pending state (no usable password yet).
+    user_doc = {
+        "email": email_lower,
+        "password_hash": "",  # set when invite accepted
+        "name": request.name.strip() or email_lower.split("@")[0],
+        "role": target_role,
+        "company_id": current_user["company_id"],
+        "email_verified": False,
+        "invite_pending": True,
+        "invited_by": current_user["id"],
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    user_result = await db.users.insert_one(user_doc)
+    user_id = str(user_result.inserted_id)
+
+    token = await _issue_email_token(user_id, "invite", ttl_hours=24 * 7)
+    sent = await send_invite_email(
+        email_lower,
+        user_doc["name"],
+        current_user.get("name", "Your admin"),
+        company_name,
+        target_role,
+        token,
+        request.origin_url,
+    )
+
+    return {
+        "message": f"Invite sent to {email_lower}",
+        "user_id": user_id,
+        "email_sent": sent,
+    }
+
+
+@api_router.post("/auth/accept-invite")
+async def accept_invite(request: AcceptInviteRequest):
+    """Set the password for an invited user using the invite token. Marks email_verified=True."""
+    token_record = await db.email_tokens.find_one({"token": request.token, "type": "invite"})
+    if not token_record:
+        raise HTTPException(status_code=400, detail="Invalid or already-used invite link")
+    if datetime.utcnow() > token_record["expires_at"]:
+        await db.email_tokens.delete_one({"_id": token_record["_id"]})
+        raise HTTPException(status_code=400, detail="Invite link has expired. Please ask your admin to re-invite you.")
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    user_id = token_record["user_id"]
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {
+            "password_hash": get_password_hash(request.new_password),
+            "email_verified": True,
+            "email_verified_at": datetime.utcnow(),
+            "invite_pending": False,
+            "invite_accepted_at": datetime.utcnow(),
+        }}
+    )
+    await db.email_tokens.delete_one({"_id": token_record["_id"]})
+
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    return {
+        "message": "Account activated. You can now sign in.",
+        "email": user.get("email"),
+    }
 
 # ============== Email Test Route ==============
 
@@ -7619,10 +7869,20 @@ async def register_company(data: CompanyRegister):
         "name": data.name,
         "role": user_role,
         "company_id": company_id,
+        "email_verified": False,
         "created_at": datetime.utcnow().isoformat(),
     }
     user_result = await db.users.insert_one(user_doc)
     user_id = str(user_result.inserted_id)
+
+    # Send email-verification link via the noreply mailbox. Failure here must
+    # NOT block sign-up; the user can request a resend via /auth/resend-verification.
+    try:
+        verify_token = await _issue_email_token(user_id, "verify", ttl_hours=24)
+        verify_origin = data.origin_url if (data.origin_url and _is_allowed_origin(data.origin_url)) else DEFAULT_ORIGIN_URL
+        await send_verification_email(data.email, data.name, verify_token, verify_origin)
+    except Exception as e:
+        logger.error(f"register_company: failed to send verification email to {data.email}: {e}")
     
     # If Stripe is configured, create checkout session
     checkout_url = None
@@ -7723,6 +7983,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "name": current_user["name"],
         "role": current_user.get("role", "driver"),
         "company_name": company["name"] if company else None,
+        "email_verified": bool(current_user.get("email_verified", False)),
     }
     
     return {
