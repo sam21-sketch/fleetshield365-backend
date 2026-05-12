@@ -280,7 +280,12 @@ if "replicaSet=" not in MONGO_URL:
 # JWT Configuration
 SECRET_KEY = JWT_SECRET
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 24
+# Default token TTL — 30 days. Long-lived sessions keep drivers
+# from being bounced to the login screen mid-shift. The Phase 3
+# revocation list (/auth/logout + revoked_tokens) is what
+# actually ends sessions early when needed; expiry is the safety
+# net.
+ACCESS_TOKEN_EXPIRE_HOURS = 24 * 30
 
 # Create the main app
 app = FastAPI(title="FleetShield365 API")
@@ -3935,7 +3940,10 @@ async def login(credentials: UserLogin, request: Request):
     )
     
     # Token expiry based on "remember me" option
-    expires_delta = timedelta(days=30) if credentials.remember_me else timedelta(days=1)
+    # Always 30-day sessions now — user requested. ``remember_me`` kept
+    # in the request schema for backward compat but no longer changes
+    # the TTL. Phase 3 revocation list ends a session early on logout.
+    expires_delta = timedelta(days=30)
     token = await _mint_access_token(
         str(user["_id"]),
         user_doc=user,
