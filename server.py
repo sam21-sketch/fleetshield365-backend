@@ -1881,6 +1881,43 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode.setdefault("jti", uuid.uuid4().hex)
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+
+# In-process throttle for the last_active_at writeback. We don't want
+# a logged-in driver doing 20 requests in a minute to trigger 20 Mongo
+# writes for the same field. The map is bounded and ephemeral per
+# worker; missing entries just mean a fresh write happens (idempotent).
+_LAST_ACTIVE_CACHE: dict = {}
+_LAST_ACTIVE_THROTTLE_S = 60
+
+
+def _touch_last_active(user_id: str) -> None:
+    import time as _time
+    now_ts = _time.time()
+    last = _LAST_ACTIVE_CACHE.get(user_id)
+    if last is not None and (now_ts - last) < _LAST_ACTIVE_THROTTLE_S:
+        return
+    _LAST_ACTIVE_CACHE[user_id] = now_ts
+    # Bound the cache so a long-running worker doesn't grow unbounded.
+    if len(_LAST_ACTIVE_CACHE) > 5000:
+        # Drop the oldest half — cheap O(n) pass, runs at most once per
+        # 5000 distinct user IDs which is well past the realistic ceiling.
+        cutoff = sorted(_LAST_ACTIVE_CACHE.values())[len(_LAST_ACTIVE_CACHE) // 2]
+        for k in list(_LAST_ACTIVE_CACHE):
+            if _LAST_ACTIVE_CACHE[k] <= cutoff:
+                _LAST_ACTIVE_CACHE.pop(k, None)
+    # Fire and forget — we don't want to add per-request latency for
+    # a non-critical telemetry write.
+    try:
+        asyncio.create_task(
+            db.users.update_one(
+                {"_id": ObjectId(user_id)},
+                {"$set": {"last_active_at": utcnow()}},
+            )
+        )
+    except Exception:
+        pass
+
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
@@ -1959,6 +1996,16 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user['jwt_role'] = payload.get('role')
         user['jwt_company_id'] = payload.get('company_id')
         user['jwt_subdomain'] = payload.get('subdomain')
+
+        # Touch users.last_active_at — throttled to once per 60 s per
+        # user via an in-process LRU so a logged-in driver doing rapid
+        # requests doesn't generate one Mongo write per request. The
+        # field powers the owner-panel "inactive organizations" view.
+        try:
+            _touch_last_active(str(user["_id"]))
+        except Exception:
+            pass
+
         return user
     except HTTPException:
         raise
@@ -4052,6 +4099,21 @@ async def login(credentials: UserLogin, request: Request):
         if company_doc:
             company_timezone = company_doc.get("timezone", DEFAULT_TIMEZONE)
             company_subdomain = company_doc.get("subdomain")
+
+    # Flip the invitation status to 'accepted' the first time a driver
+    # successfully signs in after being invited. Idempotent — only
+    # writes if the current status is 'invited'.
+    try:
+        if user.get("invite_status") == "invited":
+            await db.users.update_one(
+                {"_id": user["_id"], "invite_status": "invited"},
+                {"$set": {
+                    "invite_status": "accepted",
+                    "invite_accepted_at": utcnow(),
+                }},
+            )
+    except Exception:
+        pass
 
     # Add company timezone to user data. Phase 3 — sanitize so
     # password_hash never reaches the wire.
@@ -7309,8 +7371,23 @@ async def send_driver_credentials(driver_id: str, current_user: dict = Depends(g
     
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send email. Please check email configuration.")
-    
-    return {"message": f"Credentials sent to {driver_email}"}
+
+    # Mark the invitation as sent. The web Drivers panel reads this to
+    # show "Invitation sent on …" badges instead of the user wondering
+    # whether they already invited the driver. invite_status flips to
+    # 'accepted' the first time the driver successfully logs in (set
+    # in the login endpoint, see below).
+    now_ts = utcnow()
+    await db.users.update_one(
+        {"_id": ObjectId(driver_id)},
+        {"$set": {
+            "invite_sent_at": now_ts,
+            "invite_status": "invited",
+            "last_invite_email": driver_email,
+        }},
+    )
+
+    return {"message": f"Credentials sent to {driver_email}", "invite_sent_at": now_ts.isoformat()}
 
 async def check_driver_expiry_alerts(driver_id: str, company_id: str):
     """Check driver document expiry dates and create alerts at 60, 30, 14, 7 day intervals"""
@@ -11705,6 +11782,346 @@ async def developer_broadcast(
         pass
 
     return {"sent": sent, "failed": failed, "recipients": len(recipients)}
+
+
+# ============== Owner-panel: org summary + charts ==============
+
+@api_router.get("/developer/orgs/summary")
+async def developer_orgs_summary(
+    current_user: dict = Depends(require_platform_owner),
+):
+    """One row per tenant with all the fields the Organizations page
+    needs. Computed off existing data — vehicle count, user count,
+    subscription status, suspended flag, derived last_active_at and
+    inactive_days. Cheap aggregations, fine to call on every page
+    load (the owner panel is internal/low-volume)."""
+    now = utcnow()
+    companies = await db.companies.find({}, {
+        "name": 1, "subdomain": 1, "subscription_status": 1, "subscription_plan": 1,
+        "trial_end": 1, "vehicle_count": 1, "suspended": 1, "suspended_at": 1,
+        "suspended_reason": 1, "created_at": 1, "deleted_at": 1,
+    }).to_list(2000)
+    companies = [c for c in companies if not c.get("deleted_at")]
+    co_ids = [str(c["_id"]) for c in companies]
+
+    # Fan-out user counts + last_active per company in one pass each.
+    user_rows = await db.users.find(
+        {"company_id": {"$in": co_ids}},
+        {"company_id": 1, "role": 1, "last_active_at": 1, "deleted_at": 1, "email": 1, "name": 1, "is_frozen": 1},
+    ).to_list(20000)
+    by_co: dict = {}
+    for u in user_rows:
+        if u.get("deleted_at"):
+            continue
+        cid = u.get("company_id")
+        bucket = by_co.setdefault(cid, {
+            "user_count": 0, "owner": None, "last_active": None,
+        })
+        bucket["user_count"] += 1
+        if u.get("role") == UserRole.SUPER_ADMIN and bucket["owner"] is None:
+            bucket["owner"] = {
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "email": u.get("email"),
+                "is_frozen": bool(u.get("is_frozen")),
+            }
+        la = u.get("last_active_at")
+        if la and (bucket["last_active"] is None or la > bucket["last_active"]):
+            bucket["last_active"] = la
+
+    rows = []
+    for c in companies:
+        cid = str(c["_id"])
+        bucket = by_co.get(cid, {"user_count": 0, "owner": None, "last_active": None})
+        last_active = bucket["last_active"]
+        inactive_days: Optional[int] = None
+        if last_active and isinstance(last_active, datetime):
+            inactive_days = max(0, (now - last_active).days)
+
+        trial_end = c.get("trial_end")
+        trial_days_left: Optional[int] = None
+        if trial_end:
+            try:
+                te = trial_end if isinstance(trial_end, datetime) else datetime.fromisoformat(str(trial_end).replace("Z", "+00:00"))
+                if te.tzinfo:
+                    te = te.astimezone(timezone.utc).replace(tzinfo=None)
+                trial_days_left = (te - now).days
+            except Exception:
+                trial_days_left = None
+
+        rows.append({
+            "id": cid,
+            "name": c.get("name"),
+            "subdomain": c.get("subdomain"),
+            "subscription_status": c.get("subscription_status"),
+            "subscription_plan": c.get("subscription_plan"),
+            "trial_end": trial_end.isoformat() if isinstance(trial_end, datetime) else trial_end,
+            "trial_days_left": trial_days_left,
+            "vehicle_count": c.get("vehicle_count") or 0,
+            "user_count": bucket["user_count"],
+            "suspended": bool(c.get("suspended")),
+            "suspended_at": c.get("suspended_at").isoformat() if isinstance(c.get("suspended_at"), datetime) else c.get("suspended_at"),
+            "suspended_reason": c.get("suspended_reason"),
+            "created_at": c.get("created_at").isoformat() if isinstance(c.get("created_at"), datetime) else c.get("created_at"),
+            "last_active_at": last_active.isoformat() if isinstance(last_active, datetime) else None,
+            "inactive_days": inactive_days,
+            "owner": bucket["owner"],
+        })
+    rows.sort(key=lambda r: (r.get("name") or "").lower())
+    return {"items": rows, "count": len(rows)}
+
+
+@api_router.get("/developer/charts/revenue")
+async def developer_revenue_chart(
+    days: int = 30,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Daily PROJECTED revenue series. Computed from current pricing
+    × active tenants. Real (Stripe-reported) revenue can replace this
+    once a non-trivial number of subscriptions are live."""
+    days = max(1, min(days, 365))
+    pricing = await get_pricing()
+    base = float(pricing.get("base_price") or 0)
+    per_vehicle = float(pricing.get("per_vehicle") or 0)
+
+    # For each day in the window, count tenants that were created on
+    # or before that day, are active (not suspended, not trial_expired),
+    # and were not deleted before that day. Single in-memory pass.
+    companies = await db.companies.find({}, {
+        "subscription_status": 1, "suspended": 1, "vehicle_count": 1,
+        "created_at": 1, "deleted_at": 1,
+    }).to_list(5000)
+
+    def _as_dt(v) -> Optional[datetime]:
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=None) if v.tzinfo else v
+        if isinstance(v, str):
+            try:
+                d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                return d.astimezone(timezone.utc).replace(tzinfo=None) if d.tzinfo else d
+            except Exception:
+                return None
+        return None
+
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    series = []
+    for d in range(days - 1, -1, -1):
+        day = today - timedelta(days=d)
+        day_end = day + timedelta(days=1)
+        revenue = 0.0
+        for c in companies:
+            created = _as_dt(c.get("created_at"))
+            deleted = _as_dt(c.get("deleted_at"))
+            if created is None or created >= day_end:
+                continue
+            if deleted is not None and deleted < day_end:
+                continue
+            if c.get("suspended"):
+                continue
+            if c.get("subscription_status") == "trial_expired":
+                continue
+            vc = int(c.get("vehicle_count") or 0)
+            revenue += base + per_vehicle * vc
+        series.append({"date": day.strftime("%Y-%m-%d"), "revenue": round(revenue, 2)})
+    return {"series": series, "currency": pricing.get("currency", "AUD")}
+
+
+@api_router.get("/developer/charts/activity")
+async def developer_activity_chart(
+    days: int = 30,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Daily platform-wide counts of inspections / fuel logs / incidents."""
+    days = max(1, min(days, 365))
+    now = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = now - timedelta(days=days - 1)
+
+    async def _bucket(collection_name: str, field: str = "timestamp"):
+        cur = db[collection_name].aggregate([
+            {"$match": {field: {"$gte": start}}},
+            {"$project": {
+                "day": {"$dateToString": {"format": "%Y-%m-%d", "date": f"${field}"}}
+            }},
+            {"$group": {"_id": "$day", "n": {"$sum": 1}}},
+        ])
+        out: dict = {}
+        async for r in cur:
+            out[r["_id"]] = r["n"]
+        return out
+
+    insp = await _bucket("inspections", "timestamp")
+    fuel = await _bucket("fuel_submissions", "timestamp")
+    inc = await _bucket("incidents", "created_at")
+
+    series = []
+    for d in range(days - 1, -1, -1):
+        key = (now - timedelta(days=d)).strftime("%Y-%m-%d")
+        series.append({
+            "date": key,
+            "inspections": insp.get(key, 0),
+            "fuel": fuel.get(key, 0),
+            "incidents": inc.get(key, 0),
+        })
+    return {"series": series}
+
+
+# ============== Owner-panel: one-off user + org email ==============
+
+class OwnerEmailMessage(BaseModel):
+    subject: str
+    body: str
+
+
+@api_router.get("/developer/users/{user_id}")
+async def developer_get_user(
+    user_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return sanitize_user_doc(serialize_doc(user))
+
+
+@api_router.post("/developer/users/{user_id}/send-email")
+async def developer_email_user(
+    user_id: str,
+    payload: OwnerEmailMessage,
+    current_user: dict = Depends(require_platform_owner),
+):
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    addr = user.get("email")
+    if not addr:
+        raise HTTPException(status_code=400, detail="User has no email on file")
+    subj = (payload.subject or "").strip()
+    body = (payload.body or "").strip()
+    if not subj or not body:
+        raise HTTPException(status_code=400, detail="Subject and body are required")
+    html_body = (
+        "<div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">"
+        + body.replace("\n", "<br/>")
+        + "<hr style=\"margin-top:24px; border:none; border-top:1px solid #e5e7eb;\"/>"
+        + "<p style=\"color:#94a3b8; font-size:12px;\">Sent from FleetShield365 platform team.</p>"
+        + "</div>"
+    )
+    sender_helper = globals().get("send_system_email") or send_email_notification
+    try:
+        await sender_helper(addr, subj, html_body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Send failed: {e}")
+    try:
+        await log_audit_trail(
+            str(current_user.get("_id")),
+            "owner_email_user", "user", user_id,
+            "platform-owner-panel",
+            {"subject": subj, "to": addr},
+        )
+    except Exception:
+        pass
+    return {"ok": True, "sent_to": addr}
+
+
+@api_router.post("/developer/companies/{company_id}/send-email-owner")
+async def developer_email_org_owner(
+    company_id: str,
+    payload: OwnerEmailMessage,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Send a one-off message to the super_admin of a tenant. If the
+    tenant has multiple super_admins they all receive it."""
+    owners = await db.users.find(
+        {"company_id": company_id, "role": UserRole.SUPER_ADMIN},
+        {"email": 1, "name": 1},
+    ).to_list(20)
+    targets = [u for u in owners if u.get("email")]
+    if not targets:
+        raise HTTPException(status_code=400, detail="No super_admin with email on file for this tenant")
+    subj = (payload.subject or "").strip()
+    body = (payload.body or "").strip()
+    if not subj or not body:
+        raise HTTPException(status_code=400, detail="Subject and body are required")
+    html_body = (
+        "<div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">"
+        + body.replace("\n", "<br/>")
+        + "<hr style=\"margin-top:24px; border:none; border-top:1px solid #e5e7eb;\"/>"
+        + "<p style=\"color:#94a3b8; font-size:12px;\">Sent from FleetShield365 platform team.</p>"
+        + "</div>"
+    )
+    sender_helper = globals().get("send_system_email") or send_email_notification
+    sent = 0
+    failed = 0
+    for o in targets:
+        try:
+            await sender_helper(o["email"], subj, html_body)
+            sent += 1
+        except Exception:
+            failed += 1
+    try:
+        await log_audit_trail(
+            str(current_user.get("_id")),
+            "owner_email_org", "company", company_id,
+            "platform-owner-panel",
+            {"subject": subj, "sent": sent, "failed": failed},
+        )
+    except Exception:
+        pass
+    return {"ok": True, "sent": sent, "failed": failed, "recipients": [o["email"] for o in targets]}
+
+
+# ============== Owner-panel: landing-media config ==============
+
+@api_router.get("/landing/media")
+async def public_landing_media():
+    """Public endpoint — landing page hits this to render the
+    'See it in the field' photo strip. Owner panel writes via PUT."""
+    doc = await db.platform_config.find_one({"_id": "landing_media"})
+    if doc and isinstance(doc.get("items"), list) and doc["items"]:
+        return {"items": doc["items"]}
+    # Defaults: hand-picked Unsplash sources, royalty-free.
+    return {"items": _DEFAULT_LANDING_MEDIA}
+
+
+class LandingMediaItem(BaseModel):
+    key: str
+    title: str
+    url: str
+    alt: Optional[str] = None
+
+
+class LandingMediaUpdate(BaseModel):
+    items: List[LandingMediaItem]
+
+
+@api_router.put("/developer/landing-media")
+async def developer_set_landing_media(
+    payload: LandingMediaUpdate,
+    current_user: dict = Depends(require_platform_owner),
+):
+    items = [it.dict() for it in payload.items]
+    await db.platform_config.update_one(
+        {"_id": "landing_media"},
+        {"$set": {"items": items, "updated_at": utcnow(), "updated_by": str(current_user.get("_id"))}},
+        upsert=True,
+    )
+    return {"ok": True, "count": len(items)}
+
+
+_DEFAULT_LANDING_MEDIA: List[dict] = [
+    {"key": "trucks",     "title": "Prime movers",          "alt": "Heavy truck on a highway at dusk",
+     "url": "https://images.unsplash.com/photo-1601584115197-04ecc0da31d7?w=800&q=70&auto=format&fit=crop"},
+    {"key": "trailers",   "title": "Trailers",              "alt": "Curtain-sided trailers at a depot",
+     "url": "https://images.unsplash.com/photo-1591768793355-74d04bb6608f?w=800&q=70&auto=format&fit=crop"},
+    {"key": "excavators", "title": "Excavators",            "alt": "Excavator on a construction site",
+     "url": "https://images.unsplash.com/photo-1525908484335-9d2c2a01cd6e?w=800&q=70&auto=format&fit=crop"},
+    {"key": "forklifts",  "title": "Forklifts",             "alt": "Forklift moving pallets in a warehouse",
+     "url": "https://images.unsplash.com/photo-1601598851547-4302969d0614?w=800&q=70&auto=format&fit=crop"},
+    {"key": "cranes",     "title": "Cranes",                "alt": "Mobile crane lifting steel beams",
+     "url": "https://images.unsplash.com/photo-1605152276897-4f618f831968?w=800&q=70&auto=format&fit=crop"},
+    {"key": "utes",       "title": "Light vehicles & utes", "alt": "Pickup truck on a country road",
+     "url": "https://images.unsplash.com/photo-1568605117036-5fe5e7bab0b7?w=800&q=70&auto=format&fit=crop"},
+]
 
 
 @api_router.post("/developer/companies/{company_id}/suspend")
