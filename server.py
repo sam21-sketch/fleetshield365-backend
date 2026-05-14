@@ -4282,21 +4282,31 @@ class ResetPasswordRequest(BaseModel):
 
 @api_router.post("/auth/forgot-password")
 @limiter.limit("3/minute")
-async def forgot_password(request: ForgotPasswordRequest, http_request: Request = None):
-    """Send password reset email"""
+async def forgot_password(request: Request, payload: ForgotPasswordRequest):
+    """Send password reset email.
+
+    Parameter ordering matters: slowapi looks for a parameter named
+    ``request`` that is a ``starlette.requests.Request`` to derive the
+    rate-limit key. Using the same name for a Pydantic body model
+    causes slowapi to raise inside the wrapper and the endpoint 500s
+    before any code runs (which surfaces to the browser as a CORS
+    error because FastAPI's exception handler short-circuits the
+    CORS middleware). So we keep ``request`` for the HTTP request
+    and rename the body to ``payload``.
+    """
     # Case-insensitive email lookup
-    email_lower = request.email.lower()
+    email_lower = payload.email.lower()
     user = await db.users.find_one({"email": email_lower})
-    
+
     # Always return success to prevent email enumeration
     if not user:
         return {"message": "If an account exists with this email, you will receive a password reset link."}
-    
+
     # Generate reset token
     import secrets
     reset_token = secrets.token_urlsafe(32)
     expires_at = utcnow() + timedelta(hours=1)
-    
+
     # Store reset token
     await db.password_resets.update_one(
         {"user_id": str(user["_id"])},
@@ -4308,14 +4318,14 @@ async def forgot_password(request: ForgotPasswordRequest, http_request: Request 
         }},
         upsert=True
     )
-    
+
     # Send reset email
     # Validate the submitted origin against the CORS allow list / tenant
     # subdomain regex to prevent an open-redirect via the password-reset
     # email (Requirement 6.3). On mismatch we silently fall back to
     # DEFAULT_ORIGIN_URL — this is a trust boundary, not user-facing input
     # validation, so surfacing a 4xx would only help an attacker probe.
-    submitted_origin = request.origin_url
+    submitted_origin = payload.origin_url
     if _is_allowed_origin(submitted_origin):
         validated_origin = submitted_origin.strip().rstrip('/')
     else:
@@ -4344,12 +4354,19 @@ async def forgot_password(request: ForgotPasswordRequest, http_request: Request 
         button_url=reset_url,
     )
 
-    await send_system_email(
-        request.email,
-        "[FleetShield365] Reset your password",
-        html_content,
-    )
-    
+    try:
+        await send_system_email(
+            payload.email,
+            "[FleetShield365] Reset your password",
+            html_content,
+        )
+    except Exception as e:
+        # Mail send failures are not user-facing — we already saved the
+        # reset token. Log and return the same enumeration-safe 200 so
+        # an attacker can't distinguish "mailbox unreachable" from
+        # "user does not exist".
+        logger.error(f"forgot_password: mail send failed for {payload.email}: {e}")
+
     return {"message": "If an account exists with this email, you will receive a password reset link."}
 
 @api_router.post("/auth/reset-password")
@@ -4484,9 +4501,14 @@ async def verify_email(request: VerifyEmailRequest):
 
 @api_router.post("/auth/resend-verification")
 @limiter.limit("2/minute")
-async def resend_verification(request: ResendVerificationRequest, http_request: Request = None):
-    """Re-send the verification email. Always returns the same response to avoid email enumeration."""
-    user = await db.users.find_one({"email": request.email.lower()})
+async def resend_verification(request: Request, payload: ResendVerificationRequest):
+    """Re-send the verification email. Always returns the same response to avoid email enumeration.
+
+    Parameter order is intentional: slowapi requires ``request`` to be
+    a starlette.Request to derive the rate-limit key. See forgot_password
+    for the full explanation.
+    """
+    user = await db.users.find_one({"email": payload.email.lower()})
     if not user:
         return {"message": "If an account with this email exists, a verification email has been sent."}
     if user.get("email_verified"):
@@ -4495,7 +4517,10 @@ async def resend_verification(request: ResendVerificationRequest, http_request: 
     # Invalidate any prior verify tokens for this user.
     await db.email_tokens.delete_many({"user_id": str(user["_id"]), "type": "verify"})
     token = await _issue_email_token(str(user["_id"]), "verify", ttl_hours=24)
-    await send_verification_email(user["email"], user.get("name", ""), token, request.origin_url)
+    try:
+        await send_verification_email(user["email"], user.get("name", ""), token, payload.origin_url)
+    except Exception as e:
+        logger.error(f"resend_verification: mail send failed for {payload.email}: {e}")
     return {"message": "If an account with this email exists, a verification email has been sent."}
 
 
@@ -4650,14 +4675,18 @@ CONTACT_RECIPIENT = os.environ.get('CONTACT_RECIPIENT_EMAIL', 'contact@fleetshie
 
 @api_router.post("/contact")
 @limiter.limit("3/minute")
-async def submit_contact_form(request: ContactFormRequest, http_request: Request = None):
-    """Public endpoint: submits a contact request from the website landing page."""
+async def submit_contact_form(request: Request, payload: ContactFormRequest):
+    """Public endpoint: submits a contact request from the website landing page.
+
+    Parameter ordering: slowapi requires ``request`` to be a
+    starlette.Request — see forgot_password for the full explanation.
+    """
     # Basic validation
-    name = (request.name or "").strip()
-    email = (request.email or "").strip()
-    message = (request.message or "").strip()
-    company = (request.company or "").strip()
-    phone = (request.phone or "").strip()
+    name = (payload.name or "").strip()
+    email = (payload.email or "").strip()
+    message = (payload.message or "").strip()
+    company = (payload.company or "").strip()
+    phone = (payload.phone or "").strip()
 
     if not name or not email or not message:
         raise HTTPException(status_code=400, detail="Name, email and message are required.")
