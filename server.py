@@ -5243,7 +5243,14 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         str(current_user["_id"]), "create", "vehicle", str(vehicle_doc["_id"]),
         request.client.host if request.client else "unknown"
     )
-    
+
+    # Stripe: bump the per-vehicle line item by 1 (no-op if the tenant
+    # has no Stripe subscription yet or Stripe isn't configured).
+    try:
+        await _sync_vehicle_quantity_to_stripe(company_id)
+    except Exception:
+        pass
+
     return serialize_doc(vehicle_doc)
 
 @api_router.get("/vehicles")
@@ -5439,6 +5446,13 @@ async def delete_vehicle(
         str(current_user["_id"]), "delete", "vehicle", vehicle_id,
         request.client.host if request.client else "unknown"
     )
+
+    # Stripe: drop the per-vehicle line item by 1 (proration credit
+    # applies on the next invoice). No-op if tenant has no Stripe sub.
+    try:
+        await _sync_vehicle_quantity_to_stripe(company_id)
+    except Exception:
+        pass
 
     return {
         "message": "Vehicle deleted",
@@ -10137,6 +10151,74 @@ async def purge_old_deleted(
         "removed": purged,
     }
 
+# ============== Stripe per-vehicle quantity sync ==============
+#
+# Vehicle add/remove → Stripe subscription quantity. The registration
+# flow creates a two-line-item subscription (base + per_vehicle); this
+# helper finds the per_vehicle line and modifies its quantity to match
+# `companies.vehicle_count`. Stripe handles proration on the next
+# invoice (`proration_behavior='create_prorations'`).
+#
+# Guarded behind STRIPE_SECRET_KEY presence — no-op when Stripe isn't
+# configured (yet) or the tenant has no `stripe_subscription_id`
+# (still on trial / cancelled / sign-up never completed checkout).
+# Wrapped in try/except so a Stripe outage never blocks vehicle CRUD.
+
+async def _sync_vehicle_quantity_to_stripe(company_id: str) -> None:
+    if not stripe.api_key:
+        return
+    try:
+        company = await db.companies.find_one(
+            {"_id": ObjectId(company_id)},
+            {"stripe_subscription_id": 1},
+        )
+        if not company:
+            return
+        sub_id = company.get("stripe_subscription_id")
+        if not sub_id:
+            return  # trial / not yet on a paid sub
+
+        # Live count of non-deleted vehicles for the tenant — beats
+        # the stored counters which can drift across restores/purges.
+        vehicle_count = await db.vehicles.count_documents({
+            "company_id": company_id,
+            "deleted_at": None,
+        })
+        vehicle_count = max(1, vehicle_count)
+        sub = stripe.Subscription.retrieve(sub_id)
+        items = (sub.get("items") or {}).get("data") or []
+        # Locate the per-vehicle line. We tag it via product name in
+        # the registration flow; fall back to the second line item if
+        # naming doesn't match (sub created before this change).
+        target = None
+        for it in items:
+            price = it.get("price") or {}
+            product = price.get("product")
+            # Stripe returns product as either an id or an object —
+            # handle both.
+            name = ""
+            if isinstance(product, dict):
+                name = (product.get("name") or "").lower()
+            if "per vehicle" in name or "per_vehicle" in name:
+                target = it
+                break
+        if target is None and len(items) >= 2:
+            target = items[1]
+        if target is None:
+            logger.warning("[stripe_sync] no per-vehicle line item for sub %s", sub_id)
+            return
+        if int(target.get("quantity") or 0) == vehicle_count:
+            return  # nothing to do
+        stripe.Subscription.modify(
+            sub_id,
+            items=[{"id": target["id"], "quantity": vehicle_count}],
+            proration_behavior="create_prorations",
+        )
+        logger.info("[stripe_sync] sub %s quantity → %s", sub_id, vehicle_count)
+    except Exception as e:
+        logger.exception("[stripe_sync] failed for company %s: %s", company_id, e)
+
+
 # ============== Subscription (Future Ready) ==============
 
 # Company Registration with Stripe
@@ -10226,28 +10308,43 @@ async def register_company(data: CompanyRegister):
                 {"$set": {"stripe_customer_id": customer.id}}
             )
             
-            # Calculate price from live config (falls back to PRICING)
+            # Two-line-item subscription:
+            #   1. Base price (quantity always 1)
+            #   2. Per-vehicle price (quantity = number of vehicles)
+            # We use the second line item's `quantity` to scale the bill
+            # when the tenant adds/removes vehicles via
+            # _sync_vehicle_quantity_to_stripe. A single lump-sum line
+            # (the old shape) made Subscription.modify per-vehicle
+            # awkward.
             base_price = pricing_now["base_price"]
             per_vehicle = pricing_now["per_vehicle"]
             currency = (pricing_now.get("currency") or "AUD").lower()
-            total_monthly = base_price + (data.vehicle_count * per_vehicle)
 
-            # Create checkout session for subscription
-            checkout_session = stripe.checkout.Session.create(
-                customer=customer.id,
-                payment_method_types=["card"],
-                line_items=[{
+            line_items = [
+                {
                     "price_data": {
                         "currency": currency,
-                        "product_data": {
-                            "name": f"FleetShield365 Pro - {data.vehicle_count} vehicles",
-                            "description": f"Base ${base_price}/mo + ${per_vehicle}/vehicle",
-                        },
-                        "unit_amount": total_monthly * 100,  # Stripe uses cents
+                        "product_data": {"name": "FleetShield365 Pro — Base"},
+                        "unit_amount": int(round(base_price * 100)),
                         "recurring": {"interval": "month"},
                     },
                     "quantity": 1,
-                }],
+                },
+                {
+                    "price_data": {
+                        "currency": currency,
+                        "product_data": {"name": "FleetShield365 Pro — Per vehicle"},
+                        "unit_amount": int(round(per_vehicle * 100)),
+                        "recurring": {"interval": "month"},
+                    },
+                    "quantity": max(1, int(data.vehicle_count)),
+                },
+            ]
+
+            checkout_session = stripe.checkout.Session.create(
+                customer=customer.id,
+                payment_method_types=["card"],
+                line_items=line_items,
                 mode="subscription",
                 success_url=f"{data.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
                 cancel_url=f"{data.origin_url}/pricing",
@@ -11445,7 +11542,10 @@ class PricingUpdate(BaseModel):
     per_vehicle: Optional[float] = None
     trial_days: Optional[int] = None
     currency: Optional[str] = None
-    cadence: Optional[str] = None  # "monthly" | "annual"
+    # `cadence` was removed — only monthly billing is supported. Kept
+    # on the model as Optional[str] to gracefully ignore old clients
+    # still sending it, but the value is never persisted.
+    cadence: Optional[str] = None
 
 
 @api_router.put("/developer/pricing")
@@ -11461,7 +11561,7 @@ async def developer_set_pricing(
     UI can show a banner.
     """
     update: dict = {}
-    for k in ("base_price", "per_vehicle", "trial_days", "currency", "cadence"):
+    for k in ("base_price", "per_vehicle", "trial_days", "currency"):
         v = getattr(payload, k)
         if v is None:
             continue
@@ -11469,8 +11569,6 @@ async def developer_set_pricing(
             raise HTTPException(status_code=400, detail=f"{k} out of range")
         if k == "trial_days" and (v < 0 or v > 365):
             raise HTTPException(status_code=400, detail="trial_days must be 0-365")
-        if k == "cadence" and v not in {"monthly", "annual"}:
-            raise HTTPException(status_code=400, detail="cadence must be monthly or annual")
         update[k] = v
     if not update:
         raise HTTPException(status_code=400, detail="No pricing fields provided")
@@ -11491,7 +11589,7 @@ async def developer_set_pricing(
         try:
             current = await get_pricing()
             currency = (current.get("currency") or "AUD").lower()
-            interval = "year" if current.get("cadence") == "annual" else "month"
+            interval = "month"  # Annual plan was removed — monthly only.
             # Create new Price for the base; vehicle add-on stays as a
             # separate price object so we can vary per_vehicle without
             # touching base. Stripe Prices are immutable, so we make
