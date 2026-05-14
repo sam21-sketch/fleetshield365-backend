@@ -10747,6 +10747,154 @@ async def send_alert_notification(
                 is_html=True
             )
 
+# ============== Upgrade-to-paid checkout (existing tenant) ==============
+#
+# /auth/register-company creates checkout for brand-new tenants. This
+# endpoint covers the other case: tenant already exists (still on
+# trial or trial_expired) and wants to upgrade. We re-use the live
+# pricing config, attach to the existing Stripe Customer if one
+# exists from the original registration, and return the checkout URL
+# for the web client to redirect to.
+
+class UpgradeCheckoutRequest(BaseModel):
+    origin_url: Optional[str] = None  # where to land after success/cancel
+
+
+@api_router.post("/billing/upgrade-checkout")
+async def create_upgrade_checkout(
+    payload: UpgradeCheckoutRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Start a Stripe checkout session for an existing tenant.
+
+    Auth: any role that can read the Billing tab (super_admin / admin).
+    Drivers don't see Billing, so we gate to admins.
+    """
+    if current_user.get("role") not in (UserRole.SUPER_ADMIN, UserRole.ADMIN):
+        raise HTTPException(status_code=403, detail="Only owners and admins can upgrade billing")
+
+    if not stripe.api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Stripe is not configured on this server. Set STRIPE_SECRET_KEY in .env.",
+        )
+
+    company_id = current_user.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="User has no company")
+
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    # Block double-charging — if tenant already has an active
+    # subscription, send them to the Stripe billing portal instead
+    # of creating a duplicate.
+    if company.get("subscription_status") == "active" and company.get("stripe_subscription_id"):
+        return {
+            "already_active": True,
+            "message": "You're already on the paid plan.",
+            "checkout_url": None,
+        }
+
+    # Live vehicle count drives the quantity on the per-vehicle line.
+    vehicle_count = await db.vehicles.count_documents({
+        "company_id": company_id,
+        "deleted_at": None,
+    })
+    vehicle_count = max(1, vehicle_count)
+
+    pricing_now = await get_pricing()
+    base_price = pricing_now["base_price"]
+    per_vehicle = pricing_now["per_vehicle"]
+    currency = (pricing_now.get("currency") or "AUD").lower()
+
+    # Re-use existing Stripe customer if registration created one.
+    customer_id = company.get("stripe_customer_id")
+    try:
+        if not customer_id:
+            customer = stripe.Customer.create(
+                email=current_user.get("email"),
+                name=company.get("name") or current_user.get("name"),
+                metadata={
+                    "company_id": company_id,
+                    "company_name": company.get("name") or "",
+                },
+            )
+            customer_id = customer.id
+            await db.companies.update_one(
+                {"_id": ObjectId(company_id)},
+                {"$set": {"stripe_customer_id": customer_id}},
+            )
+
+        # Default success/cancel URLs honour the caller-supplied origin
+        # when it's on the platform domain (subdomain regex match), so
+        # an Owner upgrading from `lalitcom.fleetshield365.com/settings`
+        # lands back there rather than the apex. Falls back to the
+        # platform apex otherwise.
+        origin = payload.origin_url if (payload.origin_url and _is_allowed_origin(payload.origin_url)) else DEFAULT_ORIGIN_URL
+        origin = origin.rstrip('/')
+
+        line_items = [
+            {
+                "price_data": {
+                    "currency": currency,
+                    "product_data": {"name": "FleetShield365 Pro — Base"},
+                    "unit_amount": int(round(base_price * 100)),
+                    "recurring": {"interval": "month"},
+                },
+                "quantity": 1,
+            },
+            {
+                "price_data": {
+                    "currency": currency,
+                    "product_data": {"name": "FleetShield365 Pro — Per vehicle"},
+                    "unit_amount": int(round(per_vehicle * 100)),
+                    "recurring": {"interval": "month"},
+                },
+                "quantity": vehicle_count,
+            },
+        ]
+
+        # If the tenant is still inside their trial, honour the
+        # remaining trial days on the new subscription so they don't
+        # lose value by upgrading early. Otherwise no trial.
+        sub_data: dict = {
+            "metadata": {
+                "company_id": company_id,
+                "vehicle_count": str(vehicle_count),
+                "upgrade": "true",
+            },
+        }
+        try:
+            ts = await get_trial_status(company_id)
+            days_left = int(ts.get("days_left") or 0)
+            if ts.get("status") == "trialing" and days_left > 0:
+                sub_data["trial_period_days"] = days_left
+        except Exception:
+            pass
+
+        checkout_session = stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=line_items,
+            mode="subscription",
+            success_url=f"{origin}/settings?tab=billing&upgrade=success",
+            cancel_url=f"{origin}/settings?tab=billing&upgrade=cancelled",
+            subscription_data=sub_data,
+        )
+        return {
+            "already_active": False,
+            "checkout_url": checkout_session.url,
+            "session_id": checkout_session.id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_upgrade_checkout failed for {company_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not start checkout: {e}")
+
+
 @api_router.get("/subscription")
 async def get_subscription(current_user: dict = Depends(get_current_user)):
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
