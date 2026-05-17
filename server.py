@@ -1543,6 +1543,30 @@ def validate_password_policy(password: str) -> None:
         )
 
 
+def reject_same_password(new_password: str, current_hash: Optional[str]) -> None:
+    """Reject when the proposed password matches the user's current one.
+
+    Used by every reset/change endpoint so a user can't "reset" to
+    the same password they had before. Silently no-op if the user has
+    no current hash (e.g. invite-only account never set one).
+    """
+    if not current_hash:
+        return
+    try:
+        if verify_password(new_password, current_hash):
+            raise HTTPException(
+                status_code=400,
+                detail="New password must be different from your current password",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        # If hash verification fails for some other reason (corrupt
+        # hash, library mismatch), don't block the reset — let the
+        # caller proceed and rehash with the new password.
+        return
+
+
 # Account lockout: 5 failed login attempts inside the window → 30-min lock.
 # Local int parser — _env_int is defined later in the file (next to the
 # upload validation helpers), so we inline a tolerant parse here to
@@ -4384,6 +4408,13 @@ async def reset_password(request: ResetPasswordRequest):
 
     # Phase 3 — uniform password policy (was 6-char min — too weak).
     validate_password_policy(request.new_password)
+
+    # Block reusing the current password — forces a meaningful reset.
+    target_user = await db.users.find_one(
+        {"_id": ObjectId(reset_record["user_id"])},
+        {"password_hash": 1},
+    )
+    reject_same_password(request.new_password, (target_user or {}).get("password_hash"))
 
     # Update password + clear any lingering lockout (a successful reset
     # implies the legitimate user is back in control).
@@ -7328,16 +7359,20 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    
+
+    # Block reusing the existing password so a "reset" actually
+    # rotates the credential.
+    reject_same_password(request.new_password, driver.get("password_hash"))
+
     # Hash the new password
     hashed_password = get_password_hash(request.new_password)
-    
+
     # Update the driver's password
     await db.users.update_one(
         {"_id": ObjectId(driver_id)},
         {"$set": {"password_hash": hashed_password}}
     )
-    
+
     return {"message": f"Password reset successfully for {driver.get('name', 'driver')}"}
 
 @api_router.put("/drivers/{driver_id}")
@@ -11457,6 +11492,12 @@ async def reset_user_password(
 ):
     """Reset a user's password (developer emergency access)"""
     try:
+        validate_password_policy(new_password)
+        target = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 1})
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        reject_same_password(new_password, target.get("password_hash"))
+
         hashed_password = get_password_hash(new_password)
         result = await db.users.update_one(
             {"_id": ObjectId(user_id)},
@@ -11466,10 +11507,10 @@ async def reset_user_password(
                 "updated_at": datetime.now(timezone.utc)
             }}
         )
-        
+
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         return {"message": "Password reset successfully", "temp_password": new_password}
     except Exception as e:
         logger.error(f"Developer reset password error: {e}")
@@ -11834,6 +11875,61 @@ async def developer_set_pricing(
 
 
 # ============== Developer: server disk usage ==============
+
+@api_router.get("/developer/orgs/{company_id}/storage")
+async def developer_org_storage(
+    company_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Per-org MinIO storage usage. Owner panel calls this on demand
+    from the Organisations table (not auto-loaded — could touch tens
+    of thousands of objects across all tenants if we did)."""
+    BUCKETS = (
+        "logos", "compliance", "inspection-photos", "fuel-receipts",
+        "incident-photos", "incident-attachments", "service-records",
+        "maintenance", "signatures", "photos",
+    )
+    total_bytes = 0
+    total_objects = 0
+    capped = False
+    by_bucket: dict = {}
+    for name in BUCKETS:
+        try:
+            paginator = object_store._s3_client.get_paginator("list_objects_v2")
+            b_bytes = 0
+            b_objects = 0
+            scanned = 0
+            # Tenant prefix is always `<company_id>/...` per
+            # object_store.upload_base64 — list with Prefix to
+            # restrict the scan to one tenant's slice.
+            for page in paginator.paginate(
+                Bucket=name,
+                Prefix=f"{company_id}/",
+                PaginationConfig={"MaxItems": 5000},
+            ):
+                for obj in page.get("Contents") or []:
+                    b_bytes += obj.get("Size", 0) or 0
+                    b_objects += 1
+                    scanned += 1
+                    if scanned >= 5000:
+                        capped = True
+                        break
+                if scanned >= 5000:
+                    break
+            by_bucket[name] = {"bytes": b_bytes, "objects": b_objects}
+            total_bytes += b_bytes
+            total_objects += b_objects
+        except Exception as exc:
+            by_bucket[name] = {"error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "company_id": company_id,
+        "total_bytes": total_bytes,
+        "total_objects": total_objects,
+        "by_bucket": by_bucket,
+        "capped": capped,
+        "generated_at": utcnow().isoformat(),
+    }
+
 
 @api_router.get("/developer/server-disk")
 async def developer_server_disk(
