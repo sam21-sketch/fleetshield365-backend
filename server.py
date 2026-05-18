@@ -13885,8 +13885,8 @@ async def get_version_min():
         "min_ios_build": MIN_IOS_BUILD_NUMBER,
         "min_android_version_code": MIN_ANDROID_VERSION_CODE,
         "recommended_version": RECOMMENDED_VERSION,
-        "store_url_ios": "https://apps.apple.com/au/app/fleetshield365/id0000000000",
-        "store_url_android": "https://play.google.com/store/apps/details?id=com.fleetshield365",
+        "store_url_ios": "https://apps.apple.com/app/fleetshield365/id6760111342",
+        "store_url_android": "https://play.google.com/store/apps/details?id=com.fleetshield365&pcampaignid=web_share",
     }
 
 # Include router
