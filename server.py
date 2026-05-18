@@ -4119,7 +4119,12 @@ async def login(credentials: UserLogin, request: Request):
                 ),
             )
 
-    if not user or not verify_password(credentials.password, user["password_hash"]):
+    # Some legacy user docs persist the hash as `hashed_password`
+    # rather than `password_hash`, and invite-pending users have
+    # neither field set until they accept the invite. Resolve the hash
+    # defensively so login returns a clean 401 instead of 500.
+    stored_hash = (user or {}).get("password_hash") or (user or {}).get("hashed_password")
+    if not user or not stored_hash or not verify_password(credentials.password, stored_hash):
         # Phase 3 — record the failure (if the user exists) so the
         # lockout counter can kick in. Don't reveal whether the
         # account exists: response stays "Invalid credentials".
@@ -5994,7 +5999,7 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
     
     # Verify password. Return 400 (not 401) so the web axios interceptor
     # treats it as an inline form error instead of an expired session.
-    if not verify_password(request.password, current_user["password_hash"]):
+    if not verify_password(request.password, current_user.get("password_hash") or current_user.get("hashed_password") or ""):
         raise HTTPException(status_code=400, detail="Incorrect password")
 
     # Fetch selected operators
@@ -6193,7 +6198,7 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     
     # Verify password. Return 400 (not 401) so the web axios interceptor
     # treats it as an inline form error instead of an expired session.
-    if not verify_password(verification.password, current_user["password_hash"]):
+    if not verify_password(verification.password, current_user.get("password_hash") or current_user.get("hashed_password") or ""):
         raise HTTPException(status_code=400, detail="Incorrect password")
 
     # Verify driver exists and belongs to the same company
@@ -6422,7 +6427,7 @@ async def view_driver_documents(driver_id: str, doc_type: str, verification: Pas
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can view documents")
     
-    if not verify_password(verification.password, current_user["password_hash"]):
+    if not verify_password(verification.password, current_user.get("password_hash") or current_user.get("hashed_password") or ""):
         raise HTTPException(status_code=400, detail="Incorrect password")
 
     valid_doc_types = {
