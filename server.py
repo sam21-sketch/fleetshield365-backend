@@ -2961,6 +2961,16 @@ class UserRegister(BaseModel):
     dangerous_goods_number: Optional[str] = None
     dangerous_goods_issue: Optional[str] = None
     dangerous_goods_expiry: Optional[str] = None
+    # MSIC (Maritime Security Identification Card) — Phase 2.1
+    msic_number: Optional[str] = None
+    msic_issue: Optional[str] = None
+    msic_expiry: Optional[str] = None
+    # Free-form "Other document" slot. The label is owner-supplied so any
+    # cert the fixed types don't cover can still be tracked.
+    other_doc_label: Optional[str] = None
+    other_doc_number: Optional[str] = None
+    other_doc_issue: Optional[str] = None
+    other_doc_expiry: Optional[str] = None
 
 class DriverUpdate(BaseModel):
     name: Optional[str] = None
@@ -2981,6 +2991,16 @@ class DriverUpdate(BaseModel):
     dangerous_goods_number: Optional[str] = None
     dangerous_goods_issue: Optional[str] = None
     dangerous_goods_expiry: Optional[str] = None
+    # MSIC (Maritime Security Identification Card) — Phase 2.1
+    msic_number: Optional[str] = None
+    msic_issue: Optional[str] = None
+    msic_expiry: Optional[str] = None
+    # Free-form "Other document" slot. The label is owner-supplied so any
+    # cert the fixed types don't cover can still be tracked.
+    other_doc_label: Optional[str] = None
+    other_doc_number: Optional[str] = None
+    other_doc_issue: Optional[str] = None
+    other_doc_expiry: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: Optional[str] = None  # Can be email or username
@@ -3026,8 +3046,18 @@ class CompanyUpdate(BaseModel):
     logo_base64: Optional[str] = None
     subscription_plan: Optional[str] = None
     timezone: Optional[str] = None
+    # Phase 5 — region preferences. The Settings panel writes these so
+    # the owner can override what we auto-detected at signup.
+    country: Optional[str] = None
+    preferred_currency: Optional[str] = None
+    units_system: Optional[str] = None
+    locale: Optional[str] = None
 
 # Vehicle Models
+class VehicleCustomField(BaseModel):
+    label: str
+    value: str
+
 class VehicleCreate(BaseModel):
     name: str
     registration_number: str
@@ -3041,6 +3071,10 @@ class VehicleCreate(BaseModel):
     service_due_km: Optional[int] = None
     current_odometer: Optional[int] = 0
     assigned_driver_ids: Optional[List[str]] = None
+    # Phase 2.2 — optional image, free-text notes, owner-defined extras.
+    image_base64: Optional[str] = None
+    notes: Optional[str] = None
+    custom_fields: Optional[List[VehicleCustomField]] = None
 
 class VehicleUpdate(BaseModel):
     name: Optional[str] = None
@@ -3055,6 +3089,9 @@ class VehicleUpdate(BaseModel):
     service_due_km: Optional[int] = None
     current_odometer: Optional[int] = None
     assigned_driver_ids: Optional[List[str]] = None
+    image_base64: Optional[str] = None
+    notes: Optional[str] = None
+    custom_fields: Optional[List[VehicleCustomField]] = None
 
 # Checklist Models
 class ChecklistItem(BaseModel):
@@ -3276,6 +3313,12 @@ class CompanyRegister(BaseModel):
     origin_url: Optional[str] = None
     role: Optional[str] = None  # 'super_admin' for Company Owner, 'admin' for Admin
     timezone: Optional[str] = "Australia/Sydney"  # Company timezone for timestamps
+    # Phase 5 — region preferences detected at signup. All optional;
+    # missing values fall through to sensible defaults (AU/AUD/metric).
+    country: Optional[str] = None         # ISO 3166-1 alpha-2
+    preferred_currency: Optional[str] = None  # ISO 4217
+    units_system: Optional[str] = None    # "metric" | "imperial"
+    locale: Optional[str] = None          # BCP-47 (e.g. "en-AU")
     # Optional tenant subdomain (Requirements 9.1, 9.3). When provided the
     # value is validated + uniqueness-checked; when omitted the register
     # handler calls slug_generator() to derive one from ``company_name``.
@@ -3289,7 +3332,9 @@ class CompanyRegister(BaseModel):
 PRICING = {
     "base_price": 29,
     "per_vehicle": 3,
-    "trial_days": 14,
+    "trial_days": 15,  # Phase 4.2 — bumped default to 15 days
+    "trial_enabled": True,  # Phase 4.2 — owner-controlled global flag
+    "trial_max_vehicles": None,  # None = unlimited during trial
     "currency": "AUD",
     "cadence": "monthly",
 }
@@ -3309,7 +3354,10 @@ async def get_pricing() -> dict:
         doc = None
     base = dict(PRICING)
     if doc:
-        for k in ("base_price", "per_vehicle", "trial_days", "currency", "cadence"):
+        for k in (
+            "base_price", "per_vehicle", "trial_days", "currency", "cadence",
+            "trial_enabled", "trial_max_vehicles",
+        ):
             v = doc.get(k)
             if v is not None:
                 base[k] = v
@@ -5267,8 +5315,9 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
                     ),
                 )
 
+    vehicle_id = ObjectId()
     vehicle_doc = {
-        "_id": ObjectId(),
+        "_id": vehicle_id,
         "company_id": company_id,
         "name": vehicle.name,
         "registration_number": vehicle.registration_number,
@@ -5282,8 +5331,27 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         "service_due_km": vehicle.service_due_km,
         "current_odometer": vehicle.current_odometer or 0,
         "assigned_driver_ids": vehicle.assigned_driver_ids or [],
+        # Phase 2.2 — owner-supplied "anything else" fields. Notes and
+        # custom_fields are persisted directly; the photo goes to MinIO
+        # and only the object key is stored on the doc.
+        "notes": (vehicle.notes or "").strip()[:2000] or None,
+        "custom_fields": (
+            [cf.dict() for cf in (vehicle.custom_fields or [])][:10] or None
+        ),
         "created_at": utcnow()
     }
+    if vehicle.image_base64:
+        image_key = f"{company_id}/vehicles/{vehicle_id}.jpg"
+        _upload_base64_or_400(
+            "photos",
+            image_key,
+            vehicle.image_base64,
+            "jpg",
+            "image_base64",
+            expected_company_id=company_id,
+            type_key="profile",
+        )
+        vehicle_doc["image_object_key"] = image_key
     await db.vehicles.insert_one(vehicle_doc)
     
     # Invalidate vehicles cache
@@ -5311,7 +5379,7 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
     except Exception:
         pass
 
-    return serialize_doc(vehicle_doc)
+    return _attach_vehicle_image_url(serialize_doc(vehicle_doc))
 
 @api_router.get("/vehicles")
 async def get_vehicles(
@@ -5339,22 +5407,33 @@ async def get_vehicles(
             "assigned_driver_ids": str(current_user["_id"]),
         }
         vehicles = await db.vehicles.find(query).skip(actual_offset).limit(actual_limit).to_list(actual_limit)
-        return serialize_doc(vehicles)
+        result = serialize_doc(vehicles)
+        return [_attach_vehicle_image_url(v) for v in result] if isinstance(result, list) else result
 
     # Cache only the default page. Bypass when caller paginates.
     use_cache = actual_offset == 0 and actual_limit >= 200
     if use_cache:
         cached = get_cached("vehicles", company_id)
         if cached:
-            return cached
+            # Re-attach presigned URLs on cache hit so they don't expire.
+            return [_attach_vehicle_image_url(dict(v)) for v in cached] if isinstance(cached, list) else cached
 
     # Phase 4 — exclude soft-deleted vehicles from the admin list.
     query = {**_soft_delete_filter(), "company_id": company_id}
     vehicles = await db.vehicles.find(query).skip(actual_offset).limit(actual_limit).to_list(actual_limit)
     result = serialize_doc(vehicles)
+    if isinstance(result, list):
+        result = [_attach_vehicle_image_url(v) for v in result]
 
     if use_cache:
-        set_cached("vehicles", company_id, result)
+        # Cache without presigned URLs (they expire). Presigning is cheap,
+        # so re-attach on every cache hit instead of caching short-lived
+        # links that go stale.
+        cacheable = [
+            {k: v for k, v in vd.items() if k != "image_url"}
+            for vd in (result if isinstance(result, list) else [])
+        ]
+        set_cached("vehicles", company_id, cacheable)
     return result
 
 @api_router.get("/vehicles/active-today")
@@ -5376,6 +5455,127 @@ async def get_active_vehicles_today(
     
     return {"active_vehicle_ids": active_ids, "count": len(active_ids)}
 
+async def _compute_storage_categories(company_filter: Optional[dict] = None) -> List[dict]:
+    """Phase 4.4 — content breakdown of storage by user-facing category.
+
+    Counts come from Mongo (cheap aggregations on indexed fields). Bytes
+    are an estimate (count × avg per-category size); see CLAUDE.md §13
+    note. Pass ``company_filter`` to scope to one tenant.
+    """
+    filt: dict = dict(company_filter or {})
+
+    def f(extra: Optional[dict] = None) -> dict:
+        out = dict(filt)
+        if extra:
+            out.update(extra)
+        return out
+
+    # Inspection photo counts. photo_refs is a small array on each
+    # inspection doc; counting array elements requires an aggregate.
+    async def _photo_count(coll, match: dict, array_field: str) -> int:
+        pipeline = [
+            {"$match": match},
+            {"$project": {"n": {"$size": {"$ifNull": [f"${array_field}", []]}}}},
+            {"$group": {"_id": None, "total": {"$sum": "$n"}}},
+        ]
+        result = await coll.aggregate(pipeline).to_list(1)
+        return result[0]["total"] if result else 0
+
+    soft = _soft_delete_filter()
+    prestart_photos = await _photo_count(
+        db.inspections, f({**soft, "inspection_type": "prestart"}), "photo_refs")
+    endshift_photos = await _photo_count(
+        db.inspections, f({**soft, "inspection_type": "end_shift"}), "photo_refs")
+    incident_damage = await _photo_count(
+        db.incidents, f({**soft}), "damage_photos")
+    incident_scene = await _photo_count(
+        db.incidents, f({**soft}), "scene_photos")
+    incident_other = await _photo_count(
+        db.incidents, f({**soft}), "other_vehicle_photos")
+
+    # Simple count_documents for object-key-or-not. The presence of the
+    # key implies a stored file.
+    signatures = await db.inspections.count_documents(
+        f({**soft, "signature_object_key": {"$exists": True, "$ne": None}}))
+    fuel_receipts = await db.fuel_submissions.count_documents(
+        f({"receipt_object_key": {"$exists": True, "$ne": None}}))
+    service_attachments = await _photo_count(
+        db.service_records, f({**soft}), "attachment_object_keys")
+    maintenance_invoices = await db.maintenance_logs.count_documents(
+        f({**soft, "invoice_object_key": {"$exists": True, "$ne": None}}))
+    logos = await db.companies.count_documents(
+        f({**soft, "logo_object_key": {"$exists": True, "$ne": None}}))
+
+    # Driver compliance docs — front + back per doc type.
+    doc_fields = [
+        "license_front_object_key", "license_back_object_key",
+        "medical_cert_front_object_key", "medical_cert_back_object_key",
+        "first_aid_front_object_key", "first_aid_back_object_key",
+        "forklift_front_object_key", "forklift_back_object_key",
+        "dangerous_goods_front_object_key", "dangerous_goods_back_object_key",
+        "msic_front_object_key", "msic_back_object_key",
+        "other_doc_front_object_key", "other_doc_back_object_key",
+    ]
+    driver_doc_count = 0
+    for field in doc_fields:
+        driver_doc_count += await db.users.count_documents(
+            f({**soft, field: {"$exists": True, "$ne": None}}))
+
+    # Vehicle photos (Phase 2.2).
+    vehicle_images = await db.vehicles.count_documents(
+        f({**soft, "image_object_key": {"$exists": True, "$ne": None}}))
+
+    # Per-category KB estimates (post-compression sizes from CLAUDE.md
+    # §11 Phase-1 numbers: thumbnails 50KB, photos 250KB, PDFs 200KB).
+    def _kb(n: int, kb: int) -> int:
+        return n * kb * 1024
+
+    return [
+        {"key": "prestart_photos", "label": "Prestart inspection photos",
+         "count": prestart_photos, "bytes_estimate": _kb(prestart_photos, 250)},
+        {"key": "endshift_photos", "label": "End-shift inspection photos",
+         "count": endshift_photos, "bytes_estimate": _kb(endshift_photos, 250)},
+        {"key": "inspection_signatures", "label": "Inspection signatures",
+         "count": signatures, "bytes_estimate": _kb(signatures, 50)},
+        {"key": "incident_damage_photos", "label": "Incident damage photos",
+         "count": incident_damage, "bytes_estimate": _kb(incident_damage, 250)},
+        {"key": "incident_scene_photos", "label": "Incident scene photos",
+         "count": incident_scene, "bytes_estimate": _kb(incident_scene, 250)},
+        {"key": "incident_other_photos", "label": "Incident other-vehicle photos",
+         "count": incident_other, "bytes_estimate": _kb(incident_other, 250)},
+        {"key": "fuel_receipts", "label": "Fuel receipts",
+         "count": fuel_receipts, "bytes_estimate": _kb(fuel_receipts, 200)},
+        {"key": "service_attachments", "label": "Service record attachments",
+         "count": service_attachments, "bytes_estimate": _kb(service_attachments, 300)},
+        {"key": "maintenance_invoices", "label": "Maintenance invoices",
+         "count": maintenance_invoices, "bytes_estimate": _kb(maintenance_invoices, 300)},
+        {"key": "driver_documents", "label": "Driver compliance documents",
+         "count": driver_doc_count, "bytes_estimate": _kb(driver_doc_count, 200)},
+        {"key": "company_logos", "label": "Company logos",
+         "count": logos, "bytes_estimate": _kb(logos, 100)},
+        {"key": "vehicle_images", "label": "Vehicle photos",
+         "count": vehicle_images, "bytes_estimate": _kb(vehicle_images, 200)},
+    ]
+
+
+def _attach_vehicle_image_url(vehicle_doc: dict) -> dict:
+    """Phase 2.2 — render-time helper. Tacks a short-lived presigned URL
+    onto vehicles that carry an image_object_key so the frontend can
+    render the photo without a separate fetch. The key never leaves the
+    backend in its raw form for non-developers; the URL is the only
+    public-facing pointer."""
+    if not isinstance(vehicle_doc, dict):
+        return vehicle_doc
+    object_key = vehicle_doc.get("image_object_key")
+    if object_key:
+        try:
+            vehicle_doc["image_url"] = _presign_if_key("photos", object_key)
+        except Exception:
+            # Never let a presign failure break the vehicle response.
+            vehicle_doc["image_url"] = None
+    return vehicle_doc
+
+
 @api_router.get("/vehicles/{vehicle_id}")
 async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_user)):
     vehicle = await db.vehicles.find_one({
@@ -5384,32 +5584,62 @@ async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_
     })
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    return serialize_doc(vehicle)
+    return _attach_vehicle_image_url(serialize_doc(vehicle))
 
 @api_router.put("/vehicles/{vehicle_id}")
 async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Request, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    company_id = current_user["company_id"]
     update_data = {k: v for k, v in update.dict().items() if v is not None}
+
+    # Phase 2.2 — image_base64 is an upload, not a storable field. Push
+    # the bytes to MinIO under photos/<company>/vehicles/<id>.jpg and
+    # swap in the object key instead.
+    image_b64 = update_data.pop("image_base64", None)
+    if image_b64:
+        image_key = f"{company_id}/vehicles/{vehicle_id}.jpg"
+        _upload_base64_or_400(
+            "photos",
+            image_key,
+            image_b64,
+            "jpg",
+            "image_base64",
+            expected_company_id=company_id,
+            type_key="profile",
+        )
+        update_data["image_object_key"] = image_key
+
+    # Cap notes + custom_fields the same way create does. Pydantic gives
+    # us the list back as VehicleCustomField objects when present.
+    if "notes" in update_data and update_data["notes"] is not None:
+        update_data["notes"] = update_data["notes"].strip()[:2000] or None
+    if "custom_fields" in update_data and update_data["custom_fields"] is not None:
+        update_data["custom_fields"] = (
+            [cf.dict() if hasattr(cf, "dict") else cf for cf in update_data["custom_fields"]][:10]
+            or None
+        )
+
     if update_data:
         await db.vehicles.update_one(
-            {"_id": ObjectId(vehicle_id), "company_id": current_user["company_id"]},
+            {"_id": ObjectId(vehicle_id), "company_id": company_id},
             {"$set": update_data}
         )
-    
+
     vehicle = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
-    
+    serialized = _attach_vehicle_image_url(serialize_doc(vehicle))
+
     # Invalidate cache
     invalidate_cache("vehicles", current_user["company_id"])
     invalidate_cache("dashboard", current_user["company_id"])
-    
+
     await log_audit_trail(
         str(current_user["_id"]), "update", "vehicle", vehicle_id,
         request.client.host if request.client else "unknown", update_data
     )
-    
-    return serialize_doc(vehicle)
+
+    return serialized
 
 @api_router.delete("/vehicles/{vehicle_id}")
 async def delete_vehicle(
@@ -5657,6 +5887,15 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         "dangerous_goods_number": user.dangerous_goods_number,
         "dangerous_goods_issue": user.dangerous_goods_issue,
         "dangerous_goods_expiry": user.dangerous_goods_expiry,
+        # Phase 2.1 — MSIC and free-form "Other" document. Photo uploads
+        # land via /drivers/{id}/documents/{doc_type} after create.
+        "msic_number": user.msic_number,
+        "msic_issue": user.msic_issue,
+        "msic_expiry": user.msic_expiry,
+        "other_doc_label": user.other_doc_label,
+        "other_doc_number": user.other_doc_number,
+        "other_doc_issue": user.other_doc_issue,
+        "other_doc_expiry": user.other_doc_expiry,
     }
     # Only add email if provided (sparse index doesn't like None values)
     if user.email:
@@ -5723,10 +5962,11 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can download documents")
     
-    # Verify password
+    # Verify password. Return 400 (not 401) so the web axios interceptor
+    # treats it as an inline form error instead of an expired session.
     if not verify_password(request.password, current_user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid password")
-    
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
     # Fetch selected operators
     operator_ids = [ObjectId(oid) for oid in request.operator_ids]
     operators = await db.users.find({
@@ -5769,7 +6009,15 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
                 "dangerous_goods": [
                     ("dangerous_goods_front", "dangerous_goods_front.jpg"),
                     ("dangerous_goods_back", "dangerous_goods_back.jpg")
-                ]
+                ],
+                "msic": [
+                    ("msic_front", "msic_front.jpg"),
+                    ("msic_back", "msic_back.jpg")
+                ],
+                "other": [
+                    ("other_doc_front", "other_document_front.jpg"),
+                    ("other_doc_back", "other_document_back.jpg")
+                ],
             }
             
             for doc_type in request.document_types:
@@ -5913,10 +6161,11 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Company Owners can view license photos")
     
-    # Verify password
+    # Verify password. Return 400 (not 401) so the web axios interceptor
+    # treats it as an inline form error instead of an expired session.
     if not verify_password(verification.password, current_user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid password")
-    
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
     # Verify driver exists and belongs to the same company
     driver = await db.users.find_one({
         "_id": ObjectId(driver_id),
@@ -5924,7 +6173,7 @@ async def view_license_photos(driver_id: str, verification: PasswordVerification
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    
+
     return {
         "driver_id": driver_id,
         "driver_name": driver.get("name"),
@@ -6020,8 +6269,10 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
         "first_aid": ("first_aid_front", "first_aid_back", "first-aid"),
         "forklift": ("forklift_front", "forklift_back", "forklift"),
         "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back", "dangerous-goods"),
+        "msic": ("msic_front", "msic_back", "msic"),
+        "other": ("other_doc_front", "other_doc_back", "other-doc"),
     }
-    
+
     if doc_type not in valid_doc_types:
         raise HTTPException(status_code=400, detail=f"Invalid document type. Valid types: {list(valid_doc_types.keys())}")
     
@@ -6099,20 +6350,22 @@ async def get_driver_documents(driver_id: str, doc_type: str, current_user: dict
         "first_aid": ("first_aid_front", "first_aid_back"),
         "forklift": ("forklift_front", "forklift_back"),
         "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+        "msic": ("msic_front", "msic_back"),
+        "other": ("other_doc_front", "other_doc_back"),
     }
-    
+
     if doc_type not in valid_doc_types:
         raise HTTPException(status_code=400, detail=f"Invalid document type")
-    
+
     front_field, back_field = valid_doc_types[doc_type]
-    
+
     driver = await db.users.find_one({
         "_id": ObjectId(driver_id),
         "company_id": current_user["company_id"]
     })
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    
+
     # Task 5.3: post-migration we check the new _object_key fields; legacy
     # inline-base64 fields are also consulted so pre-migration rows still
     # report has_front / has_back correctly.
@@ -6123,7 +6376,14 @@ async def get_driver_documents(driver_id: str, doc_type: str, current_user: dict
         "has_back": bool(
             driver.get(f"{back_field}_object_key") or driver.get(back_field)
         ),
-        "uploaded_at": driver.get(f"{doc_type}_updated_at")
+        "uploaded_at": driver.get(f"{doc_type}_updated_at"),
+        # For "other" the label is a user-supplied free-text string stored
+        # alongside the photo keys; expose it so the UI can render the
+        # right card heading.
+        "label": driver.get("other_doc_label") if doc_type == "other" else None,
+        "number": driver.get(f"{doc_type}_number"),
+        "issue_date": driver.get(f"{doc_type}_issue_date"),
+        "expiry_date": driver.get(f"{doc_type}_expiry_date"),
     }
 
 @api_router.post("/drivers/{driver_id}/documents/{doc_type}/view")
@@ -6133,13 +6393,15 @@ async def view_driver_documents(driver_id: str, doc_type: str, verification: Pas
         raise HTTPException(status_code=403, detail="Only Company Owners can view documents")
     
     if not verify_password(verification.password, current_user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid password")
-    
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
     valid_doc_types = {
         "medical": ("medical_cert_front", "medical_cert_back"),
         "first_aid": ("first_aid_front", "first_aid_back"),
         "forklift": ("forklift_front", "forklift_back"),
         "dangerous_goods": ("dangerous_goods_front", "dangerous_goods_back"),
+        "msic": ("msic_front", "msic_back"),
+        "other": ("other_doc_front", "other_doc_back"),
     }
     
     if doc_type not in valid_doc_types:
@@ -6459,21 +6721,12 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         {"$set": {"current_odometer": inspection.odometer}}
     )
     
-    # Generate PDF
+    # Generate PDF lazily on download. Phase 3.1 (2026-05-18 plan):
+    # PDFs are no longer stored on the server — they're rebuilt and
+    # streamed from /inspections/{id}/pdf on demand. No bytes leave
+    # the request lifecycle, no MinIO objects accumulate.
     driver = await db.users.find_one({"_id": current_user["_id"]})
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    # Phase 2: PDF lands in MinIO; only the object key is stored on the
-    # inspection document. Mongo no longer carries the ~200 KB base64.
-    pdf_bytes = await generate_inspection_pdf_bytes(inspection_doc, vehicle, driver, company)
-    pdf_object_key = await _store_inspection_pdf(
-        str(inspection_doc["_id"]), company_id, pdf_bytes,
-    )
-    await db.inspections.update_one(
-        {"_id": inspection_doc["_id"]},
-        {"$set": {"pdf_object_key": pdf_object_key}, "$unset": {"pdf_base64": ""}},
-    )
-    inspection_doc["pdf_object_key"] = pdf_object_key
-    
+
     # Create alert if vehicle marked unsafe
     if has_issues:
         issue_items = [item.name for item in inspection.checklist_items if item.status == ChecklistItemStatus.ISSUE]
@@ -6677,21 +6930,11 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         {"$set": {"current_odometer": inspection.odometer}}
     )
     
-    # Generate PDF
+    # Generate PDF lazily on download. Phase 3.1 (2026-05-18 plan):
+    # PDFs are no longer persisted server-side — rebuilt + streamed
+    # from /inspections/{id}/pdf on demand.
     driver = await db.users.find_one({"_id": current_user["_id"]})
-    company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    # Phase 2: PDF lands in MinIO; only the object key is stored on the
-    # inspection document. Mongo no longer carries the ~200 KB base64.
-    pdf_bytes = await generate_inspection_pdf_bytes(inspection_doc, vehicle, driver, company)
-    pdf_object_key = await _store_inspection_pdf(
-        str(inspection_doc["_id"]), company_id, pdf_bytes,
-    )
-    await db.inspections.update_one(
-        {"_id": inspection_doc["_id"]},
-        {"$set": {"pdf_object_key": pdf_object_key}, "$unset": {"pdf_base64": ""}},
-    )
-    inspection_doc["pdf_object_key"] = pdf_object_key
-    
+
     # Create alert if damage or incident
     if inspection.new_damage:
         await create_alert(
@@ -6971,19 +7214,23 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
     return serialize_doc(inspection)
 
 @api_router.get("/inspections/{inspection_id}/pdf")
-async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, current_user: dict = Depends(get_current_user)):
-    """Return the inspection PDF as a presigned URL (preferred) or base64.
+async def get_inspection_pdf(
+    inspection_id: str,
+    regenerate: bool = False,  # legacy param — generation is now always ephemeral
+    current_user: dict = Depends(get_current_user),
+):
+    """Stream the inspection PDF on demand. Phase 3.1 (Plan 2026-05-18):
 
-    Phase 2 of STORAGE-PLAN.txt:
-    * New inspections store ``pdf_object_key`` in MinIO; this endpoint
-      returns a presigned URL alongside the key so the client can render
-      the PDF directly through Nginx without re-encoding the bytes.
-    * Legacy inspections (created before the migration) still carry
-      ``pdf_base64``; we fall back to that, returning it as before so
-      old admin-panel downloads keep working until the migration script
-      moves them to MinIO.
-    * ``regenerate=true`` always rebuilds from current photo state and
-      uploads to MinIO.
+    Every PDF is now generated in-memory and streamed to the caller.
+    Nothing is persisted to MinIO and ``pdf_base64`` is no longer
+    written. Legacy rows that still carry ``pdf_base64`` are returned
+    in the old JSON shape for backwards compatibility with the mobile
+    app's existing download path. Legacy ``pdf_object_key`` rows pull
+    the bytes from MinIO and stream them through; the persisted object
+    is left in place for the migration script to clean up.
+
+    ``regenerate`` is accepted (and ignored) so any clients passing it
+    don't 422; behaviour is identical with or without it.
     """
     company_id = current_user["company_id"]
     inspection = await db.inspections.find_one({
@@ -6994,43 +7241,52 @@ async def get_inspection_pdf(inspection_id: str, regenerate: bool = False, curre
         raise HTTPException(status_code=404, detail="Inspection not found")
 
     has_minio_pdf = bool(inspection.get("pdf_object_key"))
-    has_legacy_pdf = bool(inspection.get("pdf_base64"))
+    has_legacy_b64 = bool(inspection.get("pdf_base64"))
 
-    if regenerate or not (has_minio_pdf or has_legacy_pdf):
-        photos = await fetch_inspection_photos(inspection_id)
-        inspection["photos"] = photos
-        vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
-        driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
-        company = await db.companies.find_one({"_id": ObjectId(inspection["company_id"])})
+    # Helper to wrap raw bytes in a streaming response that triggers a
+    # browser download. Filename is anchored on the inspection ID so the
+    # caller doesn't get an opaque "report.pdf" in their downloads list.
+    def _stream(pdf_bytes: bytes):
+        from fastapi.responses import StreamingResponse
+        from io import BytesIO
 
-        pdf_bytes = await generate_inspection_pdf_bytes(inspection, vehicle, driver, company)
-        pdf_object_key = await _store_inspection_pdf(
-            inspection_id, company_id, pdf_bytes,
+        filename = f"inspection_{inspection_id}.pdf"
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
-        await db.inspections.update_one(
-            {"_id": ObjectId(inspection_id)},
-            {
-                "$set": {"pdf_object_key": pdf_object_key},
-                "$unset": {"pdf_base64": ""},
-            },
-        )
-        return {
-            "pdf_object_key": pdf_object_key,
-            "pdf_url": _presign_if_key("inspection-photos", pdf_object_key),
-        }
 
-    if has_minio_pdf:
-        return {
-            "pdf_object_key": inspection["pdf_object_key"],
-            "pdf_url": _presign_if_key(
+    # Legacy base64 row — keep the old JSON-with-pdf_base64 shape so the
+    # mobile app's existing handler doesn't have to change. The web
+    # admin handler (ReportsPage) checks pdf_base64 first too.
+    if has_legacy_b64 and not regenerate:
+        return {"pdf_base64": inspection["pdf_base64"]}
+
+    # Legacy MinIO row — pull the persisted bytes once and stream them.
+    if has_minio_pdf and not regenerate:
+        try:
+            stored = object_store.get_bytes(
                 "inspection-photos", inspection["pdf_object_key"]
-            ),
-        }
+            )
+            if stored:
+                return _stream(stored)
+        except Exception as exc:
+            logger.warning(
+                f"Stored PDF fetch failed for inspection {inspection_id}: {exc}; "
+                f"regenerating ephemerally"
+            )
 
-    # Legacy fallback — base64 still on the document. Old clients
-    # continue to work; new clients can detect pdf_url is absent and
-    # fall back to pdf_base64 themselves.
-    return {"pdf_base64": inspection["pdf_base64"]}
+    # Default + regenerate path — build fresh in memory, stream out,
+    # never touch storage. The DB document keeps no PDF artifact.
+    photos = await fetch_inspection_photos(inspection_id)
+    inspection["photos"] = photos
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
+    driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
+    company = await db.companies.find_one({"_id": ObjectId(inspection["company_id"])})
+
+    pdf_bytes = await generate_inspection_pdf_bytes(inspection, vehicle, driver, company)
+    return _stream(pdf_bytes)
 
 # ============== Fuel Submission Routes ==============
 
@@ -7197,19 +7453,25 @@ async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_curren
 
 @api_router.get("/fuel/export/csv")
 async def export_fuel_csv(
-    date_from: str,
-    date_to: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,  # CSV "id1,id2,..." for multi-vehicle filter
     current_user: dict = Depends(get_current_user)
 ):
     """Export fuel logs to CSV, streamed row-by-row from a Mongo cursor.
 
-    ``date_from`` and ``date_to`` are mandatory (YYYY-MM-DD) and the range
-    is capped at 365 days. We stream rows as we read them from Mongo, so
-    memory stays bounded regardless of how many rows the tenant has —
-    earlier versions buffered the whole CSV in a StringIO before
-    responding, which is OOM-fragile for large fleets (Phase 2 of
-    STORAGE-PLAN.txt).
+    Phase 3.2 (2026-05-18 plan):
+    * date_from / date_to are optional. When both are omitted the
+      export covers all time. The 365-day cap only applies when a
+      bounded range is supplied — "all time" intentionally bypasses
+      it because the stream is memory-bounded already.
+    * vehicle_ids (comma-separated) lets the caller pick several
+      vehicles at once. Single vehicle_id stays supported for older
+      clients. Neither set = all vehicles.
+
+    Nothing is persisted server-side: rows stream straight to the
+    client from a Mongo cursor.
     """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -7219,36 +7481,46 @@ async def export_fuel_csv(
     from starlette.responses import StreamingResponse
     from datetime import datetime as dt
 
-    # Date-range validation. Both YYYY-MM-DD. Max 365-day window keeps
-    # the worst-case export bounded.
-    try:
-        df = dt.fromisoformat(date_from)
-        dtt = dt.fromisoformat(date_to)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="date_from and date_to must be YYYY-MM-DD",
-        )
-    if dtt < df:
-        raise HTTPException(
-            status_code=400,
-            detail="date_to must be >= date_from",
-        )
-    if (dtt - df).days > 365:
-        raise HTTPException(
-            status_code=400,
-            detail="Export window is capped at 365 days; please narrow the range",
-        )
+    df = None
+    dtt = None
+    if date_from or date_to:
+        if not (date_from and date_to):
+            raise HTTPException(
+                status_code=400,
+                detail="Specify both date_from and date_to, or neither (for all time)",
+            )
+        try:
+            df = dt.fromisoformat(date_from)
+            dtt = dt.fromisoformat(date_to)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="date_from and date_to must be YYYY-MM-DD",
+            )
+        if dtt < df:
+            raise HTTPException(
+                status_code=400,
+                detail="date_to must be >= date_from",
+            )
+        if (dtt - df).days > 365:
+            raise HTTPException(
+                status_code=400,
+                detail="Export window is capped at 365 days; please narrow the range or omit dates for an all-time export",
+            )
 
     company_id = current_user["company_id"]
-    query: dict = {
-        "company_id": company_id,
-        "timestamp": {
+    query: dict = {"company_id": company_id}
+    if df is not None and dtt is not None:
+        query["timestamp"] = {
             "$gte": date_from,
             "$lte": date_to + "T23:59:59",
-        },
-    }
-    if vehicle_id:
+        }
+
+    # vehicle_ids takes precedence over vehicle_id (multi-select case).
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
         query["vehicle_id"] = vehicle_id
 
     # Lookup maps — small (vehicles, drivers) so keep in memory once.
@@ -8479,19 +8751,21 @@ async def export_incidents_csv(
     severity: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,  # CSV "id1,id2,..." for multi-vehicle filter
     current_user: dict = Depends(get_current_user)
 ):
-    """Export incidents to CSV"""
+    """Export incidents to CSV. Phase 3.3: adds vehicle filtering."""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     import csv
     from io import StringIO
     from starlette.responses import StreamingResponse
-    
+
     company_id = current_user["company_id"]
-    query: dict = {"company_id": company_id}
-    
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+
     if status:
         query["status"] = status
     if severity:
@@ -8503,7 +8777,12 @@ async def export_incidents_csv(
         if date_to:
             date_filter["$lte"] = date_to + "T23:59:59"
         query["created_at"] = date_filter
-    
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
+        query["vehicle_id"] = vehicle_id
+
     incidents = await db.incidents.find(query, {"_id": 0, "damage_photos": 0, "scene_photos": 0, "other_vehicle_photos": 0}).sort("created_at", -1).to_list(10000)
     
     # Maps
@@ -8822,11 +9101,190 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     
     doc.build(elements)
     pdf_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    
+
     return {
         "pdf_base64": pdf_base64,
         "filename": f"incident_report_{vehicle_rego}_{incident_date.replace('/', '-').replace(':', '-').replace(' ', '_')}.pdf"
     }
+
+
+@api_router.get("/incidents/export/pdf")
+async def export_incidents_pdf(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,  # CSV "id1,id2,..." for multi-vehicle filter
+    current_user: dict = Depends(get_current_user),
+):
+    """Bulk-export incidents as a single PDF (one incident per page).
+
+    Phase 3.3 (2026-05-18 plan). Streamed in-memory — nothing persists
+    server-side. Filters mirror the CSV endpoint exactly so the same
+    admin UI can pick either format.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+    from reportlab.platypus import PageBreak
+
+    company_id = current_user["company_id"]
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+    if status:
+        query["status"] = status
+    if severity:
+        query["severity"] = severity
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to + "T23:59:59"
+        query["created_at"] = date_filter
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
+        query["vehicle_id"] = vehicle_id
+
+    # Cap at 500 incidents per export — that's already a ~500-page PDF.
+    # Anyone needing more should narrow filters or use CSV.
+    incidents = await db.incidents.find(query).sort("created_at", -1).to_list(500)
+
+    if not incidents:
+        raise HTTPException(status_code=404, detail="No incidents match the selected filters")
+
+    # Pre-fetch vehicle/driver/company maps so the per-incident loop is
+    # entirely from-memory rather than N×3 round-trips.
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = (company or {}).get("name", "FleetShield365")
+    company_tz = (company or {}).get("timezone", DEFAULT_TIMEZONE)
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
+
+    vehicle_id_set = {str(i.get("vehicle_id")) for i in incidents if i.get("vehicle_id")}
+    driver_id_set = {str(i.get("driver_id")) for i in incidents if i.get("driver_id")}
+    vehicles = await db.vehicles.find(
+        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}}
+    ).to_list(len(vehicle_id_set)) if vehicle_id_set else []
+    drivers = await db.users.find(
+        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}}
+    ).to_list(len(driver_id_set)) if driver_id_set else []
+    vehicle_map = {str(v["_id"]): v for v in vehicles}
+    driver_map = {str(d["_id"]): d for d in drivers}
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=40, rightMargin=40)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
+    elements: list = []
+
+    # Cover page
+    elements.append(Paragraph(f"{company_name} — Incident Report", title_style))
+    elements.append(Paragraph(f"{len(incidents)} incident(s) included.", styles['Normal']))
+    if date_from or date_to:
+        elements.append(Paragraph(
+            f"Date range: {date_from or 'beginning'} → {date_to or 'today'}",
+            styles['Normal']))
+    if severity:
+        elements.append(Paragraph(f"Severity filter: {severity}", styles['Normal']))
+    if status:
+        elements.append(Paragraph(f"Status filter: {status}", styles['Normal']))
+    if vid_list or vehicle_id:
+        picked = vid_list or [vehicle_id]
+        names = ", ".join(
+            f"{(vehicle_map.get(v) or {}).get('name', v)}" for v in picked
+        )
+        elements.append(Paragraph(f"Vehicle filter: {names}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(
+        f"Generated: {datetime.now(get_timezone(company_tz)).strftime('%d/%m/%Y %H:%M')} ({tz_display})",
+        footer_style))
+    elements.append(PageBreak())
+
+    severity_bg = {"minor": "#fef3c7", "moderate": "#fed7aa", "major": "#fecaca", "critical": "#fecdd3"}
+    severity_text = {"minor": "#92400e", "moderate": "#c2410c", "major": "#dc2626", "critical": "#9f1239"}
+    status_colors = {"reported": "#dc2626", "under_review": "#d97706", "resolved": "#16a34a", "closed": "#6b7280"}
+
+    for idx, incident in enumerate(incidents):
+        vehicle = vehicle_map.get(str(incident.get("vehicle_id"))) or {}
+        driver = driver_map.get(str(incident.get("driver_id"))) or {}
+        vehicle_name = vehicle.get("name", "Unknown")
+        vehicle_rego = vehicle.get("registration_number", "N/A")
+        d_name = driver.get("name", driver.get("email", "Unknown"))
+        d_user = driver.get("username", "")
+        driver_name = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+        sev = incident.get("severity", "unknown")
+        incident_date = format_timestamp(incident.get("created_at", ""), company_tz)
+
+        elements.append(Paragraph(
+            f"Incident #{idx + 1} — {sev.upper()}", title_style))
+
+        data = [
+            ["Incident ID:", str(incident.get("_id", ""))[:8] + "..."],
+            ["Date/Time:", f"{incident_date} ({tz_display})"],
+            ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
+            ["Driver:", driver_name],
+            ["Severity:", sev.title()],
+            ["Status:", incident.get("status", "pending").replace("_", " ").title()],
+            ["Location:", incident.get("location_address", "N/A")],
+        ]
+        table = Table(data, colWidths=[120, 350])
+        sev_bg = severity_bg.get(sev, "#f3f4f6")
+        sev_txt = severity_text.get(sev, "#1f2937")
+        status_color = status_colors.get(incident.get("status", ""), "#6b7280")
+        table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BACKGROUND', (1, 4), (1, 4), colors.HexColor(sev_bg)),
+            ('TEXTCOLOR', (1, 4), (1, 4), colors.HexColor(sev_txt)),
+            ('FONTNAME', (1, 4), (1, 4), 'Helvetica-Bold'),
+            ('TEXTCOLOR', (1, 5), (1, 5), colors.HexColor(status_color)),
+            ('FONTNAME', (1, 5), (1, 5), 'Helvetica-Bold'),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 12))
+
+        if incident.get("description"):
+            elements.append(Paragraph("<b>Description:</b>", styles['Normal']))
+            elements.append(Paragraph(incident.get("description", ""), styles['Normal']))
+            elements.append(Spacer(1, 10))
+
+        if incident.get("injuries_occurred"):
+            injury_style = ParagraphStyle('Injury', parent=styles['Normal'], textColor=colors.red)
+            elements.append(Paragraph("<b>⚠ INJURIES REPORTED</b>", injury_style))
+            elements.append(Paragraph(incident.get("injury_description", "No details provided"), styles['Normal']))
+            elements.append(Spacer(1, 10))
+
+        # Photo counts only — embedding every photo across 500 incidents
+        # would blow up the PDF. Owners can drill into the per-incident
+        # PDF endpoint if they need photo evidence.
+        photo_counts = [
+            ("Damage", len(incident.get("damage_photos", []) or [])),
+            ("Scene", len(incident.get("scene_photos", []) or [])),
+            ("Other vehicle", len(incident.get("other_vehicle_photos", []) or [])),
+        ]
+        attached = ", ".join(f"{n} {label}" for label, n in photo_counts if n)
+        if attached:
+            elements.append(Paragraph(f"<b>Photos attached:</b> {attached}", styles['Normal']))
+
+        if idx < len(incidents) - 1:
+            elements.append(PageBreak())
+
+    doc.build(elements)
+    buffer.seek(0)
+    filename = f"incidents_{utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
 
 
 @api_router.put("/incidents/{incident_id}")
@@ -10310,18 +10768,45 @@ async def register_company(data: CompanyRegister):
     except SubdomainValidationError as exc:
         raise _subdomain_error_to_http(exc)
 
-    # Create company
+    # Create company. Phase 4.2 — owner can disable trials globally
+    # (``trial_enabled=false`` in platform_config.pricing). When trials
+    # are off, new tenants land on past_due and have to subscribe before
+    # using the platform. When trials are on we honour the configured
+    # trial_max_vehicles cap (None = unlimited during trial).
     pricing_now = await get_pricing()
+    trial_on = bool(pricing_now.get("trial_enabled", True))
+    # Phase 5 — derive region defaults so we always have something to
+    # show even when the client didn't auto-detect. Country drives
+    # everything else: currency, units, locale.
+    norm_country = (data.country or "").upper()[:2] or None
+    units = data.units_system
+    if not units:
+        units = "imperial" if norm_country in {"US", "LR", "MM"} else "metric"
+    currency = (data.preferred_currency or "").upper()[:3] or None
+
     company_doc = {
         "name": data.company_name,
         "subdomain": resolved_subdomain,
         "vehicle_count": data.vehicle_count,
-        "subscription_status": "trialing",
+        "subscription_status": "trialing" if trial_on else "past_due",
         "subscription_plan": "pro",
-        "trial_end": (utcnow() + timedelta(days=pricing_now["trial_days"])).isoformat(),
+        # trial_end stays absent when trials are disabled — the
+        # require_active_subscription gate uses missing/expired as
+        # "needs to pay before drivers can use the app".
+        "trial_end": (
+            (utcnow() + timedelta(days=pricing_now["trial_days"])).isoformat()
+            if trial_on else None
+        ),
+        "max_vehicles": (
+            pricing_now.get("trial_max_vehicles") if trial_on else 0
+        ),
         "stripe_customer_id": None,
         "stripe_subscription_id": None,
         "timezone": data.timezone or DEFAULT_TIMEZONE,
+        "country": norm_country,
+        "preferred_currency": currency,
+        "units_system": units,
+        "locale": data.locale,
         "created_at": utcnow().isoformat(),
     }
     company_result = await db.companies.insert_one(company_doc)
@@ -11608,49 +12093,58 @@ async def developer_platform_stats(
             else:
                 buckets["gt30d"].append({**item, "days_left": days_left})
 
-    # MinIO storage: list every bucket and sum object sizes. Capped at
-    # 5000 objects per bucket to keep this call cheap on large
-    # tenants; we surface ``capped: true`` so the UI can flag the
-    # number as a lower bound.
+    # Phase 4.4 (2026-05-18 plan):
+    #  * Cap lifted from 5000 → 50000 objects per bucket so most tenants
+    #    are no longer truncated. We still flag `capped: true` if we hit
+    #    the new cap so the UI can render an "at least" qualifier.
+    #  * Dropped the hard-coded 89% compression ratio — we don't measure
+    #    raw input sizes anywhere, so the savings claim was fiction. The
+    #    response now reports bytes_stored only.
+    #  * Added a `categories` breakdown sourced from cheap Mongo counts
+    #    × a per-category size constant so the owner can see "X photos"
+    #    rather than only "bucket Y has Z bytes".
     BUCKETS = (
         "logos", "compliance", "inspection-photos", "fuel-receipts",
         "incident-photos", "incident-attachments", "service-records",
         "maintenance", "signatures", "photos",
     )
-    storage: dict = {"buckets": {}, "total_bytes": 0, "total_objects": 0, "capped": False}
+    SCAN_CAP = 50000
+    storage: dict = {
+        "buckets": {}, "total_bytes": 0, "total_objects": 0,
+        "bytes_stored_actual": 0, "capped_buckets": [],
+    }
     for name in BUCKETS:
         try:
             paginator = object_store._s3_client.get_paginator("list_objects_v2")
             total_b = 0
             total_n = 0
             scanned = 0
-            for page in paginator.paginate(Bucket=name, PaginationConfig={"MaxItems": 5000}):
+            capped_this_bucket = False
+            for page in paginator.paginate(Bucket=name, PaginationConfig={"MaxItems": SCAN_CAP}):
                 for obj in page.get("Contents") or []:
                     total_b += obj.get("Size", 0) or 0
                     total_n += 1
                     scanned += 1
-                    if scanned >= 5000:
-                        storage["capped"] = True
+                    if scanned >= SCAN_CAP:
+                        capped_this_bucket = True
                         break
-                if scanned >= 5000:
+                if scanned >= SCAN_CAP:
                     break
             storage["buckets"][name] = {"bytes": total_b, "objects": total_n}
             storage["total_bytes"] += total_b
             storage["total_objects"] += total_n
+            if capped_this_bucket:
+                storage["capped_buckets"].append(name)
         except Exception as exc:
             storage["buckets"][name] = {"error": f"{type(exc).__name__}: {exc}"}
+    storage["bytes_stored_actual"] = storage["total_bytes"]
+    storage["capped"] = bool(storage["capped_buckets"])
 
-    # Compression-savings estimate: STORAGE-PLAN.txt says ~89% reduction
-    # vs raw uncompressed. So raw size estimate = stored / (1 - 0.89).
-    if storage["total_bytes"] > 0:
-        estimated_raw = int(storage["total_bytes"] / 0.11)
-        savings = estimated_raw - storage["total_bytes"]
-    else:
-        estimated_raw = 0
-        savings = 0
-    storage["estimated_raw_bytes"] = estimated_raw
-    storage["estimated_saved_bytes"] = savings
-    storage["compression_ratio_pct"] = 89  # documented platform target
+    # Phase 4.4 — content-category breakdown. Counts are exact Mongo
+    # aggregations; the bytes column is `count × per-category KB`, so
+    # call it an estimate to distinguish from the authoritative per-
+    # bucket totals.
+    storage["categories"] = await _compute_storage_categories(company_filter=None)
 
     return {
         "tenants": tenant_count,
@@ -11741,16 +12235,30 @@ async def public_pricing():
 async def developer_get_pricing(
     current_user: dict = Depends(require_platform_owner),
 ):
-    """Read the platform-wide pricing config + Stripe sync state."""
+    """Read the platform-wide pricing config + Stripe sync state.
+
+    Phase 4.1 (2026-05-18 plan) — raw Stripe identifiers (price_xxx,
+    webhook secrets, API keys) are never returned. The UI only ever
+    sees boolean "configured / not configured" booleans so a screenshot
+    of the owner panel can't leak anything operationally sensitive.
+    """
     p = await get_pricing()
+    stripe_cfg = p.get("stripe") or {}
     return {
         "base_price": p["base_price"],
         "per_vehicle": p["per_vehicle"],
         "trial_days": p["trial_days"],
+        "trial_enabled": p.get("trial_enabled", True),
+        "trial_max_vehicles": p.get("trial_max_vehicles"),
         "currency": p.get("currency", "AUD"),
         "cadence": p.get("cadence", "monthly"),
-        "stripe": p.get("stripe"),
-        "stripe_configured": bool(stripe.api_key),
+        "stripe_status": {
+            "configured": bool(stripe.api_key),
+            "webhook_configured": bool(os.environ.get("STRIPE_WEBHOOK_SECRET")),
+            "base_price_set": bool(stripe_cfg.get("base_price_id")),
+            "vehicle_price_set": bool(stripe_cfg.get("vehicle_price_id")),
+            "last_synced_at": stripe_cfg.get("synced_at"),
+        },
         "updated_at": p.get("updated_at"),
     }
 
@@ -11759,6 +12267,8 @@ class PricingUpdate(BaseModel):
     base_price: Optional[float] = None
     per_vehicle: Optional[float] = None
     trial_days: Optional[int] = None
+    trial_enabled: Optional[bool] = None
+    trial_max_vehicles: Optional[int] = None  # None == unlimited
     currency: Optional[str] = None
     # `cadence` was removed — only monthly billing is supported. Kept
     # on the model as Optional[str] to gracefully ignore old clients
@@ -11779,7 +12289,10 @@ async def developer_set_pricing(
     UI can show a banner.
     """
     update: dict = {}
-    for k in ("base_price", "per_vehicle", "trial_days", "currency"):
+    for k in (
+        "base_price", "per_vehicle", "trial_days", "currency",
+        "trial_enabled", "trial_max_vehicles",
+    ):
         v = getattr(payload, k)
         if v is None:
             continue
@@ -11787,6 +12300,8 @@ async def developer_set_pricing(
             raise HTTPException(status_code=400, detail=f"{k} out of range")
         if k == "trial_days" and (v < 0 or v > 365):
             raise HTTPException(status_code=400, detail="trial_days must be 0-365")
+        if k == "trial_max_vehicles" and v is not None and (v < 0 or v > 10000):
+            raise HTTPException(status_code=400, detail="trial_max_vehicles must be 0-10000 or null")
         update[k] = v
     if not update:
         raise HTTPException(status_code=400, detail="No pricing fields provided")
@@ -11867,10 +12382,16 @@ async def developer_set_pricing(
 
     return {
         "ok": True,
-        "stripe_configured": bool(stripe.api_key),
+        # Phase 4.1 — never echo raw Stripe IDs back to the owner UI.
+        "stripe_status": {
+            "configured": bool(stripe.api_key),
+            "webhook_configured": bool(os.environ.get("STRIPE_WEBHOOK_SECRET")),
+            "base_price_set": bool((stripe_state or {}).get("base_price_id")),
+            "vehicle_price_set": bool((stripe_state or {}).get("vehicle_price_id")),
+            "last_synced_at": (stripe_state or {}).get("synced_at"),
+        },
         "stripe_synced": stripe_synced,
         "stripe_error": stripe_error,
-        "stripe": stripe_state,
     }
 
 
@@ -11884,14 +12405,18 @@ async def developer_org_storage(
     """Per-org MinIO storage usage. Owner panel calls this on demand
     from the Organisations table (not auto-loaded — could touch tens
     of thousands of objects across all tenants if we did)."""
+    # Phase 4.4 — cap raised from 5000 → 50000 to match the platform
+    # endpoint. Adds a content-category breakdown sourced from the
+    # tenant's own collections.
     BUCKETS = (
         "logos", "compliance", "inspection-photos", "fuel-receipts",
         "incident-photos", "incident-attachments", "service-records",
         "maintenance", "signatures", "photos",
     )
+    SCAN_CAP = 50000
     total_bytes = 0
     total_objects = 0
-    capped = False
+    capped_buckets: list = []
     by_bucket: dict = {}
     for name in BUCKETS:
         try:
@@ -11899,34 +12424,43 @@ async def developer_org_storage(
             b_bytes = 0
             b_objects = 0
             scanned = 0
-            # Tenant prefix is always `<company_id>/...` per
-            # object_store.upload_base64 — list with Prefix to
-            # restrict the scan to one tenant's slice.
+            capped_this = False
             for page in paginator.paginate(
                 Bucket=name,
                 Prefix=f"{company_id}/",
-                PaginationConfig={"MaxItems": 5000},
+                PaginationConfig={"MaxItems": SCAN_CAP},
             ):
                 for obj in page.get("Contents") or []:
                     b_bytes += obj.get("Size", 0) or 0
                     b_objects += 1
                     scanned += 1
-                    if scanned >= 5000:
-                        capped = True
+                    if scanned >= SCAN_CAP:
+                        capped_this = True
                         break
-                if scanned >= 5000:
+                if scanned >= SCAN_CAP:
                     break
             by_bucket[name] = {"bytes": b_bytes, "objects": b_objects}
             total_bytes += b_bytes
             total_objects += b_objects
+            if capped_this:
+                capped_buckets.append(name)
         except Exception as exc:
             by_bucket[name] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    categories = await _compute_storage_categories(
+        company_filter={"company_id": company_id}
+    )
+
     return {
         "company_id": company_id,
         "total_bytes": total_bytes,
+        "bytes_stored_actual": total_bytes,
         "total_objects": total_objects,
         "by_bucket": by_bucket,
-        "capped": capped,
+        "buckets": by_bucket,  # alias for parity with platform endpoint
+        "capped": bool(capped_buckets),
+        "capped_buckets": capped_buckets,
+        "categories": categories,
         "generated_at": utcnow().isoformat(),
     }
 
