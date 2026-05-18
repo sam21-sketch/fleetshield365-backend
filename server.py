@@ -7481,6 +7481,107 @@ async def get_fuel_receipt(fuel_id: str, current_user: dict = Depends(get_curren
         "receipt_photo_base64": receipt,
     }
 
+@api_router.get("/fuel/receipts/download")
+async def export_fuel_receipts_zip(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Owner review 2026-05-18: stream all fuel receipt photos as a ZIP
+    with the same filters as the CSV export. Photos pulled from the
+    fuel-receipts MinIO bucket (or legacy inline base64 fallback).
+    In-memory ZIP, no /tmp file."""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+
+    company_id = current_user["company_id"]
+    query: dict = {"company_id": company_id}
+    if date_from or date_to:
+        if not (date_from and date_to):
+            raise HTTPException(
+                status_code=400,
+                detail="Specify both date_from and date_to, or neither",
+            )
+        query["timestamp"] = {
+            "$gte": date_from,
+            "$lte": date_to + "T23:59:59",
+        }
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
+        query["vehicle_id"] = vehicle_id
+
+    # Vehicle name map for folder naming inside the ZIP.
+    vehicles = await db.vehicles.find(
+        {"company_id": company_id},
+        {"name": 1, "registration_number": 1},
+    ).to_list(2000)
+    vehicle_map = {
+        str(v["_id"]): (v.get("registration_number") or v.get("name") or str(v["_id"]))
+        for v in vehicles
+    }
+
+    # Cap at 2000 receipts per export to bound memory.
+    submissions = await db.fuel_submissions.find(
+        query, {"vehicle_id": 1, "timestamp": 1, "receipt_object_key": 1,
+                "receipt_photo_base64": 1, "fuel_station": 1}
+    ).sort("timestamp", -1).to_list(2000)
+
+    if not submissions:
+        raise HTTPException(status_code=404, detail="No fuel receipts match the selected filters")
+
+    zip_buffer = BytesIO()
+    manifest_lines = [
+        "FleetShield365 Fuel Receipt Export",
+        f"Generated: {utcnow().isoformat()}",
+        f"Filters: vehicles={vid_list or [vehicle_id] if vehicle_id else 'all'} dates={date_from}..{date_to}",
+        f"Receipts: {len(submissions)}",
+        "",
+    ]
+    written = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for sub in submissions:
+            vname = vehicle_map.get(sub.get("vehicle_id", ""), "unknown")
+            ts = str(sub.get("timestamp", ""))[:19].replace(":", "-").replace("T", "_")
+            station = (sub.get("fuel_station") or "").replace("/", "_").replace("\\", "_")[:40]
+            filename = f"{vname}/{ts}{('_' + station) if station else ''}.jpg"
+            image_bytes: Optional[bytes] = None
+            key = sub.get("receipt_object_key")
+            if key:
+                try:
+                    image_bytes = object_store.get_bytes("fuel-receipts", key)
+                except Exception as exc:
+                    logger.warning(f"Receipt {key} unreadable: {exc}")
+            if image_bytes is None and sub.get("receipt_photo_base64"):
+                raw = sub["receipt_photo_base64"]
+                if raw.startswith("data:"):
+                    raw = raw.split(",", 1)[1] if "," in raw else raw
+                try:
+                    image_bytes = base64.b64decode(raw)
+                except Exception:
+                    image_bytes = None
+            if image_bytes is None:
+                manifest_lines.append(f"- SKIPPED {filename} (no readable receipt)")
+                continue
+            zf.writestr(filename, image_bytes)
+            manifest_lines.append(f"- {filename}")
+            written += 1
+        zf.writestr("manifest.txt", "\n".join(manifest_lines))
+
+    zip_buffer.seek(0)
+    out_name = f"fuel_receipts_{utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={out_name}"},
+    )
+
+
 @api_router.get("/fuel/export/csv")
 async def export_fuel_csv(
     date_from: Optional[str] = None,
@@ -11593,11 +11694,15 @@ async def create_upgrade_checkout(
 
 @api_router.get("/subscription")
 async def get_subscription(current_user: dict = Depends(get_current_user)):
+    """Subscription snapshot for the admin billing page. Phase 6
+    (2026-05-18 owner review): now returns the live pricing so the
+    page can render real numbers in the tenant's preferred currency
+    (was previously hard-coded "$0 Founding Member" on the frontend)."""
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])})
-    
+
     # Get trial status
     trial_status = await get_trial_status(current_user["company_id"])
-    
+
     plans = {
         "basic": {"max_vehicles": 5, "price": 0},
         "standard": {"max_vehicles": 20, "price": 49},
@@ -11606,20 +11711,43 @@ async def get_subscription(current_user: dict = Depends(get_current_user)):
         # response encoder — use None and let the client render "∞".
         "pro": {"max_vehicles": None, "price": 99}
     }
-    
+
     current_plan = company.get("subscription_plan", "basic")
     plan_details = plans.get(current_plan, plans["basic"])
-    
+
+    # Live pricing from platform_config — single source of truth shared
+    # with /api/pricing and the marketing pages.
+    pricing = await get_pricing()
+    active_vehicles = await db.vehicles.count_documents({
+        **_soft_delete_filter(),
+        "company_id": current_user["company_id"],
+    })
+
     return {
         "current_plan": current_plan,
         "plan_details": plan_details,
-        "active_vehicles": company.get("active_vehicles_count", 0),
+        "active_vehicles": active_vehicles,
         "billing_history": company.get("billing_history", []),
         "trial_status": trial_status.get("status"),
         "trial_days_left": trial_status.get("days_left"),
         "trial_end": trial_status.get("trial_end"),
+        "trial_enabled": pricing.get("trial_enabled", True),
         "is_active": trial_status.get("is_active", False),
-        "subscription_message": trial_status.get("message")
+        "subscription_message": trial_status.get("message"),
+        "subscription_status": company.get("subscription_status"),
+        # Live pricing (always in the platform currency from owner panel).
+        "pricing": {
+            "base_price": pricing["base_price"],
+            "per_vehicle": pricing["per_vehicle"],
+            "trial_days": pricing["trial_days"],
+            "currency": pricing.get("currency", "AUD"),
+            "cadence": pricing.get("cadence", "monthly"),
+        },
+        # Tenant's preferred display currency. The frontend converts
+        # the platform-currency amounts above into this for display.
+        # Stripe still charges in the platform currency.
+        "preferred_currency": company.get("preferred_currency"),
+        "country": company.get("country"),
     }
 
 
@@ -13498,6 +13626,57 @@ def _subdomain_recently_retired(
         if isinstance(changed_at, datetime) and changed_at >= cutoff:
             return True
     return False
+
+
+@api_router.get("/company/subdomain-suggest")
+async def suggest_subdomain_from_name(
+    name: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Owner review 2026-05-18: when an admin renames the company, we
+    want to suggest a matching tenant subdomain rather than make them
+    type one. The slug_generator helper already handles uniqueness by
+    suffixing a, b, c, … against active tenants + the recently-retired
+    history. This endpoint just exposes that for the Settings UI.
+    """
+    role = current_user.get("jwt_role") or current_user.get("role")
+    if role not in {UserRole.SUPER_ADMIN, UserRole.PLATFORM_OWNER}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only super_admin or platform_owner may rename the subdomain",
+        )
+    if not name or not name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+
+    company_id = current_user.get("company_id")
+    company = await db.companies.find_one(
+        {"_id": ObjectId(company_id)},
+        {"subdomain": 1, "subdomain_history": 1, "subdomain_last_renamed_at": 1},
+    )
+    current_subdomain = (company or {}).get("subdomain")
+
+    suggested = await slug_generator(name, db)
+    # If the slug_generator picked the same slug we already have, there
+    # is nothing to rename — surface that to the UI so it can hide the
+    # prompt rather than offering a confusing "rename to <current>" CTA.
+    is_same = (suggested == current_subdomain)
+
+    # Cooldown — reuse the same window the actual rename endpoint enforces.
+    next_permitted_at = None
+    last = (company or {}).get("subdomain_last_renamed_at")
+    if isinstance(last, datetime):
+        next_permitted_at = (last + SUBDOMAIN_RENAME_COOLDOWN).isoformat()
+
+    return {
+        "current_subdomain": current_subdomain,
+        "suggested_subdomain": suggested,
+        "is_same": is_same,
+        "next_permitted_at": next_permitted_at,
+        "in_cooldown": bool(
+            isinstance(last, datetime)
+            and (utcnow() - last) < SUBDOMAIN_RENAME_COOLDOWN
+        ),
+    }
 
 
 @api_router.put("/company/subdomain")
