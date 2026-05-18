@@ -1278,19 +1278,35 @@ async def generate_weekly_summary():
             </html>
             """
             
-            # Send to all admins
+            # Send to admins who haven't opted out. Phase 6 (2026-05-18):
+            # the weekly summary is now per-user opt-in. ``weekly_summary``
+            # is the new flag (default True so users who never visited the
+            # toggle still receive the digest); ``email_enabled`` is the
+            # master kill-switch.
             admins = await db.users.find({
                 "company_id": company_id,
                 "role": {"$in": ["super_admin", "admin"]}
             }).to_list(100)
-            
+
+            admin_ids = [str(a["_id"]) for a in admins]
+            all_prefs = await db.notification_preferences.find(
+                {"user_id": {"$in": admin_ids}}
+            ).to_list(100)
+            prefs_map = {p["user_id"]: p for p in all_prefs}
+
             for admin in admins:
-                if admin.get("email"):
-                    await send_email_notification(
-                        admin["email"],
-                        f"[FleetShield365] Weekly Summary — {week_start} to {week_end}",
-                        html_content
-                    )
+                if not admin.get("email"):
+                    continue
+                prefs = prefs_map.get(str(admin["_id"]), {})
+                if not prefs.get("email_enabled", True):
+                    continue
+                if not prefs.get("weekly_summary", True):
+                    continue
+                await send_email_notification(
+                    admin["email"],
+                    f"[FleetShield365] Weekly Summary — {week_start} to {week_end}",
+                    html_content
+                )
         
         logger.info("Weekly summary emails sent to all companies")
     except Exception as e:
@@ -8145,22 +8161,36 @@ async def get_service_records_summary(current_user: dict = Depends(get_current_u
 @api_router.get("/service-records/export/csv")
 async def export_service_records_csv(
     vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,  # CSV multi-vehicle filter
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Export service records to CSV format"""
+    """Export service records to CSV. Phase 6 (2026-05-18): adds
+    vehicle multi-select + date range filters."""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     import csv
     from io import StringIO
     from starlette.responses import StreamingResponse
-    
+
     company_id = current_user["company_id"]
-    query = {"company_id": company_id}
-    
-    if vehicle_id:
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
         query["vehicle_id"] = vehicle_id
-    
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to + "T23:59:59"
+        query["service_date"] = date_filter
+
     records = await db.service_records.find(query).sort("service_date", -1).to_list(10000)
     
     # Get vehicles for names
@@ -8208,17 +8238,113 @@ async def export_service_records_csv(
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+@api_router.get("/service-records/{record_id}/pdf")
+async def get_service_record_pdf(
+    record_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Stream a single service record as a one-page PDF. Phase 6
+    (2026-05-18). Generated in-memory; no MinIO write, no /tmp file."""
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+
+    company_id = current_user["company_id"]
+    record = await db.service_records.find_one({
+        "_id": ObjectId(record_id),
+        "company_id": company_id,
+    })
+    if not record:
+        raise HTTPException(status_code=404, detail="Service record not found")
+
+    vehicle = await db.vehicles.find_one({"_id": ObjectId(record.get("vehicle_id", ""))}) if record.get("vehicle_id") else None
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = (company or {}).get("name", "FleetShield365")
+    company_tz = (company or {}).get("timezone", DEFAULT_TIMEZONE)
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
+    vehicle_name = (vehicle or {}).get("name", "Unknown")
+    vehicle_rego = (vehicle or {}).get("registration_number", "N/A")
+
+    service_type = (record.get("service_type") or "").title()
+    if record.get("service_type_other"):
+        service_type = f"Other: {record['service_type_other']}"
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=40, rightMargin=40)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
+    elements: list = []
+
+    elements.append(Paragraph(f"{company_name} — Service Record", title_style))
+
+    data = [
+        ["Record ID:", str(record.get("_id", ""))[:8] + "..."],
+        ["Service date:", record.get("service_date", "")],
+        ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
+        ["Service type:", service_type],
+        ["Cost:", f"${record.get('cost', 0):,.2f}" if record.get('cost') is not None else "—"],
+        ["Odometer:", str(record.get("odometer_reading", "—"))],
+        ["Technician:", record.get("technician_name", "—")],
+        ["Workshop:", record.get("workshop_name", "—")],
+        ["Next service date:", record.get("next_service_date", "—")],
+        ["Next service km:", str(record.get("next_service_odometer", "—"))],
+        ["Warranty until:", record.get("warranty_until", "—")],
+    ]
+    table = Table(data, colWidths=[140, 350])
+    table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 14))
+
+    if record.get("description"):
+        elements.append(Paragraph("<b>Description:</b>", styles['Normal']))
+        elements.append(Paragraph(record.get("description", ""), styles['Normal']))
+        elements.append(Spacer(1, 10))
+
+    if record.get("warranty_notes"):
+        elements.append(Paragraph("<b>Warranty notes:</b>", styles['Normal']))
+        elements.append(Paragraph(record["warranty_notes"], styles['Normal']))
+        elements.append(Spacer(1, 10))
+
+    attachments = record.get("attachments") or record.get("attachment_object_keys") or []
+    if attachments:
+        elements.append(Paragraph(
+            f"<b>Attachments:</b> {len(attachments)} file(s) — view in admin panel",
+            styles['Normal']))
+
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph(
+        f"Generated: {datetime.now(get_timezone(company_tz)).strftime('%d/%m/%Y %H:%M')} ({tz_display})",
+        footer_style))
+
+    doc.build(elements)
+    buffer.seek(0)
+    filename = f"service_record_{record_id}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @api_router.get("/service-records/{record_id}")
 async def get_service_record(record_id: str, current_user: dict = Depends(get_current_user)):
     """Get a single service record by ID"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     record = await db.service_records.find_one({
         "_id": ObjectId(record_id),
         "company_id": current_user["company_id"]
     })
-    
+
     if not record:
         raise HTTPException(status_code=404, detail="Service record not found")
     
@@ -9678,6 +9804,15 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     ])
     last_insp_map = {doc["_id"]: doc["last"] for doc in await last_insp_cursor.to_list(1000)}
     
+    # Phase 6 (2026-05-18) — load per-defect status overrides up front so
+    # the fleet-health view reflects the same fixed/in-progress state
+    # that VehicleDefectsPage shows. Previously this endpoint only
+    # honoured the legacy inspection-level ``defect_status`` field, which
+    # the override endpoint never writes to, so fixed defects kept
+    # showing as open here.
+    overrides_cursor = db.defect_overrides.find({"company_id": company_id})
+    overrides_by_id: dict = {doc["defect_id"]: doc async for doc in overrides_cursor}
+
     # Build defects per vehicle
     defects_by_vehicle: dict = {}
     def _ts_to_dt(t):
@@ -9689,6 +9824,14 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
             except Exception:
                 return None
         return None
+
+    def _status_for(defect_id: str, insp_doc: dict) -> str:
+        override = overrides_by_id.get(defect_id)
+        if override:
+            return override.get("status", "open")
+        # Fall back to the legacy inspection-level field for back-compat.
+        return insp_doc.get("defect_status", "open")
+
     for insp in inspections:
         # Skip inspections older than 30 days (filter in Python — handles both string + datetime timestamps)
         ts_dt = _ts_to_dt(insp.get("timestamp"))
@@ -9697,36 +9840,41 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
         vid = insp.get("vehicle_id")
         if not vid:
             continue
+        inspection_id = str(insp.get("_id"))
         bucket = defects_by_vehicle.setdefault(vid, [])
         # Pre-start failed checklist items
-        for item in (insp.get("checklist_items") or []):
-            if item.get("status") == "issue":
-                bucket.append({
-                    "source": "prestart",
-                    "name": item.get("name"),
-                    "comment": item.get("comment"),
-                    "timestamp": insp.get("timestamp"),
-                    "severity": _classify_defect_severity(item.get("name", ""), False, False),
-                    "status": insp.get("defect_status", "open"),
-                })
+        for idx, item in enumerate(insp.get("checklist_items") or []):
+            if item.get("status") != "issue":
+                continue
+            d_id = _make_defect_id(inspection_id, "checklist", idx)
+            bucket.append({
+                "source": "prestart",
+                "name": item.get("name"),
+                "comment": item.get("comment"),
+                "timestamp": insp.get("timestamp"),
+                "severity": _classify_defect_severity(item.get("name", ""), False, False),
+                "status": _status_for(d_id, insp),
+            })
         # End-shift damage / incident
         if insp.get("new_damage"):
+            d_id = _make_defect_id(inspection_id, "endshift", "damage")
             bucket.append({
                 "source": "endshift",
                 "name": "New damage reported",
                 "comment": insp.get("damage_comment"),
                 "timestamp": insp.get("timestamp"),
                 "severity": "medium",
-                "status": insp.get("defect_status", "open"),
+                "status": _status_for(d_id, insp),
             })
         if insp.get("incident_today"):
+            d_id = _make_defect_id(inspection_id, "endshift", "incident")
             bucket.append({
                 "source": "endshift",
                 "name": "Incident reported",
                 "comment": insp.get("incident_comment"),
                 "timestamp": insp.get("timestamp"),
                 "severity": "high",
-                "status": insp.get("defect_status", "open"),
+                "status": _status_for(d_id, insp),
             })
     
     # Calculate per-vehicle score
@@ -11098,6 +11246,7 @@ class NotificationPreferencesUpdate(BaseModel):
     issue_alerts: Optional[bool] = None
     missed_inspection_alerts: Optional[bool] = None
     daily_summary: Optional[bool] = None
+    weekly_summary: Optional[bool] = None  # Phase 6 (2026-05-18) — per-user opt-in for Monday digest
     push_enabled: Optional[bool] = None
     email_enabled: Optional[bool] = None
     # Per-activity email toggles. These mirror the admin web settings
@@ -11153,12 +11302,15 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
     prefs = await db.notification_preferences.find_one({"user_id": current_user["id"]})
     
     if not prefs:
-        # Return defaults
+        # Return defaults. weekly_summary defaults True to preserve the
+        # pre-toggle behaviour (every admin used to receive the Monday
+        # digest unconditionally).
         return {
             "expiry_alerts": True,
             "issue_alerts": True,
             "missed_inspection_alerts": True,
             "daily_summary": False,
+            "weekly_summary": True,
             "push_enabled": True,
             "email_enabled": True,
             "prestart_email": False,
@@ -11172,6 +11324,7 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
         "issue_alerts": prefs.get("issue_alerts", True),
         "missed_inspection_alerts": prefs.get("missed_inspection_alerts", True),
         "daily_summary": prefs.get("daily_summary", False),
+        "weekly_summary": prefs.get("weekly_summary", True),
         "push_enabled": prefs.get("push_enabled", True),
         "email_enabled": prefs.get("email_enabled", True),
         "prestart_email": prefs.get("prestart_email", False),
@@ -11564,19 +11717,22 @@ async def get_support_request(
     request_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get a single support request"""
+    """Get a single support request. Phase 6 (2026-05-18): platform
+    owner sees every ticket; company admins see their tenant's
+    tickets; drivers see only their own."""
     request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
-    
+
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
-    
-    # Check access
-    if request["company_id"] != current_user["company_id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if current_user.get("role") not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
-        if request["user_id"] != str(current_user["_id"]):
+
+    is_platform_owner = bool(current_user.get("is_platform_owner")) or current_user.get("role") == "platform_owner"
+    if not is_platform_owner:
+        # Tenant scope check.
+        if request["company_id"] != current_user["company_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
+        if current_user.get("role") not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+            if request["user_id"] != str(current_user["_id"]):
+                raise HTTPException(status_code=403, detail="Access denied")
     
     return {
         "id": str(request["_id"]),
@@ -11600,34 +11756,116 @@ async def update_support_request(
     update_data: SupportRequestUpdate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Update support request (admin only) - respond or change status"""
-    if current_user.get("role") not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+    """Update support request — company admins (own tenant only) AND
+    platform_owner (any tenant). Phase 6 (2026-05-18) extends this so
+    the owner can reply / resolve / close any ticket platform-wide.
+    """
+    is_platform_owner = bool(current_user.get("is_platform_owner")) or current_user.get("role") == "platform_owner"
+    is_admin = current_user.get("role") in [UserRole.SUPER_ADMIN, UserRole.ADMIN]
+    if not (is_admin or is_platform_owner):
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     request = await db.support_requests.find_one({"_id": ObjectId(request_id)})
-    
     if not request:
         raise HTTPException(status_code=404, detail="Support request not found")
-    
-    if request["company_id"] != current_user["company_id"]:
+
+    # Company admins can only touch their own tenant's tickets. Owner
+    # bypasses this check.
+    if not is_platform_owner and request["company_id"] != current_user["company_id"]:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    update_fields = {"updated_at": utcnow()}
-    
+
+    update_fields: dict = {"updated_at": utcnow()}
+
     if update_data.status:
         update_fields["status"] = update_data.status
         if update_data.status in [SupportRequestStatus.RESOLVED, SupportRequestStatus.CLOSED]:
             update_fields["resolved_at"] = utcnow()
-    
+
     if update_data.admin_response:
         update_fields["admin_response"] = update_data.admin_response
-    
+        update_fields["responded_by"] = (
+            "platform_owner" if is_platform_owner else "admin"
+        )
+        update_fields["responded_at"] = utcnow()
+
     await db.support_requests.update_one(
         {"_id": ObjectId(request_id)},
         {"$set": update_fields}
     )
-    
+
     return {"message": "Support request updated successfully"}
+
+
+# ============== Developer: platform-wide support inbox ==============
+
+@api_router.get("/developer/support")
+async def developer_list_support_requests(
+    current_user: dict = Depends(require_platform_owner),
+    status: Optional[str] = None,
+    limit: int = 200,
+):
+    """Platform owner inbox — every support ticket across every tenant.
+    Annotated with company name so the owner can see who raised what.
+    Phase 6 (2026-05-18)."""
+    query: dict = {}
+    if status:
+        query["status"] = status
+
+    requests = (
+        await db.support_requests.find(query)
+        .sort("created_at", -1)
+        .limit(max(1, min(limit, 500)))
+        .to_list(max(1, min(limit, 500)))
+    )
+
+    # Annotate with company name in one batch query.
+    company_ids = {r.get("company_id") for r in requests if r.get("company_id")}
+    companies = (
+        await db.companies.find(
+            {"_id": {"$in": [ObjectId(c) for c in company_ids if c]}}
+        ).to_list(len(company_ids))
+        if company_ids
+        else []
+    )
+    company_map = {str(c["_id"]): c for c in companies}
+
+    return [
+        {
+            "id": str(r["_id"]),
+            "ticket_number": f"SR-{str(r['_id'])[-6:].upper()}",
+            "company_id": r.get("company_id"),
+            "company_name": (company_map.get(r.get("company_id", "")) or {}).get("name"),
+            "company_subdomain": (company_map.get(r.get("company_id", "")) or {}).get("subdomain"),
+            "user_name": r.get("user_name"),
+            "user_email": r.get("user_email"),
+            "user_role": r.get("user_role"),
+            "subject": r.get("subject"),
+            "message": r.get("message"),
+            "category": r.get("category"),
+            "status": r.get("status"),
+            "admin_response": r.get("admin_response"),
+            "responded_by": r.get("responded_by"),
+            "responded_at": r.get("responded_at").isoformat() if isinstance(r.get("responded_at"), datetime) else r.get("responded_at"),
+            "created_at": r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else r.get("created_at"),
+            "updated_at": r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else r.get("updated_at"),
+            "resolved_at": r.get("resolved_at").isoformat() if isinstance(r.get("resolved_at"), datetime) else r.get("resolved_at"),
+        }
+        for r in requests
+    ]
+
+
+@api_router.get("/developer/support/stats")
+async def developer_support_stats(
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Platform-wide ticket counters for the owner inbox header."""
+    return {
+        "total": await db.support_requests.count_documents({}),
+        "open": await db.support_requests.count_documents({"status": "open"}),
+        "in_progress": await db.support_requests.count_documents({"status": "in_progress"}),
+        "resolved": await db.support_requests.count_documents({"status": "resolved"}),
+        "closed": await db.support_requests.count_documents({"status": "closed"}),
+    }
 
 # FAQ Data (static, no database needed)
 FAQ_DATA = [
