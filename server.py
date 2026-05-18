@@ -5829,8 +5829,22 @@ async def get_drivers(
 async def create_driver(user: UserRegister, request: Request, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Check if email is provided and already exists
+
+    # Owner review 2026-05-18: driver email is now required (credentials
+    # email + verification flow assumes one) and phone must be exactly
+    # 10 digits when supplied. The web form mirrors these rules so this
+    # is mainly a backend safety net for direct API callers.
+    if not user.email or not user.email.strip():
+        raise HTTPException(status_code=400, detail="Driver email is required")
+    if user.phone:
+        phone_digits = "".join(ch for ch in user.phone if ch.isdigit())
+        if len(phone_digits) != 10:
+            raise HTTPException(
+                status_code=400,
+                detail="Driver phone must be exactly 10 digits",
+            )
+
+    # Check if email already exists
     if user.email:
         existing = await db.users.find_one({"email": user.email.lower()})
         
@@ -7652,11 +7666,20 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
     """Update driver details including license and training"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    
+
+    # Phone must be 10 digits when provided (same rule as create).
+    if update.phone is not None:
+        phone_digits = "".join(ch for ch in update.phone if ch.isdigit())
+        if update.phone.strip() and len(phone_digits) != 10:
+            raise HTTPException(
+                status_code=400,
+                detail="Driver phone must be exactly 10 digits",
+            )
+
     update_data = {k: v for k, v in update.dict().items() if v is not None}
     if update_data:
         await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
