@@ -5503,10 +5503,16 @@ async def _compute_storage_categories(company_filter: Optional[dict] = None) -> 
         return result[0]["total"] if result else 0
 
     soft = _soft_delete_filter()
+    # Owner review 2026-05-19: the inspections collection uses field
+    # name `type` ("prestart" / "end_shift"), NOT `inspection_type`.
+    # The previous version of this helper returned 0 for both classes
+    # of inspection photos because the match never hit a single doc —
+    # so the Storage page's "Prestart inspection photos" + "End-shift
+    # inspection photos" rows always read 0.
     prestart_photos = await _photo_count(
-        db.inspections, f({**soft, "inspection_type": "prestart"}), "photo_refs")
+        db.inspections, f({**soft, "type": "prestart"}), "photo_refs")
     endshift_photos = await _photo_count(
-        db.inspections, f({**soft, "inspection_type": "end_shift"}), "photo_refs")
+        db.inspections, f({**soft, "type": "end_shift"}), "photo_refs")
     incident_damage = await _photo_count(
         db.incidents, f({**soft}), "damage_photos")
     incident_scene = await _photo_count(
@@ -5520,8 +5526,13 @@ async def _compute_storage_categories(company_filter: Optional[dict] = None) -> 
         f({**soft, "signature_object_key": {"$exists": True, "$ne": None}}))
     fuel_receipts = await db.fuel_submissions.count_documents(
         f({"receipt_object_key": {"$exists": True, "$ne": None}}))
+    # Service-record attachments live under two field names: the new
+    # `attachment_object_keys` array (post-Phase-2) and the legacy
+    # `attachments` array (pre-migration rows). Count both.
     service_attachments = await _photo_count(
         db.service_records, f({**soft}), "attachment_object_keys")
+    service_attachments += await _photo_count(
+        db.service_records, f({**soft, "attachment_object_keys": {"$exists": False}}), "attachments")
     maintenance_invoices = await db.maintenance_logs.count_documents(
         f({**soft, "invoice_object_key": {"$exists": True, "$ne": None}}))
     logos = await db.companies.count_documents(
