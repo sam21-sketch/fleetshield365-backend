@@ -1816,6 +1816,34 @@ def _safe_html(value) -> str:
     return _html_lib.escape(str(value), quote=True)
 
 
+async def _check_idempotency(collection, company_id: str, idempotency_key: Optional[str]) -> Optional[dict]:
+    """Return an existing doc when (company_id, idempotency_key) matches.
+
+    Used by inspections / fuel / incidents POST handlers so the mobile
+    upload queue can safely retry a request after a network blip
+    without creating a duplicate record. Mobile sends its
+    ``uploadQueue.dedupHash`` as the ``idempotency_key`` — the value
+    is stable across retries of the same submission but distinct
+    across genuinely-new submissions.
+
+    Returns None when no key is provided (legacy clients) or no
+    match is found.
+    """
+    if not idempotency_key:
+        return None
+    key = str(idempotency_key).strip()
+    if not key:
+        return None
+    try:
+        return await collection.find_one({
+            "company_id": company_id,
+            "idempotency_key": key,
+        })
+    except Exception as exc:
+        logger.warning("idempotency lookup failed: %s", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — soft-delete + audit trail helpers (TODO.md Phase 4).
 #
@@ -3202,6 +3230,7 @@ class FuelSubmission(BaseModel):
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
     timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
+    idempotency_key: Optional[str] = None  # see PrestartCreate
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -3323,6 +3352,12 @@ class PrestartCreate(BaseModel):
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
     timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
+    # 2026-05-19 — client-supplied idempotency key. Set to the mobile
+    # uploadQueue's `dedupHash` so a queue retry after a network blip
+    # hits the same key and the server returns the existing inspection
+    # instead of inserting a second copy. Owner-reported duplicates in
+    # WhatsApp screenshot.
+    idempotency_key: Optional[str] = None
 
 class EndShiftCreate(BaseModel):
     vehicle_id: str
@@ -3341,6 +3376,7 @@ class EndShiftCreate(BaseModel):
     gps_longitude: Optional[float] = None
     location_address: Optional[str] = None
     timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
+    idempotency_key: Optional[str] = None  # see PrestartCreate
 
 # Maintenance Models
 class MaintenanceLogCreate(BaseModel):
@@ -3462,6 +3498,7 @@ class IncidentCreate(BaseModel):
     other_vehicle_photos: List[str] = []  # Base64 encoded photos
     scene_photos: List[str] = []  # Base64 encoded photos
     timestamp: Optional[str] = None  # ISO timestamp from mobile app (for offline submissions)
+    idempotency_key: Optional[str] = None  # see PrestartCreate
 
 class IncidentUpdate(BaseModel):
     status: Optional[str] = None  # reported, under_review, resolved, closed
@@ -7318,6 +7355,15 @@ async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user
 
 @api_router.post("/inspections/prestart")
 async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(get_current_user)):
+    # 2026-05-19 — idempotency. Queue retries from the mobile app resend
+    # the same payload with the same dedupHash → idempotency_key. Return
+    # the existing record instead of creating a duplicate.
+    existing = await _check_idempotency(
+        db.inspections, current_user["company_id"], inspection.idempotency_key,
+    )
+    if existing:
+        return serialize_doc(existing)
+
     # Get vehicle
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
@@ -7431,9 +7477,10 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
         "timestamp": inspection_timestamp,
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None,
-        "is_safe": not has_issues
+        "is_safe": not has_issues,
+        "idempotency_key": (inspection.idempotency_key or None),
     }
-    
+
     await db.inspections.insert_one(inspection_doc)
     
     # Update vehicle odometer
@@ -7533,6 +7580,13 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
 
 @api_router.post("/inspections/end-shift")
 async def create_end_shift(inspection: EndShiftCreate, request: Request, current_user: dict = Depends(get_current_user)):
+    # 2026-05-19 — see prestart for context.
+    existing = await _check_idempotency(
+        db.inspections, current_user["company_id"], inspection.idempotency_key,
+    )
+    if existing:
+        return serialize_doc(existing)
+
     vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -7640,9 +7694,10 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
         "timestamp": inspection_timestamp,
         "ip_address": request.client.host if request.client else "unknown",
         "pdf_base64": None,
-        "is_safe": not (inspection.new_damage or inspection.incident_today)
+        "is_safe": not (inspection.new_damage or inspection.incident_today),
+        "idempotency_key": (inspection.idempotency_key or None),
     }
-    
+
     await db.inspections.insert_one(inspection_doc)
     
     # Update vehicle odometer
@@ -8014,6 +8069,13 @@ async def get_inspection_pdf(
 @api_router.post("/fuel")
 async def create_fuel_submission(fuel: FuelSubmission, request: Request, current_user: dict = Depends(get_current_user)):
     """Driver submits fuel receipt"""
+    # 2026-05-19 — idempotency. See PrestartCreate for context.
+    existing = await _check_idempotency(
+        db.fuel_submissions, current_user["company_id"], fuel.idempotency_key,
+    )
+    if existing:
+        return serialize_doc(existing)
+
     vehicle = await db.vehicles.find_one({"_id": ObjectId(fuel.vehicle_id)})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
@@ -8062,9 +8124,10 @@ async def create_fuel_submission(fuel: FuelSubmission, request: Request, current
         "gps_longitude": fuel.gps_longitude,
         "location_address": fuel.location_address,
         "timestamp": fuel_timestamp,
-        "ip_address": request.client.host if request.client else "unknown"
+        "ip_address": request.client.host if request.client else "unknown",
+        "idempotency_key": (fuel.idempotency_key or None),
     }
-    
+
     await db.fuel_submissions.insert_one(fuel_doc)
 
     try:
@@ -9501,7 +9564,14 @@ async def create_incident(
 ):
     """Create a new incident report"""
     company_id = current_user["company_id"]
-    
+
+    # 2026-05-19 — idempotency. See PrestartCreate for context.
+    existing = await _check_idempotency(
+        db.incidents, company_id, incident.idempotency_key,
+    )
+    if existing:
+        return serialize_doc(existing)
+
     # Get vehicle info
     vehicle = await db.vehicles.find_one({"_id": ObjectId(incident.vehicle_id), "company_id": company_id})
     if not vehicle:
@@ -9575,8 +9645,9 @@ async def create_incident(
         "status": "reported",
         "created_at": incident_timestamp,
         "updated_at": datetime.now(timezone.utc),
+        "idempotency_key": (incident.idempotency_key or None),
     }
-    
+
     result = await db.incidents.insert_one(incident_doc)
     incident_doc["id"] = str(result.inserted_id)
     
@@ -14796,6 +14867,19 @@ async def ensure_indexes() -> None:
     await db.incidents.create_index("company_id")
     await db.incidents.create_index([("company_id", 1), ("created_at", -1)])
     await db.incidents.create_index([("company_id", 1), ("status", 1)])
+
+    # 2026-05-19 — idempotency lookups (per-tenant). Sparse so old rows
+    # without an idempotency_key don't bloat the index. Used by the
+    # POST /inspections/* + /fuel + /incidents handlers to dedupe
+    # queue-retry submissions from the mobile app.
+    for coll_name in ("inspections", "fuel_submissions", "incidents"):
+        try:
+            await db[coll_name].create_index(
+                [("company_id", 1), ("idempotency_key", 1)],
+                sparse=True,
+            )
+        except Exception as exc:
+            logger.warning("idempotency index on %s failed: %s", coll_name, exc)
     await db.service_records.create_index("company_id")
     await db.service_records.create_index([("company_id", 1), ("service_date", -1)])
     await db.service_records.create_index([("company_id", 1), ("vehicle_id", 1)])
