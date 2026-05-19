@@ -13103,7 +13103,24 @@ async def developer_orgs_summary(
     companies = [c for c in companies if not c.get("deleted_at")]
     co_ids = [str(c["_id"]) for c in companies]
 
+    # Owner review 2026-05-19: vehicle_count on the companies doc is the
+    # value the owner typed at sign-up (defaults to 5). Replace it with
+    # the live count of non-deleted vehicles in the vehicles collection
+    # so the Organisations table reflects reality, not a stale stub.
+    vehicle_rows = await db.vehicles.find(
+        {"company_id": {"$in": co_ids}},
+        {"company_id": 1, "deleted_at": 1},
+    ).to_list(50000)
+    vehicles_by_co: dict = {}
+    for v in vehicle_rows:
+        if v.get("deleted_at"):
+            continue
+        vehicles_by_co[v.get("company_id")] = vehicles_by_co.get(v.get("company_id"), 0) + 1
+
     # Fan-out user counts + last_active per company in one pass each.
+    # user_count = admins + drivers (all non-deleted users on the
+    # tenant). driver_count + admin_count are surfaced separately so
+    # the UI can break it down if needed.
     user_rows = await db.users.find(
         {"company_id": {"$in": co_ids}},
         {"company_id": 1, "role": 1, "last_active_at": 1, "deleted_at": 1, "email": 1, "name": 1, "is_frozen": 1},
@@ -13114,10 +13131,16 @@ async def developer_orgs_summary(
             continue
         cid = u.get("company_id")
         bucket = by_co.setdefault(cid, {
-            "user_count": 0, "owner": None, "last_active": None,
+            "user_count": 0, "admin_count": 0, "driver_count": 0,
+            "owner": None, "last_active": None,
         })
         bucket["user_count"] += 1
-        if u.get("role") == UserRole.SUPER_ADMIN and bucket["owner"] is None:
+        role = u.get("role")
+        if role == UserRole.DRIVER:
+            bucket["driver_count"] += 1
+        elif role in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+            bucket["admin_count"] += 1
+        if role == UserRole.SUPER_ADMIN and bucket["owner"] is None:
             bucket["owner"] = {
                 "id": str(u["_id"]),
                 "name": u.get("name"),
@@ -13131,7 +13154,10 @@ async def developer_orgs_summary(
     rows = []
     for c in companies:
         cid = str(c["_id"])
-        bucket = by_co.get(cid, {"user_count": 0, "owner": None, "last_active": None})
+        bucket = by_co.get(cid, {
+            "user_count": 0, "admin_count": 0, "driver_count": 0,
+            "owner": None, "last_active": None,
+        })
         last_active = bucket["last_active"]
         inactive_days: Optional[int] = None
         if last_active and isinstance(last_active, datetime):
@@ -13156,8 +13182,13 @@ async def developer_orgs_summary(
             "subscription_plan": c.get("subscription_plan"),
             "trial_end": trial_end.isoformat() if isinstance(trial_end, datetime) else trial_end,
             "trial_days_left": trial_days_left,
-            "vehicle_count": c.get("vehicle_count") or 0,
+            # Owner review 2026-05-19: live counts, not the registration
+            # placeholder. signup_vehicle_count preserved for context.
+            "vehicle_count": vehicles_by_co.get(cid, 0),
+            "signup_vehicle_count": c.get("vehicle_count") or 0,
             "user_count": bucket["user_count"],
+            "admin_count": bucket["admin_count"],
+            "driver_count": bucket["driver_count"],
             "suspended": bool(c.get("suspended")),
             "suspended_at": c.get("suspended_at").isoformat() if isinstance(c.get("suspended_at"), datetime) else c.get("suspended_at"),
             "suspended_reason": c.get("suspended_reason"),
