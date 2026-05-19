@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 import os
 import logging
 from pathlib import Path
@@ -6411,7 +6412,33 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     if email_lower:
         driver_doc["email"] = email_lower
 
-    await db.users.insert_one(driver_doc)
+    # 2026-05-19 — catch unique-index violations (phone, email, username)
+    # and surface a friendly 400 instead of a 500 + ugly stack trace.
+    # The sparse `phone_1` index is the most common offender — admins
+    # often paste a number that's already on another operator's record.
+    try:
+        await db.users.insert_one(driver_doc)
+    except DuplicateKeyError as exc:
+        msg = str(exc)
+        if "phone_1" in msg or "phone:" in msg:
+            raise HTTPException(
+                status_code=400,
+                detail="That phone number is already used by another operator on this platform.",
+            )
+        if "email_1" in msg or "email:" in msg:
+            raise HTTPException(
+                status_code=400,
+                detail="That email is already registered.",
+            )
+        if "username_1" in msg or "username:" in msg:
+            raise HTTPException(
+                status_code=400,
+                detail="That username is already taken. Try a different name.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="A unique-key conflict prevented driver creation. Please change the value and try again.",
+        )
 
     # Invalidate cache
     invalidate_cache("drivers", company_id)
