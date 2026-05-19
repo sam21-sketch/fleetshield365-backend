@@ -1559,6 +1559,123 @@ def validate_password_policy(password: str) -> None:
         )
 
 
+def validate_driver_pin(pin: str) -> None:
+    """Validate a 4-digit driver sign-in PIN.
+
+    Drivers sign in on the mobile app with a username + 4-digit PIN
+    instead of a password. The PIN is stored bcrypt-hashed in the same
+    `password_hash` field — login flow doesn't change. We just skip the
+    8-char-with-complexity policy for drivers.
+    """
+    if not isinstance(pin, str):
+        raise HTTPException(status_code=400, detail="PIN is required")
+    pin = pin.strip()
+    if len(pin) != 4 or not pin.isdigit():
+        raise HTTPException(
+            status_code=400,
+            detail="PIN must be exactly 4 digits",
+        )
+
+
+def _persist_custom_documents(
+    custom_documents: Optional[List[Any]],
+    company_id: str,
+    driver_id: str,
+) -> List[dict]:
+    """Persist each custom document's front/back to MinIO and return the
+    storable shape (label + number + issue + expiry + object keys).
+
+    Accepts either a list of CustomDocumentInput pydantic instances or
+    plain dicts — the create + update endpoints differ in which they
+    receive. Skips entries with an empty label. The label is the only
+    required field.
+    """
+    if not custom_documents:
+        return []
+    stored: List[dict] = []
+    for idx, raw in enumerate(custom_documents):
+        if hasattr(raw, "model_dump"):
+            doc = raw.model_dump()
+        elif hasattr(raw, "dict"):
+            doc = raw.dict()
+        elif isinstance(raw, dict):
+            doc = dict(raw)
+        else:
+            continue
+        label = (doc.get("label") or "").strip()
+        if not label:
+            continue
+        # Stable per-document ID — we reuse it on update so the object
+        # keys stay constant. Generate one if the client didn't send it.
+        doc_id = (doc.get("id") or "").strip() or str(uuid.uuid4())
+        record: dict = {
+            "id": doc_id,
+            "label": label[:80],
+            "number": (doc.get("number") or "").strip()[:80] or None,
+            "issue": (doc.get("issue") or "").strip() or None,
+            "expiry": (doc.get("expiry") or "").strip() or None,
+        }
+        # Preserve any previously-uploaded keys when the client sends
+        # the full doc back during edit (front_base64 will be absent).
+        if doc.get("front_object_key"):
+            record["front_object_key"] = doc["front_object_key"]
+        if doc.get("back_object_key"):
+            record["back_object_key"] = doc["back_object_key"]
+        # Upload new front bytes when present.
+        front_b64 = doc.get("front_base64")
+        if front_b64:
+            key = f"driver-docs/{company_id}/{driver_id}/custom/{doc_id}-front.bin"
+            _upload_base64_or_400(
+                "compliance", key, front_b64, "bin",
+                f"custom_documents[{idx}].front_base64",
+                expected_company_id=company_id,
+                type_key="driver_doc",
+            )
+            record["front_object_key"] = key
+        back_b64 = doc.get("back_base64")
+        if back_b64:
+            key = f"driver-docs/{company_id}/{driver_id}/custom/{doc_id}-back.bin"
+            _upload_base64_or_400(
+                "compliance", key, back_b64, "bin",
+                f"custom_documents[{idx}].back_base64",
+                expected_company_id=company_id,
+                type_key="driver_doc",
+            )
+            record["back_object_key"] = key
+        stored.append(record)
+    return stored
+
+
+def _attach_custom_document_urls(user_doc: Optional[dict]) -> Optional[dict]:
+    """Attach presigned `*_url` siblings to each custom_documents entry.
+
+    Mutates and returns the user doc. No-op when the user has no custom
+    docs. Safe to call on any user shape.
+    """
+    if not user_doc or not isinstance(user_doc.get("custom_documents"), list):
+        return user_doc
+    for entry in user_doc["custom_documents"]:
+        if not isinstance(entry, dict):
+            continue
+        front_key = entry.get("front_object_key")
+        back_key = entry.get("back_object_key")
+        if front_key:
+            try:
+                entry["front_url"] = object_store.presign_get(
+                    "compliance", front_key,
+                )
+            except Exception:
+                entry["front_url"] = None
+        if back_key:
+            try:
+                entry["back_url"] = object_store.presign_get(
+                    "compliance", back_key,
+                )
+            except Exception:
+                entry["back_url"] = None
+    return user_doc
+
+
 def reject_same_password(new_password: str, current_hash: Optional[str]) -> None:
     """Reject when the proposed password matches the user's current one.
 
@@ -2946,6 +3063,29 @@ class AIDamageStatus:
     CONFIRMED_DAMAGE = "confirmed_damage"
 
 # Auth Models
+class CustomDocumentInput(BaseModel):
+    """A repeatable, owner-defined driver document.
+
+    Replaces the hardcoded medical / first_aid / forklift / dangerous_goods
+    / MSIC / other slots. The front/back files are accepted as base64 and
+    persisted to the `compliance` MinIO bucket; `front_object_key` /
+    `back_object_key` are written by the backend and surfaced as presigned
+    URLs on read.
+    """
+    label: str
+    number: Optional[str] = None
+    issue: Optional[str] = None    # DD/MM/YYYY
+    expiry: Optional[str] = None   # DD/MM/YYYY or "NA"
+    front_base64: Optional[str] = None    # data URL or raw base64; image OR pdf
+    back_base64: Optional[str] = None
+    front_object_key: Optional[str] = None  # set by server; keep on update
+    back_object_key: Optional[str] = None
+    # Optional client-side hint about which type of file the photo is.
+    # Server still validates magic bytes — this is purely a UI affordance.
+    front_kind: Optional[str] = None  # "image" | "pdf"
+    back_kind: Optional[str] = None
+
+
 class UserRegister(BaseModel):
     email: Optional[EmailStr] = None  # Optional - can login with username instead
     password: str
@@ -2987,6 +3127,16 @@ class UserRegister(BaseModel):
     other_doc_number: Optional[str] = None
     other_doc_issue: Optional[str] = None
     other_doc_expiry: Optional[str] = None
+    # 2026-05-19 — `custom_documents` is the new owner-driven, repeatable
+    # document list. Replaces the hardcoded forklift/dangerous_goods/MSIC/
+    # other slots above. Each entry has an arbitrary label + number +
+    # issue + expiry and optional front/back uploads (image OR PDF).
+    custom_documents: Optional[List["CustomDocumentInput"]] = None
+    # 2026-05-19 — `pin` is a 4-digit numeric PIN used by drivers to sign
+    # in on the mobile app. When supplied it replaces the `password` field
+    # (no policy enforcement). For drivers we require PIN; for admins we
+    # require password.
+    pin: Optional[str] = None
 
 class DriverUpdate(BaseModel):
     name: Optional[str] = None
@@ -3017,6 +3167,12 @@ class DriverUpdate(BaseModel):
     other_doc_number: Optional[str] = None
     other_doc_issue: Optional[str] = None
     other_doc_expiry: Optional[str] = None
+    # 2026-05-19 — `custom_documents` mirrors UserRegister. Full replace on
+    # update (the entire list is sent back from the UI).
+    custom_documents: Optional[List["CustomDocumentInput"]] = None
+    # 2026-05-19 — optional PIN reset. When supplied, must be 4 digits.
+    pin: Optional[str] = None
+
 
 class UserLogin(BaseModel):
     email: Optional[str] = None  # Can be email or username
@@ -3068,6 +3224,11 @@ class CompanyUpdate(BaseModel):
     preferred_currency: Optional[str] = None
     units_system: Optional[str] = None
     locale: Optional[str] = None
+    # 2026-05-19 — default workshop email used to pre-fill the "Email
+    # Defects to Workshop" modal. Persisted per tenant so each admin
+    # doesn't retype it. Empty string clears the default.
+    workshop_email_default: Optional[str] = None
+    workshop_name_default: Optional[str] = None
 
 # Vehicle Models
 class VehicleCustomField(BaseModel):
@@ -4462,6 +4623,111 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
 
     return {"message": "If an account exists with this email, you will receive a password reset link."}
 
+
+def _mask_email(email: str) -> str:
+    """Return a UI-safe email hint like ``r***@gmail.com`` for the
+    forgot-by-username response. We never leak the full address back to
+    a caller who only supplied a username."""
+    if not email or "@" not in email:
+        return "your email"
+    local, _, domain = email.partition("@")
+    if len(local) <= 1:
+        return f"{local}***@{domain}"
+    return f"{local[0]}{'*' * max(2, len(local) - 1)}@{domain}"
+
+
+class ForgotByUsernameRequest(BaseModel):
+    username: str
+    origin_url: str = DEFAULT_ORIGIN_URL
+
+
+@api_router.post("/auth/forgot-by-username")
+@limiter.limit("3/minute")
+async def forgot_password_by_username(request: Request, payload: ForgotByUsernameRequest):
+    """Mobile-friendly forgot-password: look up account by username first,
+    then fall back to the email-based reset flow when an email is on file.
+
+    The mobile app collects username first because drivers don't always
+    remember the email their admin used. We return one of three signals
+    so the client can guide the user:
+
+      * ``status="email_sent"`` — username matched and an email is on file
+      * ``status="no_email"``   — username matched but no email; ask admin
+      * ``status="not_found"``  — username didn't match any account
+
+    The user-not-found case still returns HTTP 200 to stay consistent
+    with the email-based endpoint (no enumeration), but with a distinct
+    status code so the UI can show the right next step.
+    """
+    username = (payload.username or "").strip().lower()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    user = await db.users.find_one({"username": username})
+    if not user:
+        return {"status": "not_found", "message": "No account found with that username."}
+
+    email = (user.get("email") or "").strip()
+    if not email:
+        return {
+            "status": "no_email",
+            "message": "This account doesn't have an email on file. Please ask your admin to reset your PIN.",
+        }
+
+    # Reuse the email-based flow: mint a reset token + send the branded
+    # reset email. We don't call the forgot_password endpoint directly
+    # so the rate limit on that path doesn't double-charge this caller.
+    import secrets
+    reset_token = secrets.token_urlsafe(32)
+    expires_at = utcnow() + timedelta(hours=1)
+    await db.password_resets.update_one(
+        {"user_id": str(user["_id"])},
+        {"$set": {
+            "user_id": str(user["_id"]),
+            "token": reset_token,
+            "expires_at": expires_at,
+            "created_at": utcnow(),
+        }},
+        upsert=True,
+    )
+
+    submitted_origin = payload.origin_url
+    if _is_allowed_origin(submitted_origin):
+        validated_origin = submitted_origin.strip().rstrip("/")
+    else:
+        validated_origin = DEFAULT_ORIGIN_URL.rstrip("/")
+    reset_url = f"{validated_origin}/reset-password?token={reset_token}"
+
+    body = (
+        f"<p>Hi {_safe_html(user.get('name', 'there'))},</p>"
+        f"<p>We received a request to reset the FleetShield365 PIN for "
+        f"<strong>{_safe_html(username)}</strong>. Click the button below to set a new credential.</p>"
+        f"<p style='color:#94a3b8; font-size:13px;'>This link expires in 1 hour. "
+        f"If you didn't request a reset, you can safely ignore this email.</p>"
+    )
+    html_content = _email_template_branded(
+        heading="Reset your PIN",
+        body_html=body,
+        button_label="Reset PIN",
+        button_url=reset_url,
+    )
+
+    # Mask the email when echoing back so we don't leak the full address
+    # to whoever has just the username.
+    masked = _mask_email(email)
+    try:
+        await send_system_email(
+            email,
+            "[FleetShield365] Reset your PIN",
+            html_content,
+        )
+    except Exception as e:
+        logger.error(f"forgot_by_username: mail send failed for {email}: {e}")
+
+    return {"status": "email_sent", "email_hint": masked,
+            "message": f"A reset link was sent to {masked}."}
+
+
 @api_router.post("/auth/reset-password")
 async def reset_password(request: ResetPasswordRequest):
     """Reset password using token"""
@@ -5618,6 +5884,170 @@ async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Vehicle not found")
     return _attach_vehicle_image_url(serialize_doc(vehicle))
 
+
+@api_router.get("/vehicles/{vehicle_id}/history")
+async def get_vehicle_history(
+    vehicle_id: str,
+    limit: int = 10,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a per-vehicle activity feed.
+
+    Aggregates the most recent inspections (pre-start + end-shift),
+    fuel logs, incidents, and service records into one response so the
+    UI can render a single "Vehicle History" panel without 4 parallel
+    requests. Each row carries the driver/operator name and timestamp.
+
+    Drivers can only fetch history for vehicles they're assigned to.
+    Admins + super_admins see any vehicle in their tenant.
+    """
+    if current_user["role"] not in [
+        UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.DRIVER,
+    ]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # 2026-05-19 — guard against bad vehicle_id slugs in the URL.
+    # Without this, ObjectId() raises bson.errors.InvalidId which
+    # bubbles up as a 500 instead of the expected 400/404.
+    if not ObjectId.is_valid(vehicle_id):
+        raise HTTPException(status_code=400, detail="Invalid vehicle id")
+
+    company_id = current_user["company_id"]
+    vehicle = await db.vehicles.find_one({
+        **_soft_delete_filter(),
+        "_id": ObjectId(vehicle_id),
+        "company_id": company_id,
+    })
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    if current_user["role"] == UserRole.DRIVER:
+        # A driver can only view history for vehicles they're assigned to.
+        assigned_ids = vehicle.get("assigned_driver_ids") or []
+        if str(current_user["_id"]) not in assigned_ids:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    actual_limit = max(1, min(int(limit), 50))
+
+    # Resolve all driver names referenced across the rows in one shot
+    # so we avoid N+1 queries per row.
+    async def _fetch_inspections(itype: Optional[str] = None) -> List[dict]:
+        q: dict = {
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "vehicle_id": vehicle_id,
+        }
+        if itype:
+            q["type"] = itype
+        cursor = db.inspections.find(q).sort("timestamp", -1).limit(actual_limit)
+        return await cursor.to_list(actual_limit)
+
+    prestart_rows, endshift_rows, fuel_rows, incident_rows, service_rows = await asyncio.gather(
+        _fetch_inspections("prestart"),
+        _fetch_inspections("end_shift"),
+        db.fuel_submissions.find({
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "vehicle_id": vehicle_id,
+        }).sort("timestamp", -1).limit(actual_limit).to_list(actual_limit),
+        db.incidents.find({
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "vehicle_id": vehicle_id,
+        }).sort("created_at", -1).limit(actual_limit).to_list(actual_limit),
+        db.service_records.find({
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "vehicle_id": vehicle_id,
+        }).sort("service_date", -1).limit(actual_limit).to_list(actual_limit),
+    )
+
+    # Collect driver IDs we need to resolve to names.
+    driver_ids: set = set()
+    for row in prestart_rows + endshift_rows + fuel_rows + incident_rows:
+        did = row.get("driver_id")
+        if did:
+            driver_ids.add(did)
+    driver_lookup: dict = {}
+    if driver_ids:
+        try:
+            cursor = db.users.find(
+                {"_id": {"$in": [ObjectId(d) for d in driver_ids if d]}},
+                {"name": 1, "username": 1},
+            )
+            async for u in cursor:
+                driver_lookup[str(u["_id"])] = (
+                    u.get("name") or u.get("username") or "Operator"
+                )
+        except Exception:
+            # ObjectId parsing fail (e.g. legacy string ids) — fall back
+            # to row-level driver_name if present.
+            driver_lookup = {}
+
+    def _name(row: dict) -> str:
+        did = row.get("driver_id")
+        if did and did in driver_lookup:
+            return driver_lookup[did]
+        return row.get("driver_name") or "Unknown operator"
+
+    def _serial(rows: List[dict], extra: callable) -> List[dict]:
+        out = []
+        for r in rows:
+            r = serialize_doc(r)
+            out.append(extra(r))
+        return out
+
+    response = {
+        "vehicle": _attach_vehicle_image_url(serialize_doc(vehicle)),
+        "prestart_inspections": _serial(prestart_rows, lambda r: {
+            "id": r.get("id"),
+            "timestamp": r.get("timestamp"),
+            "odometer": r.get("odometer"),
+            "driver_name": _name(r),
+            "is_safe": r.get("is_safe"),
+            "issue_count": sum(
+                1 for c in (r.get("checklist_items") or [])
+                if c.get("status") == "issue"
+            ),
+        }),
+        "endshift_inspections": _serial(endshift_rows, lambda r: {
+            "id": r.get("id"),
+            "timestamp": r.get("timestamp"),
+            "odometer": r.get("odometer"),
+            "driver_name": _name(r),
+            "new_damage": bool(r.get("new_damage")),
+            "incident_today": bool(r.get("incident_today")),
+            "cleanliness": r.get("cleanliness"),
+            "damage_comment": r.get("damage_comment"),
+        }),
+        "fuel_logs": _serial(fuel_rows, lambda r: {
+            "id": r.get("id"),
+            "timestamp": r.get("timestamp") or r.get("created_at"),
+            "amount": r.get("amount"),
+            "liters": r.get("liters"),
+            "odometer": r.get("odometer"),
+            "fuel_station": r.get("fuel_station"),
+            "driver_name": _name(r),
+        }),
+        "incidents": _serial(incident_rows, lambda r: {
+            "id": r.get("id"),
+            "timestamp": r.get("created_at") or r.get("incident_date"),
+            "severity": r.get("severity"),
+            "description": r.get("description") or r.get("notes"),
+            "driver_name": _name(r),
+        }),
+        "service_records": _serial(service_rows, lambda r: {
+            "id": r.get("id"),
+            "service_date": r.get("service_date"),
+            "service_type": r.get("service_type"),
+            "cost": r.get("cost"),
+            "odometer": r.get("odometer"),
+            "workshop": r.get("workshop"),
+        }),
+    }
+    return response
+
+
 @api_router.put("/vehicles/{vehicle_id}")
 async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Request, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
@@ -5852,7 +6282,14 @@ async def get_drivers(
     # Combine lists
     all_operators = drivers + admin_operators
     result = serialize_doc(all_operators)
-    
+
+    # Attach presigned URLs for custom_documents so the UI can render
+    # thumbnails without a second round-trip. Skipped when the list is
+    # empty so caching cost stays the same as before.
+    if isinstance(result, list):
+        for entry in result:
+            _attach_custom_document_urls(entry)
+
     # Cache the result
     set_cached("drivers", company_id, result)
     return result
@@ -5862,12 +6299,10 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # Owner review 2026-05-18: driver email is now required (credentials
-    # email + verification flow assumes one) and phone must be exactly
-    # 10 digits when supplied. The web form mirrors these rules so this
-    # is mainly a backend safety net for direct API callers.
-    if not user.email or not user.email.strip():
-        raise HTTPException(status_code=400, detail="Driver email is required")
+    # 2026-05-19 — owner request: driver email is OPTIONAL. Drivers sign
+    # in with username + 4-digit PIN on the mobile app, so an email isn't
+    # required at create time. When omitted, `email_verified` defaults to
+    # false and the credentials email is skipped client-side.
     if user.phone:
         phone_digits = "".join(ch for ch in user.phone if ch.isdigit())
         if len(phone_digits) != 10:
@@ -5876,10 +6311,25 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
                 detail="Driver phone must be exactly 10 digits",
             )
 
+    # 2026-05-19 — accept either a 4-digit PIN (preferred for drivers) or
+    # a free-form password. PIN wins when both are supplied. If neither
+    # is supplied we reject — the credential is what makes the account
+    # usable.
+    pin = (user.pin or "").strip()
+    password = user.password or ""
+    if pin:
+        validate_driver_pin(pin)
+        credential_hash = get_password_hash(pin)
+    elif password:
+        credential_hash = get_password_hash(password)
+    else:
+        raise HTTPException(status_code=400, detail="PIN or password is required")
+
     # Check if email already exists
-    if user.email:
-        existing = await db.users.find_one({"email": user.email.lower()})
-        
+    email_lower = (user.email or "").strip().lower() or None
+    if email_lower:
+        existing = await db.users.find_one({"email": email_lower})
+
         # Check if email belongs to an admin in the same company
         if existing:
             # If it's an admin from the same company, enable them as operator too
@@ -5897,22 +6347,33 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
                 return serialize_doc(updated_user)
             else:
                 raise HTTPException(status_code=400, detail="Email already registered")
-    
+
     # Generate unique username
     username = user.username or await generate_unique_username(user.name, current_user["company_id"])
-    
+
     # Check if username already exists GLOBALLY
     if await db.users.find_one({"username": username}):
         username = await generate_unique_username(user.name, current_user["company_id"])
-    
+
+    driver_id = ObjectId()
+    company_id = current_user["company_id"]
+
+    # 2026-05-19 — persist owner-defined custom documents (repeatable
+    # label/number/issue/expiry with optional front/back upload). The
+    # uploads land in the `compliance` bucket scoped to this driver_id.
+    custom_documents = _persist_custom_documents(
+        user.custom_documents, company_id, str(driver_id),
+    )
+
     driver_doc = {
-        "_id": ObjectId(),
+        "_id": driver_id,
         "username": username,
-        "password_hash": get_password_hash(user.password),
+        "password_hash": credential_hash,
+        "auth_mode": "pin" if pin else "password",
         "name": user.name,
         "phone": user.phone,
         "role": UserRole.DRIVER,
-        "company_id": current_user["company_id"],
+        "company_id": company_id,
         "assigned_vehicles": [],
         "created_at": utcnow(),
         "ip_address": request.client.host if request.client else "unknown",
@@ -5942,18 +6403,21 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         "other_doc_number": user.other_doc_number,
         "other_doc_issue": user.other_doc_issue,
         "other_doc_expiry": user.other_doc_expiry,
+        # 2026-05-19 — repeatable custom docs (replaces the fixed slots
+        # for new drivers; legacy slots still write/read for older accts).
+        "custom_documents": custom_documents,
     }
     # Only add email if provided (sparse index doesn't like None values)
-    if user.email:
-        driver_doc["email"] = user.email.lower()
-    
+    if email_lower:
+        driver_doc["email"] = email_lower
+
     await db.users.insert_one(driver_doc)
-    
+
     # Invalidate cache
-    invalidate_cache("drivers", current_user["company_id"])
-    invalidate_cache("dashboard", current_user["company_id"])
-    
-    return serialize_doc(driver_doc)
+    invalidate_cache("drivers", company_id)
+    invalidate_cache("dashboard", company_id)
+
+    return _attach_custom_document_urls(serialize_doc(driver_doc))
 
 @api_router.delete("/drivers/{driver_id}")
 async def delete_driver(driver_id: str, current_user: dict = Depends(get_current_user)):
@@ -7813,13 +8277,34 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
                 detail="Driver phone must be exactly 10 digits",
             )
 
-    update_data = {k: v for k, v in update.dict().items() if v is not None}
+    update_dict = update.dict()
+
+    # 2026-05-19 — handle PIN reset (separate from password). When the
+    # admin enters a new 4-digit PIN we rehash and flip auth_mode to
+    # "pin". We never write the raw PIN to the doc.
+    new_pin = (update_dict.pop("pin", None) or "").strip()
+    if new_pin:
+        validate_driver_pin(new_pin)
+        update_dict["password_hash"] = get_password_hash(new_pin)
+        update_dict["auth_mode"] = "pin"
+
+    # 2026-05-19 — custom_documents is a full-replace list. Persist any
+    # new front/back uploads to MinIO and store the resulting object
+    # keys; preserved entries pass through unchanged.
+    if update_dict.get("custom_documents") is not None:
+        update_dict["custom_documents"] = _persist_custom_documents(
+            update_dict["custom_documents"],
+            current_user["company_id"],
+            driver_id,
+        )
+
+    update_data = {k: v for k, v in update_dict.items() if v is not None}
     if update_data:
         await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
-        
+
         # Check for expiring documents in background (don't block response)
         asyncio.create_task(check_driver_expiry_alerts(driver_id, current_user["company_id"]))
-    
+
     return {"message": "Driver updated successfully"}
 
 @api_router.post("/drivers/{driver_id}/send-credentials")
@@ -10458,6 +10943,20 @@ async def email_defects_to_workshop(
     except Exception as e:
         logger.error(f"[WORKSHOP_EMAIL] Failed to persist log: {e}")
 
+    # 2026-05-19 — remember the workshop email/name on the company so the
+    # next "Email Defects" modal opens pre-filled. Best-effort: if the
+    # company doc isn't writable for some reason we still return success.
+    try:
+        await db.companies.update_one(
+            {"_id": ObjectId(current_user["company_id"])},
+            {"$set": {
+                "workshop_email_default": request.workshop_email,
+                "workshop_name_default": workshop_name,
+            }},
+        )
+    except Exception as e:
+        logger.warning(f"[WORKSHOP_EMAIL] Failed to persist default: {e}")
+
     # Auto-flip status: open -> assigned for every defect we just emailed
     try:
         for d in open_defects:
@@ -12571,6 +13070,43 @@ async def developer_platform_stats(
         },
         "storage": storage,
         "generated_at": now.isoformat(),
+    }
+
+
+@api_router.get("/developer/storage-breakdown/{company_id}")
+async def developer_storage_breakdown(
+    company_id: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Per-tenant storage breakdown (drives the Owner Storage info popover).
+
+    Returns the same `categories` shape as platform-stats, but scoped to
+    one company so the popover can show "Lalitcom — 81 inspection photos,
+    8 driver documents, …" without scanning all of MinIO. Cheap: only
+    Mongo counts + Mongo aggregations on indexed fields.
+    """
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=400, detail="Invalid company_id")
+    company = await db.companies.find_one(
+        {"_id": ObjectId(company_id)},
+        {"name": 1, "subdomain": 1},
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    categories = await _compute_storage_categories(
+        company_filter={"company_id": company_id},
+    )
+    total_objects = sum(c.get("count", 0) for c in categories)
+    total_bytes = sum(c.get("bytes_estimate", 0) for c in categories)
+    return {
+        "company_id": company_id,
+        "company_name": company.get("name"),
+        "subdomain": company.get("subdomain"),
+        "categories": categories,
+        "total_objects_estimate": total_objects,
+        "total_bytes_estimate": total_bytes,
+        "generated_at": utcnow().isoformat(),
     }
 
 
