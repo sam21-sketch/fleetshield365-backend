@@ -3263,7 +3263,13 @@ class CompanyUpdate(BaseModel):
 # Vehicle Models
 class VehicleCustomField(BaseModel):
     label: str
-    value: str
+    value: str = ""
+    # 2026-05-19 — owner request: optional issue + expiry per custom
+    # field, so things like "Trailer rego" can carry their own dates
+    # and feed into /expiry-summary the same way as license/insurance/
+    # COI do. DD/MM/YYYY format (parse_date_flexible handles parsing).
+    issue: Optional[str] = None
+    expiry: Optional[str] = None
 
 class VehicleCreate(BaseModel):
     name: str
@@ -6779,6 +6785,47 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
             }
             
             for doc_type in request.document_types:
+                # 2026-05-19 — owner request: include the new
+                # `custom_documents` (Additional Documents) in the
+                # download ZIP. The client sends doc_type ==
+                # "custom_documents" (or "additional"); each entry's
+                # front/back object_key is fetched from MinIO and
+                # bundled under a per-doc-label folder.
+                if doc_type in ("custom_documents", "additional"):
+                    for cd in (operator.get("custom_documents") or []):
+                        if not isinstance(cd, dict):
+                            continue
+                        label = (cd.get("label") or "additional").strip()
+                        safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label)[:40] or "additional"
+                        for side, ext in (("front", "bin"), ("back", "bin")):
+                            key = cd.get(f"{side}_object_key")
+                            if not key:
+                                continue
+                            try:
+                                image_bytes = object_store.get_bytes("compliance", key)
+                            except Exception as e:
+                                logger.error(f"Failed to fetch {op_name}/{safe_label}-{side}: {e}")
+                                manifest_lines.append(
+                                    f"  - additional/{safe_label}_{side}.bin (ERROR: Could not retrieve)"
+                                )
+                                continue
+                            # Sniff the file extension from magic bytes so the
+                            # download has a sensible suffix in the ZIP.
+                            ext_real = "bin"
+                            if image_bytes[:3] == b"\xFF\xD8\xFF":
+                                ext_real = "jpg"
+                            elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+                                ext_real = "png"
+                            elif image_bytes[:5] == b"%PDF-":
+                                ext_real = "pdf"
+                            zip_file.writestr(
+                                f"{folder_name}/additional/{safe_label}_{side}.{ext_real}",
+                                image_bytes,
+                            )
+                            manifest_lines.append(
+                                f"  - additional/{safe_label}_{side}.{ext_real}"
+                            )
+                    continue
                 if doc_type not in doc_mappings:
                     continue
 
@@ -9461,6 +9508,187 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
     }
 
 # ============== Alert Routes ==============
+
+@api_router.get("/expiry-summary")
+async def get_expiry_summary(
+    days: int = 60,
+    current_user: dict = Depends(get_current_user),
+):
+    """Live expiry feed for the Dashboard 'Expiry Alerts' panel.
+
+    Computes upcoming + already-expired expiries from the current
+    vehicles + drivers collections — does NOT depend on the `alerts`
+    table being populated. The old dashboard only filtered
+    `alerts.type == 'expiry_warning'`, but expiry alerts are only
+    inserted on vehicle/driver create + occasional crons; if a fresh
+    tenant or an admin who never re-edited a vehicle never triggered
+    that path, the panel showed "All Clear" even when registration
+    had expired weeks ago. This endpoint always reflects current state.
+
+    Returns each item with: kind ('vehicle' | 'driver'), label
+    (Registration / Insurance / License / etc), name (vehicle name or
+    driver name), expiry_date (DD/MM/YYYY), days_until_expiry (negative
+    if already expired), severity ('expired' | 'critical' | 'warning'
+    | 'heads_up'), entity_id (vehicle/driver id for deep-link).
+    Capped at 200 to keep the response bounded.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    company_id = current_user["company_id"]
+    window_days = max(7, min(int(days), 365))
+    now = utcnow()
+
+    def _classify(days_left: int) -> str:
+        if days_left < 0:
+            return "expired"
+        if days_left <= 7:
+            return "critical"
+        if days_left <= 30:
+            return "warning"
+        return "heads_up"
+
+    items: List[dict] = []
+
+    # --- Vehicle expiries ---------------------------------------------
+    vehicle_fields = [
+        ("rego_expiry", "Registration"),
+        ("insurance_expiry", "Insurance"),
+        ("safety_certificate_expiry", "Safety Certificate"),
+        ("coi_expiry", "COI"),
+    ]
+    vehicles_cursor = db.vehicles.find(
+        {**_soft_delete_filter(), "company_id": company_id},
+        {
+            "name": 1, "registration_number": 1,
+            "rego_expiry": 1, "insurance_expiry": 1,
+            "safety_certificate_expiry": 1, "coi_expiry": 1,
+            "custom_fields": 1,
+        },
+    )
+    async for v in vehicles_cursor:
+        v_id = str(v["_id"])
+        v_label = f"{v.get('name', '')} ({v.get('registration_number', '')})"
+        for field, label in vehicle_fields:
+            raw = v.get(field)
+            if not raw:
+                continue
+            dt = parse_date_flexible(raw)
+            if not dt:
+                continue
+            days_left = (dt - now).days
+            if days_left > window_days:
+                continue
+            items.append({
+                "kind": "vehicle",
+                "entity_id": v_id,
+                "label": label,
+                "name": v_label,
+                "expiry_date": format_date_display(raw),
+                "days_until_expiry": days_left,
+                "severity": _classify(days_left),
+            })
+        # Custom-field expiries (2026-05-19 owner request).
+        for cf in (v.get("custom_fields") or []):
+            if not isinstance(cf, dict):
+                continue
+            raw = (cf.get("expiry") or "").strip()
+            if not raw:
+                continue
+            dt = parse_date_flexible(raw)
+            if not dt:
+                continue
+            days_left = (dt - now).days
+            if days_left > window_days:
+                continue
+            items.append({
+                "kind": "vehicle",
+                "entity_id": v_id,
+                "label": (cf.get("label") or "Custom field"),
+                "name": v_label,
+                "expiry_date": format_date_display(raw),
+                "days_until_expiry": days_left,
+                "severity": _classify(days_left),
+            })
+
+    # --- Driver doc expiries ------------------------------------------
+    driver_fields = [
+        ("license_expiry", "Driver License"),
+        ("medical_certificate_expiry", "Medical Certificate"),
+        ("first_aid_expiry", "First Aid"),
+        ("forklift_license_expiry", "Forklift License"),
+        ("dangerous_goods_expiry", "Dangerous Goods"),
+        ("msic_expiry", "MSIC"),
+        ("other_doc_expiry", "Other Document"),
+    ]
+    drivers_cursor = db.users.find(
+        {
+            **_soft_delete_filter(),
+            "company_id": company_id,
+            "role": UserRole.DRIVER,
+        },
+        {
+            "name": 1, "username": 1,
+            "license_expiry": 1, "medical_certificate_expiry": 1,
+            "first_aid_expiry": 1, "forklift_license_expiry": 1,
+            "dangerous_goods_expiry": 1, "msic_expiry": 1,
+            "other_doc_expiry": 1, "custom_documents": 1,
+        },
+    )
+    async for u in drivers_cursor:
+        u_id = str(u["_id"])
+        u_name = u.get("name") or u.get("username") or "Operator"
+        for field, label in driver_fields:
+            raw = u.get(field)
+            if not raw:
+                continue
+            dt = parse_date_flexible(raw)
+            if not dt:
+                continue
+            days_left = (dt - now).days
+            if days_left > window_days:
+                continue
+            items.append({
+                "kind": "driver",
+                "entity_id": u_id,
+                "label": label,
+                "name": u_name,
+                "expiry_date": format_date_display(raw),
+                "days_until_expiry": days_left,
+                "severity": _classify(days_left),
+            })
+        # Custom driver documents (Additional Documents).
+        for cd in (u.get("custom_documents") or []):
+            if not isinstance(cd, dict):
+                continue
+            raw = (cd.get("expiry") or "").strip()
+            if not raw:
+                continue
+            dt = parse_date_flexible(raw)
+            if not dt:
+                continue
+            days_left = (dt - now).days
+            if days_left > window_days:
+                continue
+            items.append({
+                "kind": "driver",
+                "entity_id": u_id,
+                "label": (cd.get("label") or "Custom document"),
+                "name": u_name,
+                "expiry_date": format_date_display(raw),
+                "days_until_expiry": days_left,
+                "severity": _classify(days_left),
+            })
+
+    # Sort: most urgent first (most-expired → most-pending).
+    items.sort(key=lambda it: it["days_until_expiry"])
+    return {
+        "items": items[:200],
+        "count": len(items),
+        "window_days": window_days,
+        "generated_at": now.isoformat(),
+    }
+
 
 @api_router.get("/alerts")
 async def get_alerts(
