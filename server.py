@@ -12802,34 +12802,50 @@ async def developer_org_storage(
     # Phase 4.4 — cap raised from 5000 → 50000 to match the platform
     # endpoint. Adds a content-category breakdown sourced from the
     # tenant's own collections.
-    BUCKETS = (
-        "logos", "compliance", "inspection-photos", "fuel-receipts",
-        "incident-photos", "incident-attachments", "service-records",
-        "maintenance", "signatures", "photos",
-    )
+    # Owner review 2026-05-19: most buckets store objects under
+    # "<company_id>/..." but `compliance` (driver licence / medical /
+    # cert photos) lives under "driver-docs/<company_id>/...". The
+    # original loop only scanned "<company_id>/" so the entire driver-
+    # docs slice was being reported as 0 bytes. Each bucket now lists
+    # its own prefix(es) so the totals match what's actually on disk.
+    BUCKET_PREFIXES: dict = {
+        "logos":                [f"{company_id}/"],
+        "compliance":           [f"driver-docs/{company_id}/"],
+        "inspection-photos":    [f"{company_id}/"],
+        "fuel-receipts":        [f"{company_id}/"],
+        "incident-photos":      [f"{company_id}/"],
+        "incident-attachments": [f"{company_id}/"],
+        "service-records":      [f"{company_id}/"],
+        "maintenance":          [f"{company_id}/"],
+        "signatures":           [f"{company_id}/"],
+        "photos":               [f"{company_id}/"],
+    }
     SCAN_CAP = 50000
     total_bytes = 0
     total_objects = 0
     capped_buckets: list = []
     by_bucket: dict = {}
-    for name in BUCKETS:
+    for name, prefixes in BUCKET_PREFIXES.items():
         try:
             paginator = object_store._s3_client.get_paginator("list_objects_v2")
             b_bytes = 0
             b_objects = 0
             scanned = 0
             capped_this = False
-            for page in paginator.paginate(
-                Bucket=name,
-                Prefix=f"{company_id}/",
-                PaginationConfig={"MaxItems": SCAN_CAP},
-            ):
-                for obj in page.get("Contents") or []:
-                    b_bytes += obj.get("Size", 0) or 0
-                    b_objects += 1
-                    scanned += 1
+            for prefix in prefixes:
+                for page in paginator.paginate(
+                    Bucket=name,
+                    Prefix=prefix,
+                    PaginationConfig={"MaxItems": SCAN_CAP},
+                ):
+                    for obj in page.get("Contents") or []:
+                        b_bytes += obj.get("Size", 0) or 0
+                        b_objects += 1
+                        scanned += 1
+                        if scanned >= SCAN_CAP:
+                            capped_this = True
+                            break
                     if scanned >= SCAN_CAP:
-                        capped_this = True
                         break
                 if scanned >= SCAN_CAP:
                     break
