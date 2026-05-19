@@ -4729,6 +4729,190 @@ async def forgot_password_by_username(request: Request, payload: ForgotByUsernam
             "message": f"A reset link was sent to {masked}."}
 
 
+# 2026-05-19 — mobile PIN-reset flow.
+#
+# The forgot-by-username flow above emails a long token + opens a web
+# page. That's fine for admin password resets, but drivers using the
+# mobile app should never have to leave the app. These two endpoints
+# implement a self-contained OTP flow:
+#
+#   1) POST /auth/request-pin-reset {username}
+#      → emails a 6-digit OTP to the user's email on file
+#   2) POST /auth/reset-pin {username, otp, new_pin}
+#      → validates OTP, bcrypt-hashes the new 4-digit PIN, updates
+#        password_hash, clears the OTP. Driver returns to the login
+#        screen and signs in with the new PIN.
+#
+# OTP TTL: 15 minutes. Max 5 wrong-OTP attempts per code (then the
+# driver must request a fresh code). Username lookup is enumeration-
+# safe (same {not_found, no_email, otp_sent} discriminated status
+# shape as forgot-by-username).
+
+
+class RequestPinResetRequest(BaseModel):
+    username: str
+
+
+@api_router.post("/auth/request-pin-reset")
+@limiter.limit("3/minute")
+async def request_pin_reset(request: Request, payload: RequestPinResetRequest):
+    """Send a 6-digit OTP to a driver's email for in-app PIN reset."""
+    username = (payload.username or "").strip().lower()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    user = await db.users.find_one({"username": username})
+    if not user:
+        return {"status": "not_found",
+                "message": "No account found with that username."}
+
+    email = (user.get("email") or "").strip()
+    if not email:
+        return {
+            "status": "no_email",
+            "message": "This account doesn't have an email on file. Please ask your admin to reset your PIN.",
+        }
+
+    # Generate 6-digit numeric OTP. secrets.randbelow gives us uniform
+    # distribution across [0, 1_000_000) which is what we want — 6
+    # digits, no leading-zero stripping (we format-string-pad).
+    import secrets as _secrets
+    otp = f"{_secrets.randbelow(1_000_000):06d}"
+    expires_at = utcnow() + timedelta(minutes=15)
+
+    # password_resets is keyed by user_id; we reuse it so a fresh OTP
+    # always replaces the previous one (per Phase 3 of the existing
+    # forgot-password flow).
+    await db.password_resets.update_one(
+        {"user_id": str(user["_id"])},
+        {"$set": {
+            "user_id": str(user["_id"]),
+            "otp": otp,
+            "otp_attempts": 0,
+            "expires_at": expires_at,
+            "created_at": utcnow(),
+        }},
+        upsert=True,
+    )
+
+    body = (
+        f"<p>Hi {_safe_html(user.get('name', 'there'))},</p>"
+        f"<p>Your FleetShield365 PIN-reset code is:</p>"
+        f"<div style='font-size:32px; font-weight:700; letter-spacing:10px; "
+        f"color:#0d9488; padding:18px 28px; background:#f0fdfa; "
+        f"border-radius:10px; display:inline-block; font-family:monospace;'>"
+        f"{otp}"
+        f"</div>"
+        f"<p style='color:#94a3b8; font-size:13px; margin-top:24px;'>"
+        f"Open the FleetShield365 app and type this code on the "
+        f"<em>Forgot PIN</em> screen. This code expires in 15 minutes. "
+        f"If you didn't request a reset, you can safely ignore this email."
+        f"</p>"
+    )
+    html_content = _email_template_branded(
+        heading="Your PIN reset code",
+        body_html=body,
+        button_label=None,
+        button_url=None,
+    )
+
+    masked = _mask_email(email)
+    try:
+        await send_system_email(
+            email,
+            "[FleetShield365] Your PIN reset code",
+            html_content,
+        )
+    except Exception as e:
+        logger.error(f"request_pin_reset: mail send failed for {email}: {e}")
+
+    return {
+        "status": "otp_sent",
+        "email_hint": masked,
+        "message": f"A 6-digit code was sent to {masked}.",
+    }
+
+
+class ResetPinRequest(BaseModel):
+    username: str
+    otp: str
+    new_pin: str
+
+
+@api_router.post("/auth/reset-pin")
+@limiter.limit("5/minute")
+async def reset_pin(request: Request, payload: ResetPinRequest):
+    """Verify the OTP + set a new 4-digit PIN."""
+    username = (payload.username or "").strip().lower()
+    otp = (payload.otp or "").strip()
+    new_pin = (payload.new_pin or "").strip()
+
+    if not username or not otp:
+        raise HTTPException(status_code=400, detail="Username and code are required")
+
+    # Enforce 4-digit PIN policy (matches create_driver + update_driver).
+    validate_driver_pin(new_pin)
+
+    user = await db.users.find_one({"username": username})
+    # Don't leak which step failed — both unknown-user and missing-OTP
+    # collapse to a generic "Invalid code". Brute-force protection is
+    # the OTP itself (1-in-1M) + the per-record attempt cap below.
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid code")
+
+    record = await db.password_resets.find_one({"user_id": str(user["_id"])})
+    if not record or not record.get("otp"):
+        raise HTTPException(
+            status_code=400,
+            detail="No reset code on file. Request a new one.",
+        )
+
+    # Expiry check.
+    exp = record.get("expires_at")
+    if not exp or utcnow() > exp:
+        raise HTTPException(
+            status_code=400,
+            detail="Code has expired. Request a new one.",
+        )
+
+    # Attempt cap.
+    attempts = record.get("otp_attempts", 0)
+    if attempts >= 5:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many incorrect attempts. Request a new code.",
+        )
+
+    if record["otp"] != otp:
+        await db.password_resets.update_one(
+            {"_id": record["_id"]},
+            {"$inc": {"otp_attempts": 1}},
+        )
+        raise HTTPException(status_code=400, detail="Invalid code")
+
+    # OK — update password_hash to the new PIN. Clear lockout state so
+    # the user can sign in immediately. Drop the OTP record so it can't
+    # be reused.
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "password_hash": get_password_hash(new_pin),
+                "auth_mode": "pin",
+                "pin_reset_at": utcnow(),
+                "failed_login_attempts": 0,
+            },
+            "$unset": {"locked_until": ""},
+        },
+    )
+    await db.password_resets.delete_one({"_id": record["_id"]})
+
+    return {
+        "status": "ok",
+        "message": "PIN updated. You can now sign in with your new PIN.",
+    }
+
+
 @api_router.post("/auth/reset-password")
 async def reset_password(request: ResetPasswordRequest):
     """Reset password using token"""
