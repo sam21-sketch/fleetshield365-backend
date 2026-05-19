@@ -50,16 +50,18 @@ async def main(apply: bool) -> None:
     hashed = _hash(DEFAULT_PIN)
     now = datetime.now(timezone.utc)
 
-    # Match driver accounts + admin-as-operator accounts. Skip those
-    # already marked as PIN-reset (admin chose a custom PIN already).
+    # 2026-05-19 update — only reset accounts whose ROLE is "driver".
+    # Earlier draft also matched `is_also_operator: True`, but that
+    # caught super_admin / admin accounts who'd enabled themselves as
+    # operators on the side — resetting their password_hash to 0000
+    # would lock them out of the web admin panel where they sign in
+    # with their normal password. Drivers-only is the correct scope.
+    #
+    # Skip rows already marked as PIN-reset (admin set a custom PIN
+    # for that operator after the migration).
     filt = {
         "$and": [
-            {
-                "$or": [
-                    {"role": "driver"},
-                    {"is_also_operator": True},
-                ]
-            },
+            {"role": "driver"},
             {
                 "$or": [
                     {"auth_mode": {"$ne": "pin"}},
