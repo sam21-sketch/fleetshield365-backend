@@ -2393,7 +2393,7 @@ UPLOAD_FORMAT_GROUP: Dict[str, str] = {
     "fuel": "image",
     "incident_photo": "image",
     "incident_pdf": "pdf",
-    "license": "image",
+    "license": "image_or_pdf",
     "driver_doc": "image_or_pdf",
     "service": "image_or_pdf",
     "maintenance": "image_or_pdf",
