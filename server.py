@@ -9422,7 +9422,7 @@ async def export_service_record_attachments_zip(
     records = await db.service_records.find(
         query,
         {"vehicle_id": 1, "service_date": 1, "service_type": 1,
-         "attachment_object_keys": 1, "attachments": 1},
+         "attachments": 1, "attachment_object_keys": 1},
     ).sort("service_date", -1).to_list(2000)
 
     if not records:
@@ -9443,8 +9443,16 @@ async def export_service_record_attachments_zip(
             svc_date = str(rec.get("service_date", ""))[:10]
             svc_type = (rec.get("service_type") or "service").replace("/", "_")
             folder = f"{vname}/{svc_date}_{svc_type}"
-            # Prefer object-keys (MinIO) over inline base64.
-            for idx, key in enumerate(rec.get("attachment_object_keys") or [], start=1):
+            # 2026-05-21 — the create handler stores MinIO object keys
+            # under the field name `attachments` (the legacy name; despite
+            # the storage-breakdown helper calling it `attachment_object_keys`).
+            # Read both for safety, deduplicating by string identity.
+            object_keys: list = []
+            for source_field in ("attachments", "attachment_object_keys"):
+                for k in (rec.get(source_field) or []):
+                    if isinstance(k, str) and k and "/" in k and k not in object_keys:
+                        object_keys.append(k)
+            for idx, key in enumerate(object_keys, start=1):
                 try:
                     raw = object_store.get_bytes("service-records", key)
                 except Exception as exc:
@@ -9456,10 +9464,12 @@ async def export_service_record_attachments_zip(
                 zf.writestr(fname, raw)
                 manifest_lines.append(f"- {fname}")
                 written += 1
-            # Legacy base64 fallback (data:image/jpeg;base64,... or raw b64).
+            # Legacy: some very old rows may store inline base64 strings
+            # in `attachments`. Detect by content (data: prefix OR not
+            # a valid object key path) and decode if present.
             for idx, payload in enumerate(rec.get("attachments") or [], start=1):
-                if not isinstance(payload, str):
-                    continue
+                if not isinstance(payload, str) or "/" in payload:
+                    continue  # already handled above (was an object key)
                 raw_str = payload
                 if raw_str.startswith("data:"):
                     raw_str = raw_str.split(",", 1)[1] if "," in raw_str else raw_str
@@ -10354,11 +10364,17 @@ async def export_incidents_csv(
     if severity:
         query["severity"] = severity
     if date_from or date_to:
+        # incidents.created_at is stored as a Python datetime (see create
+        # handler ~line 10206). Compare against datetime bounds, not
+        # strings — a string $gte against a Mongo Date never matches.
         date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = date_from
-        if date_to:
-            date_filter["$lte"] = date_to + "T23:59:59"
+        try:
+            if date_from:
+                date_filter["$gte"] = datetime.fromisoformat(date_from)
+            if date_to:
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
     vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
     if vid_list:
@@ -10514,11 +10530,17 @@ async def export_incidents_pdf(
     if severity:
         query["severity"] = severity
     if date_from or date_to:
+        # incidents.created_at is stored as a Python datetime (see create
+        # handler ~line 10206). Compare against datetime bounds, not
+        # strings — a string $gte against a Mongo Date never matches.
         date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = date_from
-        if date_to:
-            date_filter["$lte"] = date_to + "T23:59:59"
+        try:
+            if date_from:
+                date_filter["$gte"] = datetime.fromisoformat(date_from)
+            if date_to:
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
     vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
     if vid_list:
@@ -10886,11 +10908,17 @@ async def _export_incidents_pdf_unused() -> None:
     if severity:
         query["severity"] = severity
     if date_from or date_to:
+        # incidents.created_at is stored as a Python datetime (see create
+        # handler ~line 10206). Compare against datetime bounds, not
+        # strings — a string $gte against a Mongo Date never matches.
         date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = date_from
-        if date_to:
-            date_filter["$lte"] = date_to + "T23:59:59"
+        try:
+            if date_from:
+                date_filter["$gte"] = datetime.fromisoformat(date_from)
+            if date_to:
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
     vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
     if vid_list:
