@@ -14677,6 +14677,85 @@ async def developer_set_landing_media(
     return {"ok": True, "count": len(items)}
 
 
+# Allowed slugs for the landing-media grid. Matches the six tiles on
+# the marketing LandingPage.tsx. Keep this in sync with _DEFAULT_LANDING_MEDIA
+# below + the keys hard-coded in the marketing page so an owner upload
+# always lands on a slot the page actually renders.
+_LANDING_MEDIA_SLUGS = {"trucks", "trailers", "excavators", "forklifts", "cranes", "utes"}
+
+
+@api_router.post("/developer/landing-media/upload")
+async def developer_upload_landing_media(
+    key: str = Form(...),
+    title: Optional[str] = Form(None),
+    alt: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Owner-panel hero-image upload for one landing tile.
+
+    Validates the slug + file (image only, magic bytes, size cap), pushes
+    bytes to the public ``logos`` bucket under ``landing/<key>.<ext>``,
+    then upserts the matching entry in ``platform_config.landing_media.items``
+    so the public ``GET /api/landing/media`` immediately serves the new URL.
+    """
+    if key not in _LANDING_MEDIA_SLUGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid landing key. Allowed: {sorted(_LANDING_MEDIA_SLUGS)}",
+        )
+
+    contents = await file.read()
+    # Reuse the "logo" upload group: image-only, 2 MB cap, magic-byte check.
+    detected_format = _validate_upload_or_400(contents, "logo", "file")
+    content_type = _FORMAT_TO_CONTENT_TYPE[detected_format]
+    ext = {"jpeg": "jpg", "png": "png", "webp": "webp"}.get(detected_format, "jpg")
+
+    # Platform-level asset — no tenant prefix. logos bucket is anonymous-readable.
+    object_key = f"landing/{key}.{ext}"
+    try:
+        _upload_with_thumbnail("logos", object_key, contents, content_type, expected_company_id=None)
+    except Exception as exc:
+        logger.error(f"Landing media upload failed for key={key}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to upload image")
+
+    # Compose the public URL. logos bucket policy on this stack allows
+    # anonymous GET so we can hand back a stable, cache-friendly URL
+    # rather than a short-lived presigned link.
+    public_url = _presign_if_key("logos", object_key) or ""
+
+    # Load existing items (or defaults), upsert the entry for this key.
+    doc = await db.platform_config.find_one({"_id": "landing_media"})
+    items: List[dict] = (doc or {}).get("items") or [dict(d) for d in _DEFAULT_LANDING_MEDIA]
+    updated = False
+    for it in items:
+        if it.get("key") == key:
+            if title is not None:
+                it["title"] = title
+            if alt is not None:
+                it["alt"] = alt
+            it["url"] = public_url
+            it["object_key"] = object_key
+            updated = True
+            break
+    if not updated:
+        items.append({
+            "key": key,
+            "title": title or key.title(),
+            "alt": alt or "",
+            "url": public_url,
+            "object_key": object_key,
+        })
+
+    await db.platform_config.update_one(
+        {"_id": "landing_media"},
+        {"$set": {"items": items, "updated_at": utcnow(), "updated_by": str(current_user.get("_id"))}},
+        upsert=True,
+    )
+
+    return {"ok": True, "key": key, "url": public_url, "items": items}
+
+
 _DEFAULT_LANDING_MEDIA: List[dict] = [
     {"key": "trucks",     "title": "Prime movers",          "alt": "Heavy truck on a highway at dusk",
      "url": "https://images.unsplash.com/photo-1601584115197-04ecc0da31d7?w=800&q=70&auto=format&fit=crop"},
