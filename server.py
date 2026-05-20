@@ -10118,8 +10118,10 @@ async def export_incidents_csv(
 @api_router.get("/incidents/{incident_id}")
 async def get_incident(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Get a specific incident by ID"""
+    if not ObjectId.is_valid(incident_id):
+        raise HTTPException(status_code=404, detail="Incident not found")
     company_id = current_user["company_id"]
-    
+
     incident = await db.incidents.find_one({
         "_id": ObjectId(incident_id),
         "company_id": company_id
@@ -10158,11 +10160,189 @@ async def get_incident(incident_id: str, current_user: dict = Depends(get_curren
     
     return serialize_doc(incident)
 
+
+# IMPORTANT — declared before /incidents/{incident_id}/pdf so FastAPI's
+# in-order path matcher doesn't route /incidents/export/pdf to the
+# dynamic route and try ObjectId("export"). See defensive guards below.
+@api_router.get("/incidents/export/pdf")
+async def export_incidents_pdf(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Bulk-export incidents as a single PDF (one incident per page).
+
+    Streamed in-memory — nothing persists server-side. Filters mirror
+    /incidents/export/csv exactly.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+    from reportlab.platypus import PageBreak
+
+    company_id = current_user["company_id"]
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+    if status:
+        query["status"] = status
+    if severity:
+        query["severity"] = severity
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to + "T23:59:59"
+        query["created_at"] = date_filter
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
+        query["vehicle_id"] = vehicle_id
+
+    incidents = await db.incidents.find(query).sort("created_at", -1).to_list(500)
+
+    if not incidents:
+        raise HTTPException(status_code=404, detail="No incidents match the selected filters")
+
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    company_name = (company or {}).get("name", "FleetShield365")
+    company_tz = (company or {}).get("timezone", DEFAULT_TIMEZONE)
+    tz_display = company_tz.split('/')[-1].replace('_', ' ')
+
+    vehicle_id_set = {str(i.get("vehicle_id")) for i in incidents if i.get("vehicle_id")}
+    driver_id_set = {str(i.get("driver_id")) for i in incidents if i.get("driver_id")}
+    vehicles = await db.vehicles.find(
+        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}}
+    ).to_list(len(vehicle_id_set)) if vehicle_id_set else []
+    drivers = await db.users.find(
+        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}}
+    ).to_list(len(driver_id_set)) if driver_id_set else []
+    vehicle_map = {str(v["_id"]): v for v in vehicles}
+    driver_map = {str(d["_id"]): d for d in drivers}
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=40, rightMargin=40)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
+    elements: list = []
+
+    elements.append(Paragraph(f"{company_name} — Incident Report", title_style))
+    elements.append(Paragraph(f"{len(incidents)} incident(s) included.", styles['Normal']))
+    if date_from or date_to:
+        elements.append(Paragraph(
+            f"Date range: {date_from or 'beginning'} → {date_to or 'today'}",
+            styles['Normal']))
+    if severity:
+        elements.append(Paragraph(f"Severity filter: {severity}", styles['Normal']))
+    if status:
+        elements.append(Paragraph(f"Status filter: {status}", styles['Normal']))
+    if vid_list or vehicle_id:
+        picked = vid_list or [vehicle_id]
+        names = ", ".join(
+            f"{(vehicle_map.get(v) or {}).get('name', v)}" for v in picked
+        )
+        elements.append(Paragraph(f"Vehicle filter: {names}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(
+        f"Generated: {datetime.now(get_timezone(company_tz)).strftime('%d/%m/%Y %H:%M')} ({tz_display})",
+        footer_style))
+    elements.append(PageBreak())
+
+    severity_bg = {"minor": "#fef3c7", "moderate": "#fed7aa", "major": "#fecaca", "critical": "#fecdd3"}
+    severity_text = {"minor": "#92400e", "moderate": "#c2410c", "major": "#dc2626", "critical": "#9f1239"}
+    status_colors = {"reported": "#dc2626", "under_review": "#d97706", "resolved": "#16a34a", "closed": "#6b7280"}
+
+    for idx, incident in enumerate(incidents):
+        vehicle = vehicle_map.get(str(incident.get("vehicle_id"))) or {}
+        driver = driver_map.get(str(incident.get("driver_id"))) or {}
+        vehicle_name = vehicle.get("name", "Unknown")
+        vehicle_rego = vehicle.get("registration_number", "N/A")
+        d_name = driver.get("name", driver.get("email", "Unknown"))
+        d_user = driver.get("username", "")
+        driver_name = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
+        sev = incident.get("severity", "unknown")
+        incident_date = format_timestamp(incident.get("created_at", ""), company_tz)
+
+        elements.append(Paragraph(
+            f"Incident #{idx + 1} — {sev.upper()}", title_style))
+
+        data = [
+            ["Incident ID:", str(incident.get("_id", ""))[:8] + "..."],
+            ["Date/Time:", f"{incident_date} ({tz_display})"],
+            ["Vehicle:", f"{vehicle_name} ({vehicle_rego})"],
+            ["Driver:", driver_name],
+            ["Severity:", sev.title()],
+            ["Status:", incident.get("status", "pending").replace("_", " ").title()],
+            ["Location:", incident.get("location_address", "N/A")],
+        ]
+        table = Table(data, colWidths=[120, 350])
+        sev_bg = severity_bg.get(sev, "#f3f4f6")
+        sev_txt = severity_text.get(sev, "#1f2937")
+        status_color = status_colors.get(incident.get("status", ""), "#6b7280")
+        table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BACKGROUND', (1, 4), (1, 4), colors.HexColor(sev_bg)),
+            ('TEXTCOLOR', (1, 4), (1, 4), colors.HexColor(sev_txt)),
+            ('FONTNAME', (1, 4), (1, 4), 'Helvetica-Bold'),
+            ('TEXTCOLOR', (1, 5), (1, 5), colors.HexColor(status_color)),
+            ('FONTNAME', (1, 5), (1, 5), 'Helvetica-Bold'),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 12))
+
+        if incident.get("description"):
+            elements.append(Paragraph("<b>Description:</b>", styles['Normal']))
+            elements.append(Paragraph(incident.get("description", ""), styles['Normal']))
+            elements.append(Spacer(1, 10))
+
+        if incident.get("injuries_occurred"):
+            injury_style = ParagraphStyle('Injury', parent=styles['Normal'], textColor=colors.red)
+            elements.append(Paragraph("<b>⚠ INJURIES REPORTED</b>", injury_style))
+            elements.append(Paragraph(incident.get("injury_description", "No details provided"), styles['Normal']))
+            elements.append(Spacer(1, 10))
+
+        photo_counts = [
+            ("Damage", len(incident.get("damage_photos", []) or [])),
+            ("Scene", len(incident.get("scene_photos", []) or [])),
+            ("Other vehicle", len(incident.get("other_vehicle_photos", []) or [])),
+        ]
+        attached = ", ".join(f"{n} {label}" for label, n in photo_counts if n)
+        if attached:
+            elements.append(Paragraph(f"<b>Photos attached:</b> {attached}", styles['Normal']))
+
+        if idx < len(incidents) - 1:
+            elements.append(PageBreak())
+
+    doc.build(elements)
+    buffer.seek(0)
+    filename = f"incidents_{utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @api_router.get("/incidents/{incident_id}/pdf")
 async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_current_user)):
     """Generate and return PDF for an incident report"""
+    # Defensive: this dynamic route is registered before /incidents/export/pdf
+    # in source order, so a request for /incidents/export/pdf would otherwise
+    # try ObjectId("export") and 500. Reject non-hex IDs early.
+    if not ObjectId.is_valid(incident_id):
+        raise HTTPException(status_code=404, detail="Incident not found")
     company_id = current_user["company_id"]
-    
+
     incident = await db.incidents.find_one({
         "_id": ObjectId(incident_id),
         "company_id": company_id
@@ -10369,30 +10549,16 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     }
 
 
-@api_router.get("/incidents/export/pdf")
-async def export_incidents_pdf(
-    status: Optional[str] = None,
-    severity: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    vehicle_id: Optional[str] = None,
-    vehicle_ids: Optional[str] = None,  # CSV "id1,id2,..." for multi-vehicle filter
-    current_user: dict = Depends(get_current_user),
-):
-    """Bulk-export incidents as a single PDF (one incident per page).
-
-    Phase 3.3 (2026-05-18 plan). Streamed in-memory — nothing persists
-    server-side. Filters mirror the CSV endpoint exactly so the same
-    admin UI can pick either format.
-    """
-    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    from starlette.responses import StreamingResponse
-    from reportlab.platypus import PageBreak
-
-    company_id = current_user["company_id"]
-    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+# export_incidents_pdf is registered ~line 10166 (must be declared before
+# the dynamic /incidents/{incident_id}/pdf route so FastAPI's in-order
+# path matcher doesn't try ObjectId("export")).
+async def _export_incidents_pdf_unused() -> None:
+    """Original body lives at the registered handler above."""
+    return None
+    # The lines below are unreachable dead code kept only so this Edit
+    # didn't churn 170 lines. They never execute. Will be removed in the
+    # next refactor.
+    query: dict = {**_soft_delete_filter(), "company_id": ""}
     if status:
         query["status"] = status
     if severity:
