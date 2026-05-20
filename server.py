@@ -4841,15 +4841,24 @@ async def request_pin_reset(request: Request, payload: RequestPinResetRequest):
     # password_resets is keyed by user_id; we reuse it so a fresh OTP
     # always replaces the previous one (per Phase 3 of the existing
     # forgot-password flow).
+    #
+    # The collection has a unique index on `token` (the web flow's reset
+    # link). PIN reset doesn't use a token — only an OTP. We explicitly
+    # $unset token so the sparse-unique index skips this doc instead of
+    # treating it as token=null (which would collide with every other
+    # PIN-reset doc, see 2026-05-20 incident).
     await db.password_resets.update_one(
         {"user_id": str(user["_id"])},
-        {"$set": {
-            "user_id": str(user["_id"]),
-            "otp": otp,
-            "otp_attempts": 0,
-            "expires_at": expires_at,
-            "created_at": utcnow(),
-        }},
+        {
+            "$set": {
+                "user_id": str(user["_id"]),
+                "otp": otp,
+                "otp_attempts": 0,
+                "expires_at": expires_at,
+                "created_at": utcnow(),
+            },
+            "$unset": {"token": ""},
+        },
         upsert=True,
     )
 
@@ -15860,7 +15869,23 @@ async def ensure_indexes() -> None:
 
     # --- password_resets + email_logs ---------------------------------
     # TTL index on password_resets.expires_at auto-removes spent tokens.
-    await db.password_resets.create_index("token", unique=True)
+    #
+    # The mobile PIN-reset flow stores `otp` + `user_id` on the same
+    # collection but never sets `token`. The legacy index was
+    # ``unique=True`` only — MongoDB treats a missing field as null, so
+    # any second mobile reset hit a DuplicateKey on token=null and the
+    # whole request 500'd. Fix: rebuild the index as ``sparse=True`` so
+    # docs without a token are simply skipped from the index.
+    try:
+        existing = await db.password_resets.index_information()
+        for name, spec in existing.items():
+            if name == "token_1" and not spec.get("sparse"):
+                await db.password_resets.drop_index(name)
+                logger.info("Dropped legacy non-sparse token index on password_resets")
+                break
+    except Exception as exc:
+        logger.warning(f"Could not inspect password_resets indexes: {exc}")
+    await db.password_resets.create_index("token", unique=True, sparse=True)
     await db.password_resets.create_index(
         "expires_at", expireAfterSeconds=0
     )
