@@ -9154,12 +9154,115 @@ async def export_service_records_csv(
     output.seek(0)
     
     filename = f"service_records_{utcnow().strftime('%Y%m%d')}.csv"
-    
+
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+@api_router.get("/service-records/attachments/download")
+async def export_service_record_attachments_zip(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Owner request 2026-05-20 — mirror the fuel receipts ZIP for
+    service-record attachments (workshop invoices, photos, certs). In-memory
+    ZIP, no /tmp file. Cap at 2000 attachments per export to bound memory.
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+
+    company_id = current_user["company_id"]
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+    if date_from or date_to:
+        if not (date_from and date_to):
+            raise HTTPException(status_code=400, detail="Specify both date_from and date_to, or neither")
+        query["service_date"] = {"$gte": date_from, "$lte": date_to}
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["vehicle_id"] = {"$in": vid_list}
+    elif vehicle_id:
+        query["vehicle_id"] = vehicle_id
+
+    vehicles = await db.vehicles.find(
+        {"company_id": company_id},
+        {"name": 1, "registration_number": 1},
+    ).to_list(2000)
+    vehicle_map = {
+        str(v["_id"]): (v.get("registration_number") or v.get("name") or str(v["_id"]))
+        for v in vehicles
+    }
+
+    records = await db.service_records.find(
+        query,
+        {"vehicle_id": 1, "service_date": 1, "service_type": 1,
+         "attachments_object_keys": 1, "attachments": 1},
+    ).sort("service_date", -1).to_list(2000)
+
+    if not records:
+        raise HTTPException(status_code=404, detail="No service records match the selected filters")
+
+    zip_buffer = BytesIO()
+    manifest_lines = [
+        "FleetShield365 Service-Record Attachments Export",
+        f"Generated: {utcnow().isoformat()}",
+        f"Filters: vehicles={vid_list or [vehicle_id] if vehicle_id else 'all'} dates={date_from}..{date_to}",
+        f"Service records: {len(records)}",
+        "",
+    ]
+    written = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rec in records:
+            vname = vehicle_map.get(str(rec.get("vehicle_id", "")), "unknown")
+            svc_date = str(rec.get("service_date", ""))[:10]
+            svc_type = (rec.get("service_type") or "service").replace("/", "_")
+            folder = f"{vname}/{svc_date}_{svc_type}"
+            # Prefer object-keys (MinIO) over inline base64.
+            for idx, key in enumerate(rec.get("attachments_object_keys") or [], start=1):
+                try:
+                    raw = object_store.get_bytes("service-records", key)
+                except Exception as exc:
+                    logger.warning(f"Service attachment {key} unreadable: {exc}")
+                    manifest_lines.append(f"- SKIPPED {folder}/attachment-{idx} (read error)")
+                    continue
+                ext = ".pdf" if raw[:4] == b"%PDF" else ".jpg"
+                fname = f"{folder}/attachment-{idx}{ext}"
+                zf.writestr(fname, raw)
+                manifest_lines.append(f"- {fname}")
+                written += 1
+            # Legacy base64 fallback (data:image/jpeg;base64,... or raw b64).
+            for idx, payload in enumerate(rec.get("attachments") or [], start=1):
+                if not isinstance(payload, str):
+                    continue
+                raw_str = payload
+                if raw_str.startswith("data:"):
+                    raw_str = raw_str.split(",", 1)[1] if "," in raw_str else raw_str
+                try:
+                    raw_bytes = base64.b64decode(raw_str)
+                except Exception:
+                    continue
+                ext = ".pdf" if raw_bytes[:4] == b"%PDF" else ".jpg"
+                fname = f"{folder}/legacy-attachment-{idx}{ext}"
+                zf.writestr(fname, raw_bytes)
+                manifest_lines.append(f"- {fname}")
+                written += 1
+        zf.writestr("manifest.txt", "\n".join(manifest_lines))
+
+    zip_buffer.seek(0)
+    out_name = f"service_attachments_{utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={out_name}"},
+    )
+
 
 @api_router.get("/service-records/{record_id}/pdf")
 async def get_service_record_pdf(
@@ -11011,29 +11114,56 @@ def _classify_defect_severity(item_name: str, has_damage: bool, has_incident: bo
 
 
 def _vehicle_health_score(open_defects: list, expiry_days: list, last_inspection_days: int, has_grounding: bool) -> int:
-    """
-    Calculate vehicle health score 0-100.
-    - 100 = perfect
-    - <60 = critical
+    """Backwards-compat wrapper — returns just the score integer. Use
+    ``_vehicle_health_score_with_reasons`` for the new explainer payload."""
+    score, _ = _vehicle_health_score_with_reasons(open_defects, expiry_days, last_inspection_days, has_grounding)
+    return score
+
+
+def _vehicle_health_score_with_reasons(
+    open_defects: list,
+    expiry_days: list,
+    last_inspection_days: int,
+    has_grounding: bool,
+) -> tuple[int, list[dict]]:
+    """Calculate vehicle health score (0-100) plus a human-readable list
+    of deductions so the UI can explain "why isn't this 100?".
+
+    Each deduction is ``{label: str, points: int}`` — negative ``points``
+    (e.g. -10) so the UI can render "−10 never inspected" directly.
+
+    Returned in priority order so the UI can show the top 1-2 offenders.
     """
     score = 100
+    reasons: list[dict] = []
     severity_weights = {"high": 15, "medium": 10, "low": 5}
     for d in open_defects:
-        score -= severity_weights.get(d.get("severity", "low"), 5)
-    # expiry_days = list of days-until-expiry for any tracked field
+        sev = d.get("severity", "low")
+        pts = severity_weights.get(sev, 5)
+        score -= pts
+        reasons.append({"label": f"Open {sev} defect: {d.get('name', 'unnamed')}", "points": -pts})
     for days in expiry_days:
-        if days is not None:
-            if days < 0:
-                score -= 15  # already expired
-            elif days <= 14:
-                score -= 10
+        if days is None:
+            continue
+        if days < 0:
+            score -= 15
+            reasons.append({"label": "Already expired (rego/license/cert)", "points": -15})
+        elif days <= 14:
+            score -= 10
+            reasons.append({"label": f"Expiry within 14 days ({days}d)", "points": -10})
     if last_inspection_days > 7:
         score -= 10
+        reasons.append({
+            "label": "Never inspected" if last_inspection_days >= 9999 else f"Last inspected {last_inspection_days}d ago",
+            "points": -10,
+        })
     elif last_inspection_days > 3:
         score -= 5
+        reasons.append({"label": f"Last inspected {last_inspection_days}d ago", "points": -5})
     if has_grounding:
         score -= 20
-    return max(0, min(100, score))
+        reasons.append({"label": "Vehicle grounded (driver flagged unsafe)", "points": -20})
+    return max(0, min(100, score)), reasons
 
 
 @api_router.get("/fleet-health")
@@ -11192,12 +11322,15 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
             last_inspection_days = 999
         # Has grounding defect?
         has_grounding = any(d.get("severity") == "high" for d in defects)
-        score = _vehicle_health_score(defects, expiry_days_list, last_inspection_days, has_grounding)
+        score, score_reasons = _vehicle_health_score_with_reasons(
+            defects, expiry_days_list, last_inspection_days, has_grounding
+        )
         per_vehicle.append({
             "vehicle_id": vid,
             "name": v.get("name"),
             "registration_number": v.get("registration_number"),
             "score": score,
+            "score_reasons": score_reasons,
             "open_defects": len(defects),
             "high_severity_defects": sum(1 for d in defects if d.get("severity") == "high"),
             "last_inspection_days_ago": last_inspection_days if last_inspection_days < 999 else None,
@@ -11491,11 +11624,69 @@ async def update_defect_status(
     return {"status": "success", "defect_id": defect_id, "new_status": update.status}
 
 
+class WorkshopExtraItem(BaseModel):
+    """Free-form item the user wants on the workshop email that is not
+    backed by an existing defect record (oil leak, scheduled oiling,
+    "while you're at it" requests, etc)."""
+    type: str  # 'oil_leak' | 'oiling' | 'other' | free-form
+    note: Optional[str] = None
+    severity: Optional[str] = None  # 'low' | 'medium' | 'high'
+
+
 class WorkshopEmailRequest(BaseModel):
     workshop_email: str
     workshop_name: Optional[str] = None
     message: Optional[str] = None
     defect_ids: Optional[list] = None  # if provided, only these defects; else all open
+    extra_items: Optional[List[WorkshopExtraItem]] = None  # add-on requests beyond defects
+
+
+def _workshop_extras_html(extras: List[WorkshopExtraItem]) -> str:
+    """Render the 'Additional requests' block on the workshop email.
+    Caller has already filtered to a non-empty list.
+    """
+    # Type → human label map. Anything outside the known set falls back to title-case.
+    LABELS = {
+        "oil_leak": "Oil leak",
+        "oiling": "Scheduled oiling / lubrication",
+        "tyre_check": "Tyre check",
+        "brake_check": "Brake inspection",
+        "battery": "Battery check",
+        "ac_service": "Air-con service",
+        "general_service": "General service",
+        "other": "Additional item",
+    }
+    SEV_COLORS = {"high": "#dc2626", "medium": "#f59e0b", "low": "#64748b"}
+
+    rows = ""
+    for i, it in enumerate(extras, start=1):
+        label = LABELS.get(it.type, it.type.replace("_", " ").title())
+        sev_color = SEV_COLORS.get((it.severity or "low"), "#64748b")
+        note_html = (
+            f"<div style='color:#475569; margin-top:6px;'>{_safe_html(it.note)}</div>"
+            if it.note else ""
+        )
+        sev_badge = (
+            f"<span style='display:inline-block; padding:3px 10px; border-radius:999px; "
+            f"background:{sev_color}; color:white; font-size:11px; font-weight:600; "
+            f"text-transform:uppercase; margin-top:6px;'>{(it.severity or 'low')}</span>"
+        )
+        rows += f"""
+        <tr>
+          <td style="padding:14px; border-bottom:1px solid #e2e8f0; vertical-align:top;">
+            <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; letter-spacing:0.5px;">+ EXTRA · #{i}</div>
+            <div style="font-weight:600; color:#0f172a; font-size:15px; margin-top:4px;">{_safe_html(label)}</div>
+            {note_html}
+            {sev_badge}
+          </td>
+        </tr>
+        """
+    return f"""
+    <h2 style="font-size:16px; color:#0f172a; margin:24px 0 12px;">Additional requests ({len(extras)})</h2>
+    <table style="width:100%; border-collapse:collapse; background:white; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden;">
+      {rows}
+    </table>
+    """
 
 
 @api_router.post("/vehicles/{vehicle_id}/email-workshop")
@@ -11511,11 +11702,13 @@ async def email_defects_to_workshop(
     # Reuse the defect aggregation logic
     defects_payload = await get_vehicle_defects(vehicle_id, current_user=current_user)
     open_defects = defects_payload["open_defects"]
-    if request.defect_ids:
+    if request.defect_ids is not None:
+        # Empty list = "no defects, only extras" — different from None ("send all open").
         open_defects = [d for d in open_defects if d["id"] in request.defect_ids]
 
-    if not open_defects:
-        raise HTTPException(status_code=400, detail="No open defects to send")
+    extras = request.extra_items or []
+    if not open_defects and not extras:
+        raise HTTPException(status_code=400, detail="Nothing to send — pick at least one defect or add an extra item")
 
     vehicle = defects_payload["vehicle"]
     company = await db.companies.find_one({"_id": ObjectId(current_user["company_id"])}, {"name": 1})
@@ -11576,10 +11769,9 @@ async def email_defects_to_workshop(
             </table>
           </div>
 
-          <h2 style="font-size:16px; color:#0f172a; margin:24px 0 12px;">Open Defects ({len(open_defects)})</h2>
-          <table style="width:100%; border-collapse:collapse; background:white; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden;">
-            {rows_html}
-          </table>
+          {("<h2 style=\"font-size:16px; color:#0f172a; margin:24px 0 12px;\">Open Defects (" + str(len(open_defects)) + ")</h2><table style=\"width:100%; border-collapse:collapse; background:white; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden;\">" + rows_html + "</table>") if open_defects else ""}
+
+          {_workshop_extras_html(extras) if extras else ""}
 
           <p style="color:#64748b; font-size:13px; margin-top:28px; line-height:1.6;">
             All defects above include photo evidence and GPS-stamped timestamps in our compliance records.
@@ -12535,6 +12727,14 @@ class PushTokenCreate(BaseModel):
 
 class NotificationPreferencesUpdate(BaseModel):
     expiry_alerts: Optional[bool] = None
+    # Per-window expiry lead times. When `expiry_alerts` is on, these gate
+    # which days-until-expiry buckets actually emit emails. Missing → treat
+    # as "on" so older notification_preferences docs keep emailing.
+    expiry_alert_70d: Optional[bool] = None
+    expiry_alert_45d: Optional[bool] = None
+    expiry_alert_21d: Optional[bool] = None
+    expiry_alert_7d: Optional[bool] = None
+    expiry_alert_expired: Optional[bool] = None
     issue_alerts: Optional[bool] = None
     missed_inspection_alerts: Optional[bool] = None
     daily_summary: Optional[bool] = None
@@ -13756,10 +13956,12 @@ async def developer_storage_breakdown(
 ):
     """Per-tenant storage breakdown (drives the Owner Storage info popover).
 
-    Returns the same `categories` shape as platform-stats, but scoped to
-    one company so the popover can show "Lalitcom — 81 inspection photos,
-    8 driver documents, …" without scanning all of MinIO. Cheap: only
-    Mongo counts + Mongo aggregations on indexed fields.
+    Owner review 2026-05-20 — previously this returned estimate-based
+    bytes (count × per-category KB constant) which never matched the
+    real bytes the Organisations table read straight from MinIO. Fix:
+    pull real per-bucket bytes from MinIO (same logic as /orgs/{id}/storage)
+    and split each category's share proportionally by Mongo count within
+    that bucket. Result: modal totals reconcile with the table.
     """
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=400, detail="Invalid company_id")
@@ -13773,15 +13975,98 @@ async def developer_storage_breakdown(
     categories = await _compute_storage_categories(
         company_filter={"company_id": company_id},
     )
+
+    # Real per-bucket bytes — same scan as /developer/orgs/{id}/storage.
+    BUCKET_PREFIXES: dict = {
+        "logos":                [f"{company_id}/"],
+        "compliance":           [f"driver-docs/{company_id}/"],
+        "inspection-photos":    [f"{company_id}/"],
+        "fuel-receipts":        [f"{company_id}/"],
+        "incident-photos":      [f"{company_id}/"],
+        "incident-attachments": [f"{company_id}/"],
+        "service-records":      [f"{company_id}/"],
+        "maintenance":          [f"{company_id}/"],
+        "signatures":           [f"{company_id}/"],
+        "photos":               [f"{company_id}/"],
+    }
+    bucket_bytes: dict = {}
+    bucket_objects: dict = {}
+    for name, prefixes in BUCKET_PREFIXES.items():
+        b_bytes = 0
+        b_objs = 0
+        try:
+            paginator = object_store._s3_client.get_paginator("list_objects_v2")
+            for prefix in prefixes:
+                for page in paginator.paginate(
+                    Bucket=name, Prefix=prefix,
+                    PaginationConfig={"MaxItems": 50000},
+                ):
+                    for obj in page.get("Contents") or []:
+                        b_bytes += obj.get("Size", 0) or 0
+                        b_objs += 1
+        except Exception:
+            pass
+        bucket_bytes[name] = b_bytes
+        bucket_objects[name] = b_objs
+
+    # Map each category to the MinIO bucket it lives in.
+    CATEGORY_TO_BUCKET = {
+        "prestart_photos":         "inspection-photos",
+        "endshift_photos":         "inspection-photos",
+        "inspection_signatures":   "signatures",
+        "incident_damage_photos":  "incident-photos",
+        "incident_scene_photos":   "incident-photos",
+        "incident_other_photos":   "incident-photos",
+        "fuel_receipts":           "fuel-receipts",
+        "service_attachments":     "service-records",
+        "maintenance_invoices":    "maintenance",
+        "driver_documents":        "compliance",
+        "company_logos":           "logos",
+        "vehicle_images":          "photos",
+    }
+    # Sum of category counts within each bucket — for proportional split.
+    counts_in_bucket: dict = {}
+    for cat in categories:
+        bucket = CATEGORY_TO_BUCKET.get(cat["key"])
+        if bucket:
+            counts_in_bucket[bucket] = counts_in_bucket.get(bucket, 0) + (cat.get("count") or 0)
+
+    # Allocate real bytes to each category proportionally to its count
+    # within its bucket. Falls back to the legacy estimate when the
+    # bucket scan returns 0 objects but Mongo says the category has rows
+    # (rare — usually means the object_key field is stale).
+    for cat in categories:
+        bucket = CATEGORY_TO_BUCKET.get(cat["key"])
+        if not bucket:
+            cat["bytes_actual"] = 0
+            continue
+        bb = bucket_bytes.get(bucket, 0)
+        denom = counts_in_bucket.get(bucket, 0)
+        if denom > 0 and bb > 0:
+            cat["bytes_actual"] = int(bb * (cat.get("count", 0) / denom))
+        else:
+            cat["bytes_actual"] = 0
+
     total_objects = sum(c.get("count", 0) for c in categories)
-    total_bytes = sum(c.get("bytes_estimate", 0) for c in categories)
+    total_bytes_actual = sum(c.get("bytes_actual", 0) for c in categories)
+    total_bytes_real_buckets = sum(bucket_bytes.values())
+
     return {
         "company_id": company_id,
         "company_name": company.get("name"),
         "subdomain": company.get("subdomain"),
         "categories": categories,
+        "total_objects": total_objects,
+        # Real bytes from MinIO scan — matches /developer/orgs/{id}/storage.
+        "total_bytes": total_bytes_real_buckets,
+        # Sum-by-category, may differ slightly from total_bytes when
+        # the bucket holds objects that no category claims (orphans).
+        "total_bytes_categorised": total_bytes_actual,
+        # Legacy fields kept for backward-compat with older clients.
         "total_objects_estimate": total_objects,
-        "total_bytes_estimate": total_bytes,
+        "total_bytes_estimate": sum(c.get("bytes_estimate", 0) for c in categories),
+        "bucket_totals": bucket_bytes,
+        "bucket_objects": bucket_objects,
         "generated_at": utcnow().isoformat(),
     }
 
