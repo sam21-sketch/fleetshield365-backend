@@ -6954,10 +6954,13 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
             manifest_lines.append(f"\n{op_name}:")
             
             # Document type mappings
+            # 2026-05-21 — license field names were mis-mapped: stored as
+            # `license_front_object_key` / `license_back_object_key` (no
+            # `_photo_` infix), so the bulk ZIP never included license files.
             doc_mappings = {
                 "driver_license": [
-                    ("license_photo_front", "driver_license_front.jpg"),
-                    ("license_photo_back", "driver_license_back.jpg")
+                    ("license_front", "driver_license_front.jpg"),
+                    ("license_back", "driver_license_back.jpg")
                 ],
                 "medical": [
                     ("medical_cert_front", "medical_certificate_front.jpg"),
@@ -7069,8 +7072,17 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
                                 image_bytes = None
 
                     if image_bytes is not None:
+                        # 2026-05-21 — drivers now upload PDFs (license,
+                        # medical, etc.) per the image-or-pdf format
+                        # widening. Sniff magic bytes so the file in
+                        # the ZIP ends in .pdf when it's a PDF.
+                        actual_name = file_name
+                        if image_bytes[:5] == b"%PDF-":
+                            actual_name = file_name.rsplit(".", 1)[0] + ".pdf"
+                        elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+                            actual_name = file_name.rsplit(".", 1)[0] + ".png"
                         zip_file.writestr(
-                            f"{folder_name}/{file_name}", image_bytes
+                            f"{folder_name}/{actual_name}", image_bytes
                         )
                         manifest_lines.append(f"  - {file_name}")
                     elif object_key or operator.get(field_name):
@@ -8508,10 +8520,16 @@ async def export_fuel_receipts_zip(
                 status_code=400,
                 detail="Specify both date_from and date_to, or neither",
             )
-        query["timestamp"] = {
-            "$gte": date_from,
-            "$lte": date_to + "T23:59:59",
-        }
+        # `timestamp` on fuel_submissions is stored as a Python datetime
+        # (see create handler). String comparison against ISO yyyy-mm-dd
+        # never matches a Mongo Date — 2026-05-20 bug. Parse the bounds
+        # into datetimes so BSON does a proper date-to-date comparison.
+        try:
+            ts_from = datetime.fromisoformat(date_from)
+            ts_to = datetime.fromisoformat(date_to + "T23:59:59")
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
+        query["timestamp"] = {"$gte": ts_from, "$lte": ts_to}
     vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
     if vid_list:
         query["vehicle_id"] = {"$in": vid_list}
@@ -9404,7 +9422,7 @@ async def export_service_record_attachments_zip(
     records = await db.service_records.find(
         query,
         {"vehicle_id": 1, "service_date": 1, "service_type": 1,
-         "attachments_object_keys": 1, "attachments": 1},
+         "attachment_object_keys": 1, "attachments": 1},
     ).sort("service_date", -1).to_list(2000)
 
     if not records:
@@ -9426,7 +9444,7 @@ async def export_service_record_attachments_zip(
             svc_type = (rec.get("service_type") or "service").replace("/", "_")
             folder = f"{vname}/{svc_date}_{svc_type}"
             # Prefer object-keys (MinIO) over inline base64.
-            for idx, key in enumerate(rec.get("attachments_object_keys") or [], start=1):
+            for idx, key in enumerate(rec.get("attachment_object_keys") or [], start=1):
                 try:
                     raw = object_store.get_bytes("service-records", key)
                 except Exception as exc:
