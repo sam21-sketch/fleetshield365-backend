@@ -2375,6 +2375,7 @@ UPLOAD_MAX_BYTES: Dict[str, int] = {
     "maintenance": _env_int("UPLOAD_MAX_BYTES_MAINTENANCE", 5 * 1024 * 1024),
     "signature": _env_int("UPLOAD_MAX_BYTES_SIGNATURE", 512 * 1024),
     "profile": _env_int("UPLOAD_MAX_BYTES_PROFILE", 1024 * 1024),
+    "vehicle_doc": _env_int("UPLOAD_MAX_BYTES_VEHICLE_DOC", 5 * 1024 * 1024),
     "default": _env_int("UPLOAD_MAX_BYTES_DEFAULT", 5 * 1024 * 1024),
 }
 
@@ -2399,6 +2400,8 @@ UPLOAD_FORMAT_GROUP: Dict[str, str] = {
     "maintenance": "image_or_pdf",
     "signature": "png",
     "profile": "image",
+    # 2026-05-20 — rego / insurance / safety-cert / COI supporting docs.
+    "vehicle_doc": "image_or_pdf",
 }
 
 # Count caps
@@ -3288,6 +3291,14 @@ class VehicleCreate(BaseModel):
     image_base64: Optional[str] = None
     notes: Optional[str] = None
     custom_fields: Optional[List[VehicleCustomField]] = None
+    # 2026-05-20 — image OR PDF for each of the four expiry documents.
+    # The form already collects the EXPIRY DATE; this adds the supporting
+    # paperwork (rego cert, insurance policy, etc) so the owner can pull
+    # the file at audit time. UPLOAD_FORMAT_GROUP['vehicle_doc']=image_or_pdf.
+    rego_doc_base64: Optional[str] = None
+    insurance_doc_base64: Optional[str] = None
+    safety_cert_doc_base64: Optional[str] = None
+    coi_doc_base64: Optional[str] = None
 
 class VehicleUpdate(BaseModel):
     name: Optional[str] = None
@@ -3305,6 +3316,10 @@ class VehicleUpdate(BaseModel):
     image_base64: Optional[str] = None
     notes: Optional[str] = None
     custom_fields: Optional[List[VehicleCustomField]] = None
+    rego_doc_base64: Optional[str] = None
+    insurance_doc_base64: Optional[str] = None
+    safety_cert_doc_base64: Optional[str] = None
+    coi_doc_base64: Optional[str] = None
 
 # Checklist Models
 class ChecklistItem(BaseModel):
@@ -5867,6 +5882,42 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
             type_key="profile",
         )
         vehicle_doc["image_object_key"] = image_key
+
+    # 2026-05-20 — optional supporting docs for each expiry. Image OR PDF.
+    # Lives in the `compliance` bucket under `vehicle-docs/<company_id>/...`
+    # so the per-tenant prefix validator passes (it accepts company_id at
+    # segment index 1 in the compliance bucket — see object_store.py).
+    for field_name, doc_key in [
+        ("rego_doc_base64", "rego_doc_object_key"),
+        ("insurance_doc_base64", "insurance_doc_object_key"),
+        ("safety_cert_doc_base64", "safety_cert_doc_object_key"),
+        ("coi_doc_base64", "coi_doc_object_key"),
+    ]:
+        b64 = getattr(vehicle, field_name, None)
+        if not b64:
+            continue
+        # Detect ext from base64 magic bytes — _upload_base64_or_400 stamps
+        # Content-Type from detected format, but the key extension is purely
+        # cosmetic. Default .bin if we can't infer; .jpg/.png/.pdf otherwise.
+        try:
+            raw = base64.b64decode(object_store._DATA_URL_PREFIX_RE.sub("", b64).strip(), validate=True)
+            detected = _detect_format(raw)
+            ext = {"jpeg": "jpg", "png": "png", "webp": "webp", "pdf": "pdf"}.get(detected, "bin")
+        except Exception:
+            ext = "bin"
+        doc_slug = doc_key.replace("_doc_object_key", "")  # rego / insurance / safety_cert / coi
+        target = f"vehicle-docs/{company_id}/{vehicle_id}/{doc_slug}.{ext}"
+        _upload_base64_or_400(
+            "compliance",
+            target,
+            b64,
+            ext,
+            field_name,
+            expected_company_id=company_id,
+            type_key="vehicle_doc",
+        )
+        vehicle_doc[doc_key] = target
+
     await db.vehicles.insert_one(vehicle_doc)
     
     # Invalidate vehicles cache
@@ -6089,7 +6140,12 @@ def _attach_vehicle_image_url(vehicle_doc: dict) -> dict:
     onto vehicles that carry an image_object_key so the frontend can
     render the photo without a separate fetch. The key never leaves the
     backend in its raw form for non-developers; the URL is the only
-    public-facing pointer."""
+    public-facing pointer.
+
+    2026-05-20 — also presigns the four vehicle-doc keys (rego /
+    insurance / safety_cert / coi) so the Edit Vehicle modal can show
+    a "Document attached — open" link straight away.
+    """
     if not isinstance(vehicle_doc, dict):
         return vehicle_doc
     object_key = vehicle_doc.get("image_object_key")
@@ -6097,13 +6153,115 @@ def _attach_vehicle_image_url(vehicle_doc: dict) -> dict:
         try:
             vehicle_doc["image_url"] = _presign_if_key("photos", object_key)
         except Exception:
-            # Never let a presign failure break the vehicle response.
             vehicle_doc["image_url"] = None
+    for ok_field, url_field in [
+        ("rego_doc_object_key",         "rego_doc_url"),
+        ("insurance_doc_object_key",    "insurance_doc_url"),
+        ("safety_cert_doc_object_key",  "safety_cert_doc_url"),
+        ("coi_doc_object_key",          "coi_doc_url"),
+    ]:
+        key = vehicle_doc.get(ok_field)
+        if key:
+            try:
+                vehicle_doc[url_field] = _presign_if_key("compliance", key)
+            except Exception:
+                vehicle_doc[url_field] = None
     return vehicle_doc
+
+
+# Declared BEFORE the dynamic /vehicles/{vehicle_id} route so FastAPI's
+# in-order matcher hits this for /vehicles/documents/download — otherwise
+# the dynamic route would try ObjectId("documents") and 500. Matches the
+# same pattern used for /incidents/export/pdf elsewhere in this file.
+@api_router.get("/vehicles/documents/download")
+async def export_vehicle_documents_zip(
+    vehicle_id: Optional[str] = None,
+    vehicle_ids: Optional[str] = None,   # CSV "id1,id2,..."
+    doc_types: Optional[str] = None,     # CSV subset of rego/insurance/safety_cert/coi (default: all)
+    current_user: dict = Depends(get_current_user),
+):
+    """Streams a ZIP of every vehicle's rego/insurance/safety-cert/COI docs.
+
+    Folder layout inside the ZIP: ``<vehicle name (rego)>/<doc_type>.<ext>``.
+    Skips vehicles with no attached docs entirely. Manifest at the root
+    lists what was included and what was skipped (missing files, read
+    errors, vehicles without docs).
+    """
+    if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    from starlette.responses import StreamingResponse
+
+    company_id = current_user["company_id"]
+    query: dict = {**_soft_delete_filter(), "company_id": company_id}
+    vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
+    if vid_list:
+        query["_id"] = {"$in": [ObjectId(v) for v in vid_list if ObjectId.is_valid(v)]}
+    elif vehicle_id and ObjectId.is_valid(vehicle_id):
+        query["_id"] = ObjectId(vehicle_id)
+
+    allowed_types = {"rego", "insurance", "safety_cert", "coi"}
+    requested_types = (
+        {t.strip() for t in doc_types.split(",") if t.strip()}
+        if doc_types else allowed_types
+    )
+    requested_types &= allowed_types
+    if not requested_types:
+        raise HTTPException(status_code=400, detail="No valid doc_types selected")
+
+    vehicles = await db.vehicles.find(
+        query,
+        {"name": 1, "registration_number": 1,
+         "rego_doc_object_key": 1, "insurance_doc_object_key": 1,
+         "safety_cert_doc_object_key": 1, "coi_doc_object_key": 1},
+    ).to_list(2000)
+
+    zip_buffer = BytesIO()
+    manifest_lines = [
+        "FleetShield365 Vehicle Document Export",
+        f"Generated: {utcnow().isoformat()}",
+        f"Vehicles in scope: {len(vehicles)}",
+        f"Doc types: {sorted(requested_types)}",
+        "",
+    ]
+    written = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for v in vehicles:
+            vname = v.get("registration_number") or v.get("name") or str(v["_id"])
+            folder_safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in vname)
+            for doc_type in sorted(requested_types):
+                key = v.get(f"{doc_type}_doc_object_key")
+                if not key:
+                    continue
+                try:
+                    raw = object_store.get_bytes("compliance", key)
+                except Exception as exc:
+                    logger.warning(f"Vehicle doc {key} unreadable: {exc}")
+                    manifest_lines.append(f"- SKIPPED {folder_safe}/{doc_type} (read error)")
+                    continue
+                ext = ".pdf" if raw[:4] == b"%PDF" else ".jpg"
+                fname = f"{folder_safe}/{doc_type}{ext}"
+                zf.writestr(fname, raw)
+                manifest_lines.append(f"- {fname}")
+                written += 1
+        zf.writestr("manifest.txt", "\n".join(manifest_lines))
+
+    if written == 0:
+        raise HTTPException(status_code=404, detail="No vehicle documents match the selected filters")
+
+    zip_buffer.seek(0)
+    out_name = f"vehicle_documents_{utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={out_name}"},
+    )
 
 
 @api_router.get("/vehicles/{vehicle_id}")
 async def get_vehicle(vehicle_id: str, current_user: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(vehicle_id):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
     vehicle = await db.vehicles.find_one({
         "_id": ObjectId(vehicle_id),
         "company_id": current_user["company_id"]
@@ -6300,6 +6458,40 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
             type_key="profile",
         )
         update_data["image_object_key"] = image_key
+
+    # 2026-05-20 — same vehicle-doc upload flow as create. Caller passes
+    # a base64 string per field they want to replace; missing fields are
+    # left untouched. Empty-string explicitly clears the doc reference.
+    for field_name, doc_key in [
+        ("rego_doc_base64", "rego_doc_object_key"),
+        ("insurance_doc_base64", "insurance_doc_object_key"),
+        ("safety_cert_doc_base64", "safety_cert_doc_object_key"),
+        ("coi_doc_base64", "coi_doc_object_key"),
+    ]:
+        if field_name not in update_data:
+            continue
+        b64 = update_data.pop(field_name)
+        if not b64:
+            update_data[doc_key] = None
+            continue
+        try:
+            raw = base64.b64decode(object_store._DATA_URL_PREFIX_RE.sub("", b64).strip(), validate=True)
+            detected = _detect_format(raw)
+            ext = {"jpeg": "jpg", "png": "png", "webp": "webp", "pdf": "pdf"}.get(detected, "bin")
+        except Exception:
+            ext = "bin"
+        doc_slug = doc_key.replace("_doc_object_key", "")
+        target = f"vehicle-docs/{company_id}/{vehicle_id}/{doc_slug}.{ext}"
+        _upload_base64_or_400(
+            "compliance",
+            target,
+            b64,
+            ext,
+            field_name,
+            expected_company_id=company_id,
+            type_key="vehicle_doc",
+        )
+        update_data[doc_key] = target
 
     # Cap notes + custom_fields the same way create does. Pydantic gives
     # us the list back as VehicleCustomField objects when present.
@@ -13979,7 +14171,7 @@ async def developer_storage_breakdown(
     # Real per-bucket bytes — same scan as /developer/orgs/{id}/storage.
     BUCKET_PREFIXES: dict = {
         "logos":                [f"{company_id}/"],
-        "compliance":           [f"driver-docs/{company_id}/"],
+        "compliance":           [f"driver-docs/{company_id}/", f"vehicle-docs/{company_id}/"],
         "inspection-photos":    [f"{company_id}/"],
         "fuel-receipts":        [f"{company_id}/"],
         "incident-photos":      [f"{company_id}/"],
@@ -14321,7 +14513,7 @@ async def developer_org_storage(
     # its own prefix(es) so the totals match what's actually on disk.
     BUCKET_PREFIXES: dict = {
         "logos":                [f"{company_id}/"],
-        "compliance":           [f"driver-docs/{company_id}/"],
+        "compliance":           [f"driver-docs/{company_id}/", f"vehicle-docs/{company_id}/"],
         "inspection-photos":    [f"{company_id}/"],
         "fuel-receipts":        [f"{company_id}/"],
         "incident-photos":      [f"{company_id}/"],
