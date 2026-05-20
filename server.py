@@ -14047,23 +14047,26 @@ async def developer_storage_breakdown(
         else:
             cat["bytes_actual"] = 0
 
-    total_objects = sum(c.get("count", 0) for c in categories)
+    category_object_count = sum(c.get("count", 0) for c in categories)
     total_bytes_actual = sum(c.get("bytes_actual", 0) for c in categories)
     total_bytes_real_buckets = sum(bucket_bytes.values())
+    total_objects_real_buckets = sum(bucket_objects.values())
 
     return {
         "company_id": company_id,
         "company_name": company.get("name"),
         "subdomain": company.get("subdomain"),
         "categories": categories,
-        "total_objects": total_objects,
-        # Real bytes from MinIO scan — matches /developer/orgs/{id}/storage.
+        # Match what the Organisations table shows — real MinIO scan,
+        # all objects under the tenant's prefix (includes thumbnails +
+        # orphans). The per-category counts only see Mongo-indexed files.
+        "total_objects": total_objects_real_buckets,
         "total_bytes": total_bytes_real_buckets,
-        # Sum-by-category, may differ slightly from total_bytes when
-        # the bucket holds objects that no category claims (orphans).
+        # Category sum (lower; ignores thumbnails + orphan objects).
+        "categorised_objects": category_object_count,
         "total_bytes_categorised": total_bytes_actual,
         # Legacy fields kept for backward-compat with older clients.
-        "total_objects_estimate": total_objects,
+        "total_objects_estimate": category_object_count,
         "total_bytes_estimate": sum(c.get("bytes_estimate", 0) for c in categories),
         "bucket_totals": bucket_bytes,
         "bucket_objects": bucket_objects,
