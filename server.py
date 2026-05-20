@@ -14644,11 +14644,22 @@ async def developer_email_org_owner(
 @api_router.get("/landing/media")
 async def public_landing_media():
     """Public endpoint — landing page hits this to render the
-    'See it in the field' photo strip. Owner panel writes via PUT."""
+    'See it in the field' photo strip. Owner panel writes via the
+    /developer/landing-media/upload endpoint.
+
+    For items that carry an ``object_key`` (owner-uploaded), we always
+    regenerate the public URL from the current OBJECT_STORE_PUBLIC_ENDPOINT
+    so the URL stays correct across env changes.
+    """
     doc = await db.platform_config.find_one({"_id": "landing_media"})
     if doc and isinstance(doc.get("items"), list) and doc["items"]:
-        return {"items": doc["items"]}
-    # Defaults: hand-picked Unsplash sources, royalty-free.
+        items = doc["items"]
+        base = OBJECT_STORE_PUBLIC_ENDPOINT.rstrip("/")
+        for it in items:
+            ok = it.get("object_key")
+            if ok:
+                it["url"] = f"{base}/logos/{ok}"
+        return {"items": items}
     return {"items": _DEFAULT_LANDING_MEDIA}
 
 
@@ -14719,10 +14730,11 @@ async def developer_upload_landing_media(
         logger.error(f"Landing media upload failed for key={key}: {exc}")
         raise HTTPException(status_code=500, detail="Failed to upload image")
 
-    # Compose the public URL. logos bucket policy on this stack allows
-    # anonymous GET so we can hand back a stable, cache-friendly URL
-    # rather than a short-lived presigned link.
-    public_url = _presign_if_key("logos", object_key) or ""
+    # Compose the public URL. logos bucket has an anonymous-GET policy on
+    # this stack so we serve a stable, cache-friendly URL rather than a
+    # 1-hour presigned link. The marketing page caches per-pageview so a
+    # long-lived URL keeps Cloudflare's edge cache happy.
+    public_url = f"{OBJECT_STORE_PUBLIC_ENDPOINT.rstrip('/')}/logos/{object_key}"
 
     # Load existing items (or defaults), upsert the entry for this key.
     doc = await db.platform_config.find_one({"_id": "landing_media"})
