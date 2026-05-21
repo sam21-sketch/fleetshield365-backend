@@ -3935,20 +3935,28 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
         elements.append(Spacer(1, 10))
         
         rendered_any = False
-        # Add photos one by one (simpler approach)
-        for i, photo in enumerate(inspection['photos'][:6]):  # Limit to 6 photos
+        # Add photos one by one. Cap matches MAX_PHOTOS_PER_INSPECTION
+        # (was 6, which silently truncated end-shift damage + cabin/
+        # odometer extras and made the PDF look incomplete).
+        for i, photo in enumerate(inspection['photos'][:MAX_PHOTOS_PER_INSPECTION]):
             try:
                 photo_bytes: Optional[bytes] = None
                 photo_key = photo.get('object_key')
+                # Phase 2 — photos can live in either bucket; respect the
+                # source_bucket hint stamped by fetch_inspection_photos.
+                # Hardcoding "inspection-photos" used to silently fail for
+                # every multipart-uploaded photo and the PDF came out
+                # without images.
+                photo_bucket = photo.get('source_bucket') or 'inspection-photos'
                 if photo_key:
                     try:
                         photo_bytes = object_store.get_bytes(
-                            "inspection-photos", photo_key
+                            photo_bucket, photo_key
                         )
                     except Exception as exc:
                         logger.warning(
-                            "Failed to fetch inspection photo %s: %s",
-                            photo_key, exc,
+                            "Failed to fetch inspection photo %s from %s: %s",
+                            photo_key, photo_bucket, exc,
                         )
                         photo_bytes = None
                 if photo_bytes is None:
@@ -8219,6 +8227,12 @@ async def fetch_inspection_photos(inspection_id: str) -> List[dict]:
         {
             "photo_type": p.get("photo_type"),
             "object_key": p.get("object_key"),
+            # Phase 2 — photos uploaded via multipart live in the "photos"
+            # bucket; legacy base64 uploads live in "inspection-photos".
+            # The PDF generator needs this hint to fetch bytes from the
+            # right bucket — without it, multipart photos 404 and never
+            # render in the PDF.
+            "source_bucket": p.get("source_bucket") or "inspection-photos",
             "object_url": _presign_if_key(
                 p.get("source_bucket") or "inspection-photos",
                 p.get("object_key"),
