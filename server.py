@@ -7613,6 +7613,35 @@ async def get_photo(photo_id: str, current_user: dict = Depends(get_current_user
 
 # ============== Inspection Routes ==============
 
+async def _vehicle_for_inspection(vehicle_id: str, current_user: dict) -> dict:
+    """Tenant-scoped vehicle fetch with assignment enforcement.
+
+    Owner request 2026-05-21: drivers must not be able to start an
+    inspection on a vehicle they are not assigned to. The /vehicles list
+    endpoint already filters by assigned_driver_ids for drivers, but the
+    POST endpoints used to do a bare find_one with no company_id — a
+    driver who knew (or guessed) a vehicle id could submit an inspection
+    against any vehicle (including cross-tenant). This helper closes
+    both holes.
+    """
+    company_id = current_user["company_id"]
+    try:
+        oid = ObjectId(vehicle_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    vehicle = await db.vehicles.find_one({"_id": oid, "company_id": company_id})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if current_user.get("role") == UserRole.DRIVER:
+        assigned = vehicle.get("assigned_driver_ids") or []
+        if str(current_user["_id"]) not in assigned:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this vehicle. Ask your admin to assign you before inspecting.",
+            )
+    return vehicle
+
+
 @api_router.post("/inspections/prestart")
 async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(get_current_user)):
     # 2026-05-19 — idempotency. Queue retries from the mobile app resend
@@ -7624,10 +7653,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     if existing:
         return serialize_doc(existing)
 
-    # Get vehicle
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
+    vehicle = await _vehicle_for_inspection(inspection.vehicle_id, current_user)
     
     # Check mandatory photos
     required_photos = {'front', 'rear', 'left', 'right', 'cabin', 'odometer'}
@@ -7721,7 +7747,9 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
+        "vehicle_name": vehicle.get("name"),
         "driver_id": str(current_user["_id"]),
+        "driver_name": current_user.get("name") or current_user.get("username") or "Operator",
         "company_id": company_id,
         "type": InspectionType.PRESTART,
         "odometer": inspection.odometer,
@@ -7847,10 +7875,8 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     if existing:
         return serialize_doc(existing)
 
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection.vehicle_id)})
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    
+    vehicle = await _vehicle_for_inspection(inspection.vehicle_id, current_user)
+
     # Validate damage/incident photos
     if inspection.new_damage and not any(p.photo_type == 'damage' for p in (inspection.photos or [])):
         raise HTTPException(status_code=400, detail="Damage photo required when new damage reported")
@@ -7933,7 +7959,9 @@ async def create_end_shift(inspection: EndShiftCreate, request: Request, current
     inspection_doc = {
         "_id": inspection_id,
         "vehicle_id": inspection.vehicle_id,
+        "vehicle_name": vehicle.get("name"),
         "driver_id": str(current_user["_id"]),
+        "driver_name": current_user.get("name") or current_user.get("username") or "Operator",
         "company_id": company_id,
         "type": InspectionType.END_SHIFT,
         "odometer": inspection.odometer,
@@ -11671,6 +11699,29 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     )
     status_overrides = {doc["defect_id"]: doc async for doc in status_overrides_cursor}
 
+    # Legacy inspections don't carry driver_name (only driver_id). Batch
+    # resolve the missing names from the users collection so the defect
+    # rows show real names instead of "Unknown driver".
+    missing_driver_ids = {
+        insp["driver_id"] for insp in inspections
+        if not insp.get("driver_name") and insp.get("driver_id")
+    }
+    driver_name_by_id: dict = {}
+    if missing_driver_ids:
+        obj_ids = []
+        for did in missing_driver_ids:
+            try:
+                obj_ids.append(ObjectId(did))
+            except Exception:
+                pass
+        if obj_ids:
+            users = await db.users.find(
+                {"_id": {"$in": obj_ids}, "company_id": company_id},
+                {"name": 1, "username": 1},
+            ).to_list(None)
+            for u in users:
+                driver_name_by_id[str(u["_id"])] = u.get("name") or u.get("username") or ""
+
     # Build defect records
     defects = []
     name_counter: dict = {}  # to detect recurring issues
@@ -11678,7 +11729,11 @@ async def get_vehicle_defects(vehicle_id: str, current_user: dict = Depends(get_
     for insp in inspections:
         inspection_id = str(insp.get("_id"))
         timestamp = insp.get("timestamp")
-        driver_name = insp.get("driver_name") or "Unknown driver"
+        driver_name = (
+            insp.get("driver_name")
+            or driver_name_by_id.get(insp.get("driver_id", ""))
+            or "Unknown driver"
+        )
 
         # Pre-start checklist failures
         for idx, item in enumerate(insp.get("checklist_items") or []):
