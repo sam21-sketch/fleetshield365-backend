@@ -11418,8 +11418,10 @@ def _vehicle_health_score_with_reasons(
     """Calculate vehicle health score (0-100) plus a human-readable list
     of deductions so the UI can explain "why isn't this 100?".
 
-    Each deduction is ``{label: str, points: int}`` — negative ``points``
-    (e.g. -10) so the UI can render "−10 never inspected" directly.
+    ``expiry_days`` accepts either ``[int, ...]`` (legacy) or
+    ``[(label, days), ...]`` tuples — when a label is provided the
+    reason text names the specific document (e.g. "Rego expires in
+    3d") instead of the generic "Expiry within 14 days".
 
     Returned in priority order so the UI can show the top 1-2 offenders.
     """
@@ -11431,21 +11433,34 @@ def _vehicle_health_score_with_reasons(
         pts = severity_weights.get(sev, 5)
         score -= pts
         reasons.append({"label": f"Open {sev} defect: {d.get('name', 'unnamed')}", "points": -pts})
-    for days in expiry_days:
+    for entry in expiry_days:
+        if entry is None:
+            continue
+        if isinstance(entry, tuple):
+            label, days = entry
+        else:
+            label, days = None, entry
         if days is None:
             continue
         if days < 0:
             score -= 15
-            reasons.append({"label": "Already expired (rego/license/cert)", "points": -15})
+            reasons.append({
+                "label": f"{label} expired {abs(days)}d ago" if label else "Already expired (rego/license/cert)",
+                "points": -15,
+            })
         elif days <= 14:
             score -= 10
-            reasons.append({"label": f"Expiry within 14 days ({days}d)", "points": -10})
-    if last_inspection_days > 7:
+            label_text = (
+                f"{label} expires {'today' if days == 0 else f'in {days}d'}"
+                if label else f"Expiry within 14 days ({days}d)"
+            )
+            reasons.append({"label": label_text, "points": -10})
+    if last_inspection_days >= 999:
         score -= 10
-        reasons.append({
-            "label": "Never inspected" if last_inspection_days >= 9999 else f"Last inspected {last_inspection_days}d ago",
-            "points": -10,
-        })
+        reasons.append({"label": "Never inspected", "points": -10})
+    elif last_inspection_days > 7:
+        score -= 10
+        reasons.append({"label": f"Last inspected {last_inspection_days}d ago", "points": -10})
     elif last_inspection_days > 3:
         score -= 5
         reasons.append({"label": f"Last inspected {last_inspection_days}d ago", "points": -5})
@@ -11621,8 +11636,10 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     for v in vehicles:
         vid = str(v.get("_id"))
         defects = [d for d in defects_by_vehicle.get(vid, []) if d.get("status") != "fixed"]
-        # Days-until-expiry for each tracked date
-        expiry_days_list = []
+        # Days-until-expiry for each tracked date. Tuple form
+        # (label, days) so the scoring helper can name the specific
+        # document in the reasons list ("Rego expires in 3d").
+        expiry_days_list: list = []
         expiring_docs = []
         for field, label in DOC_LABELS.items():
             val = v.get(field)
@@ -11630,7 +11647,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 try:
                     exp_dt = datetime.fromisoformat(val[:10])
                     days = (exp_dt - today_dt).days
-                    expiry_days_list.append(days)
+                    expiry_days_list.append((label, days))
                     if days <= 30:
                         expiring_docs.append({"name": label, "days_until_expiry": days})
                 except Exception:
@@ -11656,7 +11673,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 nsd_dt = datetime.fromisoformat(nsd_str[:10])
                 d_days = (nsd_dt - today_dt).days
                 if d_days <= 30:
-                    expiry_days_list.append(d_days)
+                    expiry_days_list.append(("Next service", d_days))
                     expiring_docs.append({"name": "Next service due", "days_until_expiry": d_days})
             except Exception:
                 pass
@@ -11666,7 +11683,10 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
             # Within 500km or already over: surface as an alert. Treat as
             # ~equivalent to a 7-day expiry so the score deduction lines up.
             if remaining_km <= 500:
-                expiry_days_list.append(0 if remaining_km <= 0 else 7)
+                expiry_days_list.append((
+                    f"Service @ {int(nso_val)}km",
+                    0 if remaining_km <= 0 else 7,
+                ))
                 expiring_docs.append({
                     "name": f"Next service @ {int(nso_val)}km" + (
                         f" (overdue by {abs(int(remaining_km))}km)" if remaining_km <= 0
@@ -11680,7 +11700,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 wu_dt = datetime.fromisoformat(wu_str[:10])
                 w_days = (wu_dt - today_dt).days
                 if w_days <= 30:
-                    expiry_days_list.append(w_days)
+                    expiry_days_list.append(("Warranty", w_days))
                     expiring_docs.append({"name": "Warranty", "days_until_expiry": w_days})
             except Exception:
                 pass
