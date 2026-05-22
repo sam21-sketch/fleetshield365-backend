@@ -11470,9 +11470,45 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     vehicles_cursor = db.vehicles.find(
         {"company_id": company_id},
         {"name": 1, "registration_number": 1, "rego_expiry": 1, "insurance_expiry": 1,
-         "safety_certificate_expiry": 1, "coi_expiry": 1, "status": 1}
+         "safety_certificate_expiry": 1, "coi_expiry": 1, "status": 1,
+         "current_odometer": 1}
     )
     vehicles = await vehicles_cursor.to_list(1000)
+
+    # 1b. Pull each vehicle's most relevant service-record signals — the
+    # next-service reminder (date OR odometer) plus the latest warranty
+    # window. Both feed the fleet-health score and the per-vehicle alert
+    # strip (owner request 2026-05-22).
+    service_cursor = db.service_records.find(
+        {"company_id": company_id, **_soft_delete_filter()},
+        {"vehicle_id": 1, "next_service_date": 1, "next_service_odometer": 1,
+         "warranty_until": 1, "service_date": 1}
+    )
+    service_rows = await service_cursor.to_list(5000)
+    # For each vehicle, keep the SOONEST next_service trigger + latest warranty.
+    soonest_service_by_v: dict = {}
+    latest_warranty_by_v: dict = {}
+    for r in service_rows:
+        vid = r.get("vehicle_id")
+        if not vid:
+            continue
+        # Next-service: track the earliest upcoming date AND odometer.
+        nsd = r.get("next_service_date")
+        nso = r.get("next_service_odometer")
+        if nsd or nso:
+            existing = soonest_service_by_v.get(vid) or {}
+            # Pick the row with the earliest next-service date.
+            if nsd and (not existing.get("next_service_date") or nsd < existing["next_service_date"]):
+                existing["next_service_date"] = nsd
+            if nso and (not existing.get("next_service_odometer") or nso < existing["next_service_odometer"]):
+                existing["next_service_odometer"] = nso
+            soonest_service_by_v[vid] = existing
+        # Warranty: pick the latest (longest-extending) warranty per vehicle.
+        wu = r.get("warranty_until")
+        if wu:
+            existing_w = latest_warranty_by_v.get(vid)
+            if not existing_w or wu > existing_w:
+                latest_warranty_by_v[vid] = wu
     
     # 2. Get all open defects (last 30 days, not yet marked fixed) for company.
     # Timestamp filter removed from DB query because timestamps are stored as a mix of strings
@@ -11609,6 +11645,45 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 last_inspection_days = 999
         else:
             last_inspection_days = 999
+        # Service + warranty alerts (owner request 2026-05-22).
+        # Next service can trigger on date OR on odometer. Surface as
+        # entries in expiring_docs so the UI's existing list renders them.
+        svc = soonest_service_by_v.get(vid) or {}
+        nsd_str = svc.get("next_service_date")
+        nso_val = svc.get("next_service_odometer")
+        if nsd_str:
+            try:
+                nsd_dt = datetime.fromisoformat(nsd_str[:10])
+                d_days = (nsd_dt - today_dt).days
+                if d_days <= 30:
+                    expiry_days_list.append(d_days)
+                    expiring_docs.append({"name": "Next service due", "days_until_expiry": d_days})
+            except Exception:
+                pass
+        cur_odo = v.get("current_odometer")
+        if nso_val and isinstance(cur_odo, (int, float)):
+            remaining_km = nso_val - cur_odo
+            # Within 500km or already over: surface as an alert. Treat as
+            # ~equivalent to a 7-day expiry so the score deduction lines up.
+            if remaining_km <= 500:
+                expiry_days_list.append(0 if remaining_km <= 0 else 7)
+                expiring_docs.append({
+                    "name": f"Next service @ {int(nso_val)}km" + (
+                        f" (overdue by {abs(int(remaining_km))}km)" if remaining_km <= 0
+                        else f" (in {int(remaining_km)}km)"
+                    ),
+                    "days_until_expiry": 0 if remaining_km <= 0 else 7,
+                })
+        wu_str = latest_warranty_by_v.get(vid)
+        if wu_str:
+            try:
+                wu_dt = datetime.fromisoformat(wu_str[:10])
+                w_days = (wu_dt - today_dt).days
+                if w_days <= 30:
+                    expiry_days_list.append(w_days)
+                    expiring_docs.append({"name": "Warranty", "days_until_expiry": w_days})
+            except Exception:
+                pass
         # Has grounding defect?
         has_grounding = any(d.get("severity") == "high" for d in defects)
         score, score_reasons = _vehicle_health_score_with_reasons(
@@ -14744,13 +14819,31 @@ async def developer_server_disk(
 
     root = _safe("/")
     mongo = _safe("/var/lib/fleetshield365/mongo")
-    minio = _safe("/var/lib/fleetshield365/MinIO")
+    minio = _safe("/var/lib/fleetshield365/minio")
+
+    # 2026-05-22 — owner reported the Storage page showed 7.4 MB for
+    # Mongo while real disk usage was 433 MB. Root cause: the
+    # fleetshield service user can't read mongo's diagnostic.data /
+    # journal subdirs so os.walk silently skipped them. Use Mongo's
+    # own dbStats command to get the authoritative storage size
+    # instead of walking the filesystem. The MinIO path also had a
+    # capitalisation bug ("MinIO" vs the actual "minio") which is
+    # fixed above.
+    mongo_size_bytes: Optional[int] = None
+    try:
+        stats = await db.command("dbStats")
+        # storageSize = on-disk allocated space (including indexes +
+        # padding) — matches what `du -s` would report.
+        mongo_size_bytes = int(stats.get("storageSize") or 0) + int(stats.get("indexSize") or 0)
+    except Exception:
+        mongo_size_bytes = _dir_size("/var/lib/fleetshield365/mongo")
+
     return {
         "root": root,
         "mongo": mongo,
         "minio": minio,
-        "mongo_size_bytes": _dir_size("/var/lib/fleetshield365/mongo"),
-        "minio_size_bytes": _dir_size("/var/lib/fleetshield365/MinIO"),
+        "mongo_size_bytes": mongo_size_bytes,
+        "minio_size_bytes": _dir_size("/var/lib/fleetshield365/minio"),
         "generated_at": utcnow().isoformat(),
     }
 
