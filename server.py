@@ -6836,7 +6836,12 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
         "password_hash": credential_hash,
         "auth_mode": "pin" if pin else "password",
         "name": user.name,
-        "phone": user.phone,
+        # Normalise empty-string phone to None so the sparse unique
+        # index treats "no phone" as missing (not a real value). Owner
+        # reported 2026-05-25: second driver-create with phone='' was
+        # firing the unique-constraint and surfaced the misleading
+        # "phone already used" error.
+        "phone": (user.phone or "").strip() or None,
         "role": UserRole.DRIVER,
         "company_id": company_id,
         "assigned_vehicles": [],
