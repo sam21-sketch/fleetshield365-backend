@@ -7,7 +7,7 @@ from pymongo.errors import DuplicateKeyError
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
 import uuid
@@ -3490,6 +3490,23 @@ class IncidentSeverity:
     MODERATE = "moderate"
     SEVERE = "severe"
 
+def _validate_au_phone(v: Optional[str]) -> Optional[str]:
+    """Owner request 2026-05-23: phone numbers on the incident form
+    must be exactly 10 digits (Australian convention, e.g. 0412345678).
+    Accept blank/None as a no-op so the field stays optional, but
+    reject any partial-typed value. Strips spaces / dashes / brackets
+    so '04 1234 5678' or '(04) 1234-5678' are accepted as 10 digits.
+    """
+    if v is None:
+        return None
+    cleaned = ''.join(ch for ch in v if ch.isdigit())
+    if cleaned == '':
+        return None
+    if len(cleaned) != 10:
+        raise ValueError('Phone number must be exactly 10 digits.')
+    return cleaned
+
+
 class OtherPartyDetails(BaseModel):
     name: str
     phone: Optional[str] = None
@@ -3498,10 +3515,21 @@ class OtherPartyDetails(BaseModel):
     insurance_company: Optional[str] = None
     insurance_policy: Optional[str] = None
 
+    @field_validator('phone')
+    @classmethod
+    def _phone_must_be_10_digits(cls, v):
+        return _validate_au_phone(v)
+
+
 class WitnessDetails(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     statement: Optional[str] = None
+
+    @field_validator('phone')
+    @classmethod
+    def _phone_must_be_10_digits(cls, v):
+        return _validate_au_phone(v)
 
 class IncidentCreate(BaseModel):
     vehicle_id: str
