@@ -1331,6 +1331,173 @@ async def weekly_summary_scheduler():
             logger.error(f"Weekly summary scheduler error: {e}")
             await asyncio.sleep(3600)  # Retry in 1 hour on error
 
+
+async def _next_run_at(hour: int, minute: int = 0) -> float:
+    """Seconds until the next Sydney-local hour:minute. If we're past today's
+    slot, schedule for tomorrow."""
+    now = datetime.now(SYDNEY_TZ)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def generate_daily_summary():
+    """Per-company daily summary email at 8 PM Sydney time.
+
+    Sends only to admins whose notification_preferences.daily_summary is True
+    (default OFF — opt-in). Gathers today's prestart/end-shift counts,
+    issues raised, fuel logs."""
+    try:
+        now = datetime.now(SYDNEY_TZ)
+        day_start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = day_start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        day_end_utc = now.astimezone(timezone.utc).replace(tzinfo=None)
+
+        companies = await db.companies.find({"deleted_at": None}).to_list(1000)
+
+        for company in companies:
+            company_id = str(company["_id"])
+            company_name = company.get("name", "Your Company")
+
+            completed = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": day_start_utc, "$lte": day_end_utc},
+            })
+            issues = await db.inspections.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": day_start_utc, "$lte": day_end_utc},
+                "is_safe": False,
+            })
+            fuel_subs = await db.fuel_submissions.count_documents({
+                "company_id": company_id,
+                "timestamp": {"$gte": day_start_utc, "$lte": day_end_utc},
+            })
+            fuel_cursor = db.fuel_submissions.find({
+                "company_id": company_id,
+                "timestamp": {"$gte": day_start_utc, "$lte": day_end_utc},
+            }, {"litres": 1, "_id": 0})
+            total_fuel = 0.0
+            async for doc in fuel_cursor:
+                try:
+                    total_fuel += float(doc.get("litres") or 0)
+                except (TypeError, ValueError):
+                    pass
+
+            active_vehicles = await db.vehicles.count_documents({
+                "company_id": company_id,
+                "deleted_at": None,
+                "is_active": True,
+            })
+            missed = max(0, active_vehicles - completed)
+
+            summary = {
+                "completed": completed,
+                "missed": missed,
+                "issues": issues,
+                "fuel_submissions": fuel_subs,
+                "total_fuel": total_fuel,
+            }
+
+            admins = await db.users.find({
+                "company_id": company_id,
+                "role": {"$in": ["super_admin", "admin"]},
+            }).to_list(100)
+            for admin in admins:
+                if not admin.get("email"):
+                    continue
+                prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
+                if not prefs.get("email_enabled", True):
+                    continue
+                if not prefs.get("daily_summary", False):
+                    continue
+                await send_daily_summary_email(admin["email"], company_name, summary)
+
+        logger.info("Daily summary run complete")
+    except Exception as e:
+        logger.error(f"Daily summary generation failed: {e}")
+
+
+async def daily_summary_scheduler():
+    """Runs generate_daily_summary every day at 8 PM Sydney time."""
+    while True:
+        try:
+            wait_seconds = await _next_run_at(hour=20, minute=0)
+            logger.info(f"Daily summary scheduled in {wait_seconds/3600:.1f} hours")
+            await asyncio.sleep(wait_seconds)
+            await generate_daily_summary()
+        except Exception as e:
+            logger.error(f"Daily summary scheduler error: {e}")
+            await asyncio.sleep(3600)
+
+
+async def generate_missed_inspection_check():
+    """Per-company nightly check at 11:30 PM Sydney — emails admins whose
+    notification_preferences.missed_inspection_alerts is True about any
+    active vehicle that didn't get a prestart today."""
+    try:
+        now = datetime.now(SYDNEY_TZ)
+        day_start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = day_start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        day_end_utc = now.astimezone(timezone.utc).replace(tzinfo=None)
+
+        companies = await db.companies.find({"deleted_at": None}).to_list(1000)
+
+        for company in companies:
+            company_id = str(company["_id"])
+            company_name = company.get("name", "Your Company")
+
+            active_vehicles = await db.vehicles.find({
+                "company_id": company_id,
+                "deleted_at": None,
+                "is_active": True,
+            }).to_list(2000)
+            if not active_vehicles:
+                continue
+
+            # Vehicle IDs that DID get a prestart inspection today
+            inspected_ids = await db.inspections.distinct("vehicle_id", {
+                "company_id": company_id,
+                "type": "prestart",
+                "timestamp": {"$gte": day_start_utc, "$lte": day_end_utc},
+            })
+            inspected_set = {str(vid) for vid in inspected_ids}
+
+            missed = [v for v in active_vehicles if str(v.get("_id")) not in inspected_set]
+            if not missed:
+                continue
+
+            admins = await db.users.find({
+                "company_id": company_id,
+                "role": {"$in": ["super_admin", "admin"]},
+            }).to_list(100)
+            for admin in admins:
+                if not admin.get("email"):
+                    continue
+                prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
+                if not prefs.get("email_enabled", True):
+                    continue
+                if not prefs.get("missed_inspection_alerts", True):
+                    continue
+                await send_missed_inspection_email(admin["email"], company_name, missed)
+
+        logger.info("Missed inspection check complete")
+    except Exception as e:
+        logger.error(f"Missed inspection check failed: {e}")
+
+
+async def missed_inspection_scheduler():
+    """Runs generate_missed_inspection_check every day at 11:30 PM Sydney."""
+    while True:
+        try:
+            wait_seconds = await _next_run_at(hour=23, minute=30)
+            logger.info(f"Missed inspection check scheduled in {wait_seconds/3600:.1f} hours")
+            await asyncio.sleep(wait_seconds)
+            await generate_missed_inspection_check()
+        except Exception as e:
+            logger.error(f"Missed inspection scheduler error: {e}")
+            await asyncio.sleep(3600)
+
 # ============== Push Notification Service ==============
 
 async def send_push_notification(push_tokens: List[str], title: str, body: str, data: dict = None):
@@ -4187,10 +4354,10 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                         "type": "expiry_critical",
                         "message": {"$regex": f"{label}.*EXPIRED"}
                     })
-                    
+
                     if not existing_alert:
                         message = f"{label} for {vehicle_name} has EXPIRED (was due {display_date})"
-                        await create_alert(company_id, "expiry_critical", message, vehicle_id)
+                        await create_alert(company_id, "expiry_critical", message, vehicle_id, reminder_window="expired")
 
                 # Check each reminder interval
                 else:
@@ -4219,22 +4386,24 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
 
                             if not existing_alert:
                                 message = f"[{urgency}] {label} for {vehicle_name} expires in {days_until_expiry} days ({display_date})"
-                                await create_alert(company_id, alert_type, message, vehicle_id)
-                            
+                                await create_alert(company_id, alert_type, message, vehicle_id, reminder_window=str(reminder_day))
+
                             break  # Only create alert for the most urgent matching interval
                             
             except Exception:
                 pass  # Invalid date format, skip
 
-async def create_alert(company_id: str, alert_type: str, message: str, vehicle_id: str = None, driver_id: str = None):
+async def create_alert(company_id: str, alert_type: str, message: str, vehicle_id: str = None, driver_id: str = None, reminder_window: str = None):
     """Create alert and send notification.
 
     Each admin's `notification_preferences` is consulted before adding
-    them to the email recipient list. Without this filter, toggling
-    "Expiry Alerts" or "Issue Alerts" off in Settings had no effect.
-    Mapping (alert_type → pref key):
-      - expiry_warning / expiry_critical / driver_expiry_*  → expiry_alerts
-      - repeated_issues / unsafe_vehicle / vehicle_offline  → issue_alerts
+    them to the email recipient list. Mapping:
+      - alert_type contains "expiry" → master = `expiry_alerts`, per-window
+        = `expiry_alert_{reminder_window}d` for 60/30/14/7, or
+        `expiry_alert_expired` for already-expired vehicles. Drivers'
+        document expiry uses the same per-window keys.
+      - repeated_issues / vehicle_offline → `issue_alerts`.
+      - unsafe_vehicle → no email here (handled by notify_admins_with_photos).
     Missing pref docs default to all-on so older tenants keep emails.
     """
     alert = {
@@ -4253,7 +4422,11 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
     if alert_type == "unsafe_vehicle":
         return alert
 
-    pref_key = "expiry_alerts" if "expiry" in alert_type else "issue_alerts"
+    is_expiry = "expiry" in alert_type
+    master_key = "expiry_alerts" if is_expiry else "issue_alerts"
+    window_key = None
+    if is_expiry and reminder_window:
+        window_key = "expiry_alert_expired" if reminder_window == "expired" else f"expiry_alert_{reminder_window}d"
 
     admins = await db.users.find({
         "company_id": company_id,
@@ -4267,7 +4440,9 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
         prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
         if not prefs.get("email_enabled", True):
             continue
-        if not prefs.get(pref_key, True):
+        if not prefs.get(master_key, True):
+            continue
+        if window_key and not prefs.get(window_key, True):
             continue
         admin_emails.append(admin["email"])
 
@@ -9060,7 +9235,7 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
                     })
                     if not existing:
                         message = f"{label} for {display_name} has EXPIRED (was due {display_date})"
-                        await create_alert(company_id, "driver_expiry_critical", message, driver_id=driver_id)
+                        await create_alert(company_id, "driver_expiry_critical", message, driver_id=driver_id, reminder_window="expired")
                         await send_driver_expiry_email(company_id, display_name, label, days_until, display_date, expired=True)
 
                 # Check each reminder interval
@@ -9090,9 +9265,9 @@ async def check_driver_expiry_alerts(driver_id: str, company_id: str):
 
                             if not existing:
                                 message = f"[{urgency}] {label} for {display_name} expires in {days_until} days ({display_date})"
-                                await create_alert(company_id, alert_type, message, driver_id=driver_id)
+                                await create_alert(company_id, alert_type, message, driver_id=driver_id, reminder_window=str(reminder_day))
                                 await send_driver_expiry_email(company_id, display_name, label, days_until, display_date)
-                            
+
                             break  # Only create alert for the most urgent matching interval
                             
             except Exception:
@@ -13401,13 +13576,19 @@ class PushTokenCreate(BaseModel):
 class NotificationPreferencesUpdate(BaseModel):
     expiry_alerts: Optional[bool] = None
     # Per-window expiry lead times. When `expiry_alerts` is on, these gate
-    # which days-until-expiry buckets actually emit emails. Missing → treat
-    # as "on" so older notification_preferences docs keep emailing.
+    # which days-until-expiry buckets actually emit emails. Keys align with
+    # backend REMINDER_DAYS = [60, 30, 14, 7]. Missing → treat as "on" so
+    # older notification_preferences docs keep emailing.
+    expiry_alert_60d: Optional[bool] = None
+    expiry_alert_30d: Optional[bool] = None
+    expiry_alert_14d: Optional[bool] = None
+    expiry_alert_7d: Optional[bool] = None
+    expiry_alert_expired: Optional[bool] = None
+    # Legacy keys (70/45/21) kept for backward compat with docs already
+    # written before the UI/backend alignment on 2026-05-25. No UI surface.
     expiry_alert_70d: Optional[bool] = None
     expiry_alert_45d: Optional[bool] = None
     expiry_alert_21d: Optional[bool] = None
-    expiry_alert_7d: Optional[bool] = None
-    expiry_alert_expired: Optional[bool] = None
     issue_alerts: Optional[bool] = None
     missed_inspection_alerts: Optional[bool] = None
     daily_summary: Optional[bool] = None
@@ -13469,9 +13650,15 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
     if not prefs:
         # Return defaults. weekly_summary defaults True to preserve the
         # pre-toggle behaviour (every admin used to receive the Monday
-        # digest unconditionally).
+        # digest unconditionally). Per-window expiry chips default True
+        # so a fresh tenant gets the full reminder cadence.
         return {
             "expiry_alerts": True,
+            "expiry_alert_60d": True,
+            "expiry_alert_30d": True,
+            "expiry_alert_14d": True,
+            "expiry_alert_7d": True,
+            "expiry_alert_expired": True,
             "issue_alerts": True,
             "missed_inspection_alerts": True,
             "daily_summary": False,
@@ -13486,6 +13673,11 @@ async def get_notification_preferences(current_user: dict = Depends(get_current_
 
     return {
         "expiry_alerts": prefs.get("expiry_alerts", True),
+        "expiry_alert_60d": prefs.get("expiry_alert_60d", True),
+        "expiry_alert_30d": prefs.get("expiry_alert_30d", True),
+        "expiry_alert_14d": prefs.get("expiry_alert_14d", True),
+        "expiry_alert_7d": prefs.get("expiry_alert_7d", True),
+        "expiry_alert_expired": prefs.get("expiry_alert_expired", True),
         "issue_alerts": prefs.get("issue_alerts", True),
         "missed_inspection_alerts": prefs.get("missed_inspection_alerts", True),
         "daily_summary": prefs.get("daily_summary", False),
@@ -16464,6 +16656,14 @@ async def startup_event_indexes():
     # Start weekly summary scheduler
     asyncio.create_task(weekly_summary_scheduler())
     logger.info("Weekly summary scheduler started")
+
+    # Daily summary (8 PM Sydney, opt-in per admin)
+    asyncio.create_task(daily_summary_scheduler())
+    logger.info("Daily summary scheduler started")
+
+    # Missed inspection check (11:30 PM Sydney, default-on per admin)
+    asyncio.create_task(missed_inspection_scheduler())
+    logger.info("Missed inspection scheduler started")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
