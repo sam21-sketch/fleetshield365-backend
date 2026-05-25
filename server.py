@@ -12916,13 +12916,13 @@ async def register_request(data: RegisterRequestPayload, request: Request):
     subject = f"Your FleetShield365 verification code: {otp}"
     html = _email_template_branded(
         heading="Verify your email",
-        body=f"<p>Hi {(_safe_html(data.name) or 'there')},</p>"
-             f"<p>Your FleetShield365 verification code is:</p>"
-             f"<p style=\"font-size: 32px; font-weight: 700; letter-spacing: 6px; "
-             f"text-align: center; color: #0891B2; margin: 24px 0;\">{otp}</p>"
-             f"<p>This code expires in 15 minutes. If you didn't request it, ignore this email.</p>",
-        button_label=None,
-        button_url=None,
+        body_html=(
+            f"<p>Hi {(_safe_html(data.name) or 'there')},</p>"
+            f"<p>Your FleetShield365 verification code is:</p>"
+            f"<p style=\"font-size: 32px; font-weight: 700; letter-spacing: 6px; "
+            f"text-align: center; color: #0891B2; margin: 24px 0;\">{otp}</p>"
+            f"<p>This code expires in 15 minutes. If you didn't request it, ignore this email.</p>"
+        ),
     )
     try:
         await send_system_email(email_norm, subject, html)
@@ -13003,7 +13003,7 @@ async def register_verify(data: RegisterVerifyPayload, request: Request):
     try:
         welcome_html = _email_template_branded(
             heading=f"Welcome to FleetShield365, {_safe_html(pending['name']) or 'there'}!",
-            body=(
+            body_html=(
                 f"<p>Your fleet account <strong>{_safe_html(pending['company_name'])}</strong> is live.</p>"
                 f"<p>Sign in at "
                 f"<a href=\"https://{pending['subdomain']}.fleetshield365.com\">"
