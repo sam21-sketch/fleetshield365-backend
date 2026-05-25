@@ -4227,7 +4227,16 @@ async def check_and_create_expiry_alerts(vehicle: dict, company_id: str):
                 pass  # Invalid date format, skip
 
 async def create_alert(company_id: str, alert_type: str, message: str, vehicle_id: str = None, driver_id: str = None):
-    """Create alert and send notification"""
+    """Create alert and send notification.
+
+    Each admin's `notification_preferences` is consulted before adding
+    them to the email recipient list. Without this filter, toggling
+    "Expiry Alerts" or "Issue Alerts" off in Settings had no effect.
+    Mapping (alert_type → pref key):
+      - expiry_warning / expiry_critical / driver_expiry_*  → expiry_alerts
+      - repeated_issues / unsafe_vehicle / vehicle_offline  → issue_alerts
+    Missing pref docs default to all-on so older tenants keep emails.
+    """
     alert = {
         "_id": ObjectId(),
         "company_id": company_id,
@@ -4240,19 +4249,32 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
         "created_at": utcnow()
     }
     await db.alerts.insert_one(alert)
-    
-    # Get admin emails
+
+    if alert_type == "unsafe_vehicle":
+        return alert
+
+    pref_key = "expiry_alerts" if "expiry" in alert_type else "issue_alerts"
+
     admins = await db.users.find({
         "company_id": company_id,
         "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}
     }).to_list(100)
-    
-    admin_emails = [admin['email'] for admin in admins if admin.get('email')]
-    
-    if admin_emails and alert_type != "unsafe_vehicle":
+
+    admin_emails: list = []
+    for admin in admins:
+        if not admin.get("email"):
+            continue
+        prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
+        if not prefs.get("email_enabled", True):
+            continue
+        if not prefs.get(pref_key, True):
+            continue
+        admin_emails.append(admin["email"])
+
+    if admin_emails:
         await email_service.send_alert_email(alert_type, message, admin_emails, company_id)
         await db.alerts.update_one({"_id": alert["_id"]}, {"$set": {"email_sent": True}})
-    
+
     return alert
 
 async def log_audit_trail(user_id: str, action: str, entity_type: str, entity_id: str, ip_address: str, changes: dict = None):
