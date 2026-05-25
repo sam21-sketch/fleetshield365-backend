@@ -4427,7 +4427,7 @@ async def login(credentials: UserLogin, request: Request):
     # Always 30-day sessions now — user requested. ``remember_me`` kept
     # in the request schema for backward compat but no longer changes
     # the TTL. Phase 3 revocation list ends a session early on logout.
-    expires_delta = timedelta(days=30)
+    expires_delta = timedelta(days=365)
     token = await _mint_access_token(
         str(user["_id"]),
         user_doc=user,
@@ -4517,7 +4517,7 @@ async def refresh_token(
         user_id,
         user_doc=current_user,
         company_id=current_user.get("company_id"),
-        expires_delta=timedelta(days=30),
+        expires_delta=timedelta(days=365),
     )
 
     # Revoke the old jti so it cannot be reused alongside the new one.
@@ -4527,7 +4527,7 @@ async def refresh_token(
         try:
             expires_at = datetime.utcfromtimestamp(int(old_exp))
         except (ValueError, TypeError, OSError):
-            expires_at = utcnow() + timedelta(days=30)
+            expires_at = utcnow() + timedelta(days=365)
         await db.revoked_tokens.update_one(
             {"_id": old_jti},
             {
@@ -4576,7 +4576,7 @@ async def logout(
         try:
             expires_at = datetime.utcfromtimestamp(int(exp))
         except (ValueError, TypeError, OSError):
-            expires_at = utcnow() + timedelta(days=30)
+            expires_at = utcnow() + timedelta(days=365)
         await db.revoked_tokens.update_one(
             {"_id": jti},
             {
@@ -11513,7 +11513,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
     today_str = utcnow().isoformat()[:10]
     today_dt = utcnow()
     thirty_days_ago = today_dt - timedelta(days=30)
-    
+
     # 1. Get all vehicles for this company
     vehicles_cursor = db.vehicles.find(
         {"company_id": company_id},
@@ -12840,9 +12840,216 @@ async def _sync_vehicle_quantity_to_stripe(company_id: str) -> None:
         logger.exception("[stripe_sync] failed for company %s: %s", company_id, e)
 
 
+# ============== OTP-first company registration (2026-05-25) ==============
+#
+# New 2-step registration. `register-request` validates the form, sends
+# a 6-digit OTP to the email, and parks the pending registration in a
+# TTL-cleaned collection. `register-verify` checks the OTP and only
+# THEN creates the company + super_admin user. The legacy
+# `register-company` endpoint below stays for backward compat with old
+# mobile builds, but the web register flow now goes through these two.
+
+class RegisterRequestPayload(CompanyRegister):
+    pass
+
+
+class RegisterVerifyPayload(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+def _gen_otp() -> str:
+    import secrets as _s
+    return f"{_s.randbelow(1_000_000):06d}"
+
+
+@api_router.post("/auth/register-request")
+@limiter.limit("3/minute")
+async def register_request(data: RegisterRequestPayload, request: Request):
+    """Step 1 of OTP registration. Validates form, sends OTP email."""
+    validate_password_policy(data.password)
+    email_norm = data.email.lower()
+
+    # Reject if the email is already an active account.
+    if await db.users.find_one({"email": email_norm}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Validate / pre-allocate the subdomain so step 2 can't 409 after the
+    # user has already typed the OTP.
+    try:
+        if data.subdomain is not None:
+            resolved_subdomain = validate_subdomain(data.subdomain)
+            await ensure_subdomain_unique(resolved_subdomain, db)
+        else:
+            resolved_subdomain = await slug_generator(data.company_name, db)
+    except SubdomainValidationError as exc:
+        raise _subdomain_error_to_http(exc)
+
+    otp = _gen_otp()
+    otp_hash = get_password_hash(otp)
+    pending_doc = {
+        "email": email_norm,
+        "name": data.name,
+        "company_name": data.company_name,
+        "password_hash": get_password_hash(data.password),
+        "subdomain": resolved_subdomain,
+        "vehicle_count": data.vehicle_count,
+        "role": data.role or UserRole.SUPER_ADMIN,
+        "timezone": data.timezone or DEFAULT_TIMEZONE,
+        "country": data.country,
+        "preferred_currency": data.preferred_currency,
+        "units_system": data.units_system,
+        "locale": data.locale,
+        "origin_url": data.origin_url,
+        "otp_hash": otp_hash,
+        "attempts": 0,
+        "expires_at": utcnow() + timedelta(minutes=15),
+        "created_at": utcnow(),
+    }
+    # Overwrite any earlier pending row for this email — they may have
+    # just requested a fresh OTP.
+    await db.pending_registrations.update_one(
+        {"email": email_norm}, {"$set": pending_doc}, upsert=True,
+    )
+
+    # Send the OTP via the noreply mailbox using the branded template.
+    subject = f"Your FleetShield365 verification code: {otp}"
+    html = _email_template_branded(
+        heading="Verify your email",
+        body=f"<p>Hi {(_safe_html(data.name) or 'there')},</p>"
+             f"<p>Your FleetShield365 verification code is:</p>"
+             f"<p style=\"font-size: 32px; font-weight: 700; letter-spacing: 6px; "
+             f"text-align: center; color: #0891B2; margin: 24px 0;\">{otp}</p>"
+             f"<p>This code expires in 15 minutes. If you didn't request it, ignore this email.</p>",
+        button_label=None,
+        button_url=None,
+    )
+    try:
+        await send_system_email(email_norm, subject, html)
+    except Exception as exc:
+        logger.warning("register-request OTP send failed for %s: %s", email_norm, exc)
+
+    return {"status": "otp_sent", "email": email_norm}
+
+
+@api_router.post("/auth/register-verify")
+@limiter.limit("10/minute")
+async def register_verify(data: RegisterVerifyPayload, request: Request):
+    """Step 2 of OTP registration. Verifies OTP, creates company + user."""
+    email_norm = data.email.lower()
+    pending = await db.pending_registrations.find_one({"email": email_norm})
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending registration for this email. Start over.")
+    if pending.get("expires_at") and pending["expires_at"] < utcnow():
+        await db.pending_registrations.delete_one({"_id": pending["_id"]})
+        raise HTTPException(status_code=400, detail="Verification code expired. Start over.")
+    attempts = int(pending.get("attempts", 0))
+    if attempts >= 5:
+        await db.pending_registrations.delete_one({"_id": pending["_id"]})
+        raise HTTPException(status_code=429, detail="Too many wrong codes. Start over.")
+    if not verify_password(data.otp.strip(), pending["otp_hash"]):
+        await db.pending_registrations.update_one(
+            {"_id": pending["_id"]}, {"$inc": {"attempts": 1}},
+        )
+        raise HTTPException(status_code=400, detail="Incorrect verification code.")
+
+    # OTP correct — create company + admin user.
+    pricing_now = await get_pricing()
+    trial_on = bool(pricing_now.get("trial_enabled", True))
+    norm_country = (pending.get("country") or "").upper()[:2] or None
+    units = pending.get("units_system") or ("imperial" if norm_country in {"US", "LR", "MM"} else "metric")
+    currency = (pending.get("preferred_currency") or "").upper()[:3] or None
+
+    company_doc = {
+        "name": pending["company_name"],
+        "subdomain": pending["subdomain"],
+        "vehicle_count": pending["vehicle_count"],
+        "subscription_status": "trialing" if trial_on else "past_due",
+        "subscription_plan": "pro",
+        "trial_end": (
+            (utcnow() + timedelta(days=pricing_now["trial_days"])).isoformat()
+            if trial_on else None
+        ),
+        "max_vehicles": pricing_now.get("trial_max_vehicles") if trial_on else 0,
+        "stripe_customer_id": None,
+        "stripe_subscription_id": None,
+        "timezone": pending.get("timezone") or DEFAULT_TIMEZONE,
+        "country": norm_country,
+        "preferred_currency": currency,
+        "units_system": units,
+        "locale": pending.get("locale"),
+        "created_at": utcnow().isoformat(),
+    }
+    company_result = await db.companies.insert_one(company_doc)
+    company_id = str(company_result.inserted_id)
+    user_role = pending.get("role") if pending.get("role") in [UserRole.SUPER_ADMIN, UserRole.ADMIN] else UserRole.SUPER_ADMIN
+    user_doc = {
+        "email": email_norm,
+        "password_hash": pending["password_hash"],
+        "name": pending["name"],
+        "role": user_role,
+        "company_id": company_id,
+        "email_verified": True,
+        "email_verified_at": utcnow(),
+        "created_at": utcnow().isoformat(),
+    }
+    user_result = await db.users.insert_one(user_doc)
+    user_doc["_id"] = user_result.inserted_id
+
+    # Clean up pending row.
+    await db.pending_registrations.delete_one({"_id": pending["_id"]})
+
+    # Welcome email (best-effort).
+    try:
+        welcome_html = _email_template_branded(
+            heading=f"Welcome to FleetShield365, {_safe_html(pending['name']) or 'there'}!",
+            body=(
+                f"<p>Your fleet account <strong>{_safe_html(pending['company_name'])}</strong> is live.</p>"
+                f"<p>Sign in at "
+                f"<a href=\"https://{pending['subdomain']}.fleetshield365.com\">"
+                f"{pending['subdomain']}.fleetshield365.com</a>.</p>"
+                f"<p>Tap the button below to jump straight to your dashboard.</p>"
+            ),
+            button_label="Open dashboard",
+            button_url=f"https://{pending['subdomain']}.fleetshield365.com/dashboard",
+        )
+        await send_system_email(email_norm, "Welcome to FleetShield365", welcome_html)
+    except Exception as exc:
+        logger.warning("register-verify welcome email failed for %s: %s", email_norm, exc)
+
+    # Mint access token + return redirect_to so the web can hop to the
+    # tenant subdomain (same shape as legacy register-company).
+    token = await _mint_access_token(
+        str(user_doc["_id"]), user_doc=user_doc,
+        company_id=company_id, expires_delta=timedelta(days=365),
+    )
+    redirect_to = f"https://{pending['subdomain']}.fleetshield365.com/dashboard"
+
+    return {
+        "status": "registered",
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": str(user_doc["_id"]),
+            "email": email_norm,
+            "name": pending["name"],
+            "role": user_role,
+            "company_id": company_id,
+            "email_verified": True,
+        },
+        "company": {
+            "id": company_id,
+            "name": pending["company_name"],
+            "subdomain": pending["subdomain"],
+            "timezone": company_doc["timezone"],
+        },
+        "redirect_to": redirect_to,
+    }
+
+
 # ============== Subscription (Future Ready) ==============
 
-# Company Registration with Stripe
+# Company Registration with Stripe (legacy single-step — kept for back-compat)
 @api_router.post("/auth/register-company")
 async def register_company(data: CompanyRegister):
     """Register a new company and admin user, optionally create Stripe checkout session"""
@@ -16190,6 +16397,18 @@ async def ensure_indexes() -> None:
         )
     except Exception:
         # Index may already exist with a different name; not fatal.
+        pass
+
+    # --- pending_registrations TTL (OTP-first signup, 2026-05-25) ----
+    # Rows self-delete 1s after their expires_at so we don't accumulate
+    # stale OTP requests. Also unique on email so a fresh request
+    # overwrites instead of stacking.
+    try:
+        await db.pending_registrations.create_index(
+            "expires_at", expireAfterSeconds=0,
+        )
+        await db.pending_registrations.create_index("email", unique=True)
+    except Exception:
         pass
 
     logger.info("ensure_indexes(): DB indexes verified")
