@@ -9184,9 +9184,22 @@ async def send_driver_credentials(driver_id: str, current_user: dict = Depends(g
         f"[FleetShield365] Your Login Credentials for {company_name}",
         html_content
     )
-    
+
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to send email. Please check email configuration.")
+        # SMTP returned False — either the mailbox isn't configured yet
+        # (dev / pre-rollout) or the upstream MTA refused the recipient
+        # (invalid email, mailbox full, MX issues). Either way this is
+        # a data / config problem the admin can act on, not a backend
+        # crash — surface a 400 with the offending address so the UI
+        # toast reads like "Could not email Sarah Wilson at
+        # sarah@…: please check the address".
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not deliver email to {driver_email}. "
+                "Check that the address is valid and reachable, or use Copy to share the PIN another way."
+            ),
+        )
 
     # Mark the invitation as sent. The web Drivers panel reads this to
     # show "Invitation sent on …" badges instead of the user wondering
