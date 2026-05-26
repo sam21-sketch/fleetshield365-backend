@@ -8934,10 +8934,20 @@ async def export_fuel_csv(
     company_id = current_user["company_id"]
     query: dict = {"company_id": company_id}
     if df is not None and dtt is not None:
-        query["timestamp"] = {
-            "$gte": date_from,
-            "$lte": date_to + "T23:59:59",
-        }
+        # fuel_submissions.timestamp is stored as a Python datetime (see
+        # create handler), so string $gte/$lte never matched and the CSV
+        # came down with header-only when a date range was given. Parse
+        # the inputs to datetime bounds — same pattern as
+        # /incidents/export/csv at ~10647.
+        try:
+            ts_from = datetime.fromisoformat(date_from)
+            ts_to = datetime.fromisoformat(date_to + "T23:59:59")
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="date_from/date_to must be ISO yyyy-mm-dd",
+            )
+        query["timestamp"] = {"$gte": ts_from, "$lte": ts_to}
 
     # vehicle_ids takes precedence over vehicle_id (multi-select case).
     vid_list = [v.strip() for v in (vehicle_ids or "").split(",") if v.strip()]
