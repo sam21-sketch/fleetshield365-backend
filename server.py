@@ -9045,30 +9045,33 @@ class AdminResetPasswordRequest(BaseModel):
 
 @api_router.post("/drivers/{driver_id}/reset-password")
 async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswordRequest, current_user: dict = Depends(get_current_user)):
-    """Admin can reset a driver's password"""
-    # Phase 3 — uniform password policy at every set-password site.
-    validate_password_policy(request.new_password)
+    """Admin can reset a driver's sign-in PIN.
+
+    Drivers authenticate on the mobile app with a 4-digit PIN, not a
+    password, so the admin reset modal now collects a PIN (the field
+    name `new_password` is preserved for backward compat with older
+    clients but the value MUST be 4 digits).
+    """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    validate_driver_pin(request.new_password)
+
     driver = await db.users.find_one({"_id": ObjectId(driver_id), "company_id": current_user["company_id"]})
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
-    # Block reusing the existing password so a "reset" actually
-    # rotates the credential.
-    reject_same_password(request.new_password, driver.get("password_hash"))
+    hashed = get_password_hash(request.new_password.strip())
 
-    # Hash the new password
-    hashed_password = get_password_hash(request.new_password)
-
-    # Update the driver's password
     await db.users.update_one(
         {"_id": ObjectId(driver_id)},
-        {"$set": {"password_hash": hashed_password}}
+        {"$set": {
+            "password_hash": hashed,
+            "auth_mode": "pin",
+        }}
     )
 
-    return {"message": f"Password reset successfully for {driver.get('name', 'driver')}"}
+    return {"message": f"PIN reset successfully for {driver.get('name', 'driver')}"}
 
 @api_router.put("/drivers/{driver_id}")
 async def update_driver(driver_id: str, update: DriverUpdate, request: Request, current_user: dict = Depends(get_current_user)):
