@@ -3699,7 +3699,13 @@ class WitnessDetails(BaseModel):
         return _validate_au_phone(v)
 
 class IncidentCreate(BaseModel):
-    vehicle_id: str
+    # Owner request 2026-05-27 — admins can record incidents for vehicles
+    # NOT in the fleet (e.g. a hired vehicle, another party's vehicle).
+    # When vehicle_id is omitted, vehicle_other_label MUST be supplied
+    # and gets stored as the display name (no MinIO key prefix issues
+    # because there's no vehicle row to reference).
+    vehicle_id: Optional[str] = None
+    vehicle_other_label: Optional[str] = None
     description: str
     severity: str = IncidentSeverity.MODERATE  # minor, moderate, severe
     location_address: Optional[str] = None
@@ -10452,10 +10458,20 @@ async def create_incident(
     if existing:
         return serialize_doc(existing)
 
-    # Get vehicle info
-    vehicle = await db.vehicles.find_one({"_id": ObjectId(incident.vehicle_id), "company_id": company_id})
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
+    # Get vehicle info — owner 2026-05-27 allowed "Other" vehicles
+    # that aren't in the fleet. When vehicle_id is empty we expect a
+    # vehicle_other_label instead and skip the lookup.
+    other_label = (incident.vehicle_other_label or "").strip()
+    vehicle: dict = {}
+    if incident.vehicle_id:
+        try:
+            vehicle = await db.vehicles.find_one({"_id": ObjectId(incident.vehicle_id), "company_id": company_id}) or {}
+        except Exception:
+            vehicle = {}
+        if not vehicle:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+    elif not other_label:
+        raise HTTPException(status_code=400, detail="Pick a vehicle or describe the other vehicle in the 'Other vehicle' field")
     
     # Parse timestamp from mobile app (for offline submissions)
     if incident.timestamp:
@@ -10507,7 +10523,10 @@ async def create_incident(
     incident_doc = {
         "_id": incident_id,
         "company_id": company_id,
-        "vehicle_id": incident.vehicle_id,
+        # vehicle_id is None for "Other" vehicles; vehicle_other_label
+        # carries the free-text description in that case.
+        "vehicle_id": incident.vehicle_id or None,
+        "vehicle_other_label": other_label or None,
         "driver_id": str(current_user["_id"]),
         "description": incident.description,
         "severity": incident.severity,
@@ -10531,13 +10550,15 @@ async def create_incident(
     result = await db.incidents.insert_one(incident_doc)
     incident_doc["id"] = str(result.inserted_id)
     
-    # Create alert for admin
+    # Create alert for admin. For an "Other" vehicle the label is what
+    # the admin typed; for an in-fleet vehicle it's the vehicle name.
+    vehicle_label = vehicle.get('name', '') if vehicle else f"Other: {other_label}" if other_label else 'Unknown'
     alert_doc = {
         "company_id": company_id,
         "type": "incident_report",
         "severity": "critical" if incident.severity == "severe" else "warning",
-        "message": f"Incident reported: {vehicle.get('name', 'Unknown')} - {incident.severity.upper()} - {incident.description[:100]}",
-        "vehicle_id": incident.vehicle_id,
+        "message": f"Incident reported: {vehicle_label} - {incident.severity.upper()} - {incident.description[:100]}",
+        "vehicle_id": incident.vehicle_id or None,
         "driver_id": str(current_user["_id"]),
         "incident_id": str(result.inserted_id),
         "is_read": False,
