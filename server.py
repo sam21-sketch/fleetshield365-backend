@@ -5800,31 +5800,53 @@ async def get_users(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/users")
 async def create_user(user_data: UserCreate, current_user: dict = Depends(get_current_user)):
-    """Create a new admin user for the company"""
+    """Create a new admin/driver user for the company.
+
+    Role gating (2026-05-27 — owner reported the Add User panel was
+    surfacing a generic error when the email was already in use):
+      - super_admin can create admin OR driver
+      - admin can create driver only
+      - Nobody can create another super_admin or platform_owner through
+        this endpoint (those roles have their own out-of-band setup).
+    """
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Check if email already exists
+
+    allowed_roles = {UserRole.ADMIN, UserRole.DRIVER}
+    if user_data.role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Can only create admin or driver users from this panel",
+        )
+    if user_data.role == UserRole.ADMIN and current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Company Owner can invite admins",
+        )
+
+    # Friendly duplicate-email message — owner reported it was hidden
+    # behind a generic 'Could not save user' toast.
     existing = await db.users.find_one({"email": user_data.email})
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Hash password
-    hashed_password = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
+        raise HTTPException(status_code=400, detail="Email already in use")
+
+    validate_password_policy(user_data.password)
+
     new_user = {
         "email": user_data.email,
         "full_name": user_data.full_name,
-        "hashed_password": hashed_password,
+        # Field name MUST match what the login lookup reads (password_hash).
+        # An older revision wrote 'hashed_password' here, so users created
+        # via this endpoint silently failed login.
+        "password_hash": get_password_hash(user_data.password),
         "role": user_data.role,
         "company_id": current_user["company_id"],
-        "created_at": datetime.now(timezone.utc)
+        "created_at": datetime.now(timezone.utc),
     }
-    
+
     result = await db.users.insert_one(new_user)
     new_user["id"] = str(result.inserted_id)
     new_user.pop("_id", None)
-    # Phase 3 — single sanitizer covers all secret fields.
     return sanitize_user_doc(new_user)
 
 @api_router.put("/users/{user_id}")
