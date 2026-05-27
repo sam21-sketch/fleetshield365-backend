@@ -3957,6 +3957,75 @@ async def _resolve_inspection_photo(
     return object_key, "inspection-photos"
 
 
+def _pdf_company_header(company: dict, styles: dict, title: str) -> list:
+    """Return a uniform PDF header (logo + company name + title) used by
+    every export. Owner reported 2026-05-27 — the logo on inspection
+    PDFs was low-res because we forced a 2:1 aspect that squashed
+    square logos, and most other PDFs had no logo at all. This helper
+    reads the logo bytes once from MinIO (or legacy base64), uses PIL
+    to compute the natural aspect ratio, and embeds at a sharp 1.8"
+    width. Falls back to plain company-name banner when no logo set.
+    """
+    elements: list = []
+
+    logo_bytes: Optional[bytes] = None
+    if company and company.get('logo_object_key'):
+        try:
+            logo_bytes = object_store.get_bytes("logos", company['logo_object_key'])
+        except Exception as exc:
+            logger.warning(
+                "PDF header: could not fetch logo %s from MinIO: %s",
+                company.get('logo_object_key'), exc,
+            )
+    if logo_bytes is None and company and company.get('logo_base64'):
+        try:
+            raw_b64 = company['logo_base64']
+            logo_bytes = base64.b64decode(
+                raw_b64.split(',')[-1] if ',' in raw_b64 else raw_b64
+            )
+        except Exception:
+            logo_bytes = None
+
+    if logo_bytes:
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(BytesIO(logo_bytes)) as pim:
+                w, h = pim.size
+            ratio = (h / w) if w else 0.5
+            target_w = 1.8 * inch
+            target_h = target_w * ratio
+            # cap on extremely tall logos so they don't push content off the page
+            target_h = min(target_h, 1.4 * inch)
+            logo_img = RLImage(BytesIO(logo_bytes), width=target_w, height=target_h)
+            logo_img.hAlign = 'CENTER'
+            elements.append(logo_img)
+            elements.append(Spacer(1, 6))
+        except Exception as exc:
+            logger.warning("PDF header: failed to embed company logo: %s", exc)
+
+    company_name = (company or {}).get("name", "FleetShield365")
+    name_style = ParagraphStyle(
+        'PdfCompanyName',
+        parent=styles['Normal'],
+        fontSize=11,
+        alignment=1,
+        textColor=colors.HexColor('#475569'),
+        spaceAfter=4,
+    )
+    elements.append(Paragraph(company_name, name_style))
+
+    title_style = ParagraphStyle(
+        'PdfTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        alignment=1,
+        textColor=colors.HexColor('#1e3a5f'),
+        spaceAfter=14,
+    )
+    elements.append(Paragraph(title, title_style))
+    return elements
+
+
 async def generate_inspection_pdf_bytes(inspection: dict, vehicle: dict, driver: dict, company: dict) -> bytes:
     """Generate the inspection PDF and return raw bytes.
 
@@ -4007,43 +4076,11 @@ async def generate_inspection_pdf(inspection: dict, vehicle: dict, driver: dict,
     heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor('#2d3748'), spaceAfter=8)
     normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontSize=10, spaceAfter=6)
     
-    # Company Logo (if exists)
-    # Task 5.4: post-migration the logo lives in MinIO at
-    # company.logo_object_key. Fetch the bytes via object_store.get_bytes
-    # so we can embed the image in the PDF. Pre-migration rows that still
-    # carry logo_base64 fall through to the legacy branch below.
-    logo_bytes: Optional[bytes] = None
-    if company and company.get('logo_object_key'):
-        try:
-            logo_bytes = object_store.get_bytes(
-                "logos", company['logo_object_key']
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch company logo %s from MinIO: %s",
-                company.get('logo_object_key'), exc,
-            )
-            logo_bytes = None
-    if logo_bytes is None and company and company.get('logo_base64'):
-        try:
-            raw_b64 = company['logo_base64']
-            logo_bytes = base64.b64decode(
-                raw_b64.split(',')[-1] if ',' in raw_b64 else raw_b64
-            )
-        except Exception:
-            logo_bytes = None
-    if logo_bytes:
-        try:
-            logo_img = RLImage(BytesIO(logo_bytes), width=2*inch, height=1*inch)
-            elements.append(logo_img)
-            elements.append(Spacer(1, 12))
-        except Exception as exc:
-            logger.warning("Failed to embed company logo: %s", exc)
-    
-    # Title
+    # Uniform header — owner request 2026-05-27 (logo at natural ratio,
+    # company name, then page title). Same helper is used by every PDF
+    # generator below so branding is consistent.
     inspection_type = "Prestart Inspection Report" if inspection['type'] == 'prestart' else "End of Shift Report"
-    elements.append(Paragraph(inspection_type, title_style))
-    elements.append(Spacer(1, 12))
+    elements.extend(_pdf_company_header(company, styles, inspection_type))
     
     # Get timezone display name
     tz_display = company_tz.split('/')[-1].replace('_', ' ')
@@ -9858,7 +9895,7 @@ async def get_service_record_pdf(
     footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
     elements: list = []
 
-    elements.append(Paragraph(f"{company_name} — Service Record", title_style))
+    elements.extend(_pdf_company_header(company, styles, "Service Record"))
 
     data = [
         ["Record ID:", str(record.get("_id", ""))[:8] + "..."],
@@ -10094,10 +10131,9 @@ async def get_service_record_pdf(record_id: str, current_user: dict = Depends(ge
     styles = getSampleStyleSheet()
     elements = []
     
-    # Title
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
-    elements.append(Paragraph(f"Service Record - {vehicle_name}", title_style))
-    
+    # Uniform branded header — replaces the bare title-only top.
+    elements.extend(_pdf_company_header(company, styles, f"Service Record — {vehicle_name}"))
+
     # Service date in Australian format
     service_date = record.get("service_date", "")
     if service_date:
@@ -10917,7 +10953,7 @@ async def export_incidents_pdf(
     footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
     elements: list = []
 
-    elements.append(Paragraph(f"{company_name} — Incident Report", title_style))
+    elements.extend(_pdf_company_header(company, styles, "Incident Report"))
     elements.append(Paragraph(f"{len(incidents)} incident(s) included.", styles['Normal']))
     if date_from or date_to:
         elements.append(Paragraph(
@@ -11056,11 +11092,11 @@ async def get_incident_pdf(incident_id: str, current_user: dict = Depends(get_cu
     styles = getSampleStyleSheet()
     elements = []
     
-    # Title with severity color
+    # Severity colour reference (used by the severity badge below).
     severity_colors = {"minor": "#f59e0b", "moderate": "#ef4444", "major": "#dc2626", "critical": "#7f1d1d"}
     severity = incident.get("severity", "unknown")
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1e3a5f'), spaceAfter=20)
-    elements.append(Paragraph(f"Incident Report - {severity.upper()}", title_style))
+    # Branded header on every PDF — owner request 2026-05-27.
+    elements.extend(_pdf_company_header(company, styles, f"Incident Report — {severity.upper()}"))
     
     # Incident date in company timezone
     incident_date = format_timestamp(incident.get("created_at", ""), company_tz)
@@ -11299,8 +11335,8 @@ async def _export_incidents_pdf_unused() -> None:
     footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=9, textColor=colors.gray)
     elements: list = []
 
-    # Cover page
-    elements.append(Paragraph(f"{company_name} — Incident Report", title_style))
+    # Cover page — branded header
+    elements.extend(_pdf_company_header(company, styles, "Incident Report"))
     elements.append(Paragraph(f"{len(incidents)} incident(s) included.", styles['Normal']))
     if date_from or date_to:
         elements.append(Paragraph(
