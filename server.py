@@ -14228,6 +14228,273 @@ async def update_support_request(
     return {"message": "Support request updated successfully"}
 
 
+# ============== Developer: email-template preview ==============
+#
+# One-shot helper for the platform owner to preview every outgoing
+# email template at a single inbox. Calls each generator with sample
+# data and sends to the supplied address. Owner asked for this on
+# 2026-05-27 to QA branding + formatting across the 21 templates.
+
+@api_router.post("/developer/preview-all-templates")
+async def preview_all_email_templates(
+    to: str,
+    current_user: dict = Depends(require_platform_owner),
+):
+    """Fire every email template once to a single inbox for QA."""
+    sent: list = []
+
+    async def fire(label: str, subject: str, html: str, sender: str = "alerts"):
+        ok = await _send_via_smtp(to, f"[PREVIEW {label}] {subject}", html, sender=sender)
+        sent.append({"template": label, "ok": ok})
+
+    # --- BRANDED TEMPLATES (noreply@) ---
+    await fire(
+        "01 Forgot Password",
+        "Reset your FleetShield365 password",
+        _email_template_branded(
+            heading="Reset your password",
+            body_html="<p>You asked to reset your FleetShield365 password. Click the button to choose a new one. The link expires in 24 hours.</p>",
+            button_label="Reset password",
+            button_url="https://fleetshield365.com/reset-password?token=PREVIEW",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "02 Email Verification",
+        "Verify your FleetShield365 email",
+        _email_template_branded(
+            heading="Verify your email address",
+            body_html="<p>Thanks for signing up. Click below to confirm this is the right email address.</p>",
+            button_label="Verify email",
+            button_url="https://fleetshield365.com/verify-email?token=PREVIEW",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "03 Invite Admin or Driver",
+        "You've been invited to FleetShield365",
+        _email_template_branded(
+            heading="You've been invited to QA Test Fleet",
+            body_html="<p>QA Test Fleet has invited you to join their fleet management workspace as an <strong>Admin</strong>. Click the button below to set your password and get started.</p>",
+            button_label="Accept invitation",
+            button_url="https://fleetshield365.com/set-password?token=PREVIEW",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "04 Verify-email Reminder",
+        "Please verify your FleetShield365 email",
+        _email_template_branded(
+            heading="One step to go",
+            body_html="<p>We sent a verification link earlier; in case it landed in spam, here it is again.</p>",
+            button_label="Verify email",
+            button_url="https://fleetshield365.com/verify-email?token=PREVIEW",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "05 Invite Resend",
+        "Your FleetShield365 invitation",
+        _email_template_branded(
+            heading="Your invitation",
+            body_html="<p>QA Test Fleet is waiting for you to set your password. The link below opens the same sign-up screen.</p>",
+            button_label="Set password",
+            button_url="https://fleetshield365.com/set-password?token=PREVIEW",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "06 OTP Register",
+        "Your FleetShield365 verification code",
+        _email_template_branded(
+            heading="Your verification code",
+            body_html="<p style='font-size:14px'>Enter this code on the sign-up page within 15 minutes.</p>"
+                      "<div style='text-align:center;margin:24px 0;font-size:32px;letter-spacing:8px;font-weight:600;color:#0d9488'>483217</div>"
+                      "<p style='font-size:13px;color:#64748b'>If you didn't request this, you can ignore this email.</p>",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "07 Welcome (post-register)",
+        "Welcome to FleetShield365",
+        _email_template_branded(
+            heading="Welcome aboard",
+            body_html="<p>Your FleetShield365 workspace <strong>QA Test Fleet</strong> is ready. Open the dashboard to add your first vehicle and operator.</p>",
+            button_label="Open dashboard",
+            button_url="https://qatest.fleetshield365.com/dashboard",
+        ),
+        sender="noreply",
+    )
+
+    await fire(
+        "08 Contact Form Auto-reply",
+        "We received your message",
+        _email_template_branded(
+            heading="Thanks for getting in touch",
+            body_html="<p>We've received your message and will reply within one business day. If your request is urgent, reply to this email or call our office number.</p>",
+        ),
+        sender="noreply",
+    )
+
+    # --- ALERTS TEMPLATES (alerts@) — inline HTML, fire helpers directly with sample data ---
+
+    sample_alerts = [
+        {"vehicle": "Truck SAM-202", "label": "Rego", "expiry": "2026-06-15", "days": 14},
+        {"vehicle": "Trailer ABC-543", "label": "Insurance", "expiry": "2026-07-01", "days": 30},
+    ]
+    expiry_html = "<html><body style='font-family:Arial,sans-serif;padding:20px'><h2 style='color:#F97316'>FleetShield365 Expiry Alerts</h2><p>Hi QA Test Fleet Admin,</p><p>The following items require your attention:</p><ul style='margin:20px 0'>"
+    for a in sample_alerts:
+        expiry_html += f"<li>{a['label']} for {a['vehicle']} expires in {a['days']} days ({a['expiry']})</li>"
+    expiry_html += "</ul></body></html>"
+    await fire("09 Expiry Alert (vehicle)", "2 Expiry Alerts Require Attention", expiry_html)
+
+    defect_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#EF4444'>Defect Alert - Mercedes Actros (SAM-202)</h2>"
+        "<p>Driver <strong>Sarah Wilson</strong> reported the following on the pre-start inspection:</p>"
+        "<p style='background:#FEF2F2;border-left:4px solid #EF4444;padding:12px'>Light leaking from headlight, dashboard warning light on.</p>"
+        "<p>Open the inspection in the FleetShield365 admin panel to review the photos.</p></body></html>"
+    )
+    await fire("10 Defect Alert", "[DEFECT ALERT] Mercedes Actros - light leaking from headlight", defect_html)
+
+    missed_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#F97316'>FleetShield365 Missed Inspection Alert</h2>"
+        "<p>Hi QA Test Fleet Admin,</p>"
+        "<p>The following vehicles did not complete their prestart inspection today:</p>"
+        "<ul style='margin:20px 0'><li>Sweep Truck 1 (SWP-001)</li><li>Asset Probe 780931 (ASP-780931)</li></ul>"
+        "<p>Please follow up with the assigned drivers.</p></body></html>"
+    )
+    await fire("11 Missed Inspection", "2 Vehicle(s) Missed Inspection Today", missed_html)
+
+    repeated_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#F97316'>Repeated Issues - Sweep Truck 1 (SWP-001)</h2>"
+        "<p>This vehicle has been reported with issues 4 times in the last 7 days:</p>"
+        "<ul style='margin:20px 0'>"
+        "<li>2026-05-22 - Brake warning light</li>"
+        "<li>2026-05-24 - Same warning light</li>"
+        "<li>2026-05-26 - Light still on</li>"
+        "<li>2026-05-27 - Still unresolved</li></ul>"
+        "<p>Consider taking this vehicle out of service until inspected.</p></body></html>"
+    )
+    await fire("12 Repeated Issues", "[PATTERN ALERT] Sweep Truck 1 - 4 issues in 7 days", repeated_html)
+
+    daily_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#0D9488'>Daily Summary - 27 May 2026</h2>"
+        "<p>Hi QA Test Fleet Admin,</p>"
+        "<div style='background:#F8FAFC;padding:20px;border-radius:8px;margin:20px 0'>"
+        "<p><strong>Inspections Completed:</strong> 8</p>"
+        "<p><strong>Inspections Missed:</strong> 2</p>"
+        "<p><strong>Issues Reported:</strong> 1</p>"
+        "<p><strong>Fuel Submissions:</strong> 3</p>"
+        "<p><strong>Total Fuel:</strong> 240.5 L</p></div>"
+        "<p>Log in for detailed reports.</p></body></html>"
+    )
+    await fire("13 Daily Summary", "Daily Summary - 27 May 2026", daily_html)
+
+    weekly_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#0D9488'>Weekly Summary - Week ending 26 May 2026</h2>"
+        "<p>Hi QA Test Fleet Admin,</p>"
+        "<div style='background:#F8FAFC;padding:20px;border-radius:8px;margin:20px 0'>"
+        "<table style='width:100%;border-collapse:collapse'>"
+        "<tr><td>Total inspections</td><td style='text-align:right'><strong>47</strong></td></tr>"
+        "<tr><td>Pre-start</td><td style='text-align:right'>32</td></tr>"
+        "<tr><td>End-shift</td><td style='text-align:right'>15</td></tr>"
+        "<tr><td>Incidents</td><td style='text-align:right'><strong>2</strong></td></tr>"
+        "<tr><td>Fuel logs</td><td style='text-align:right'>18</td></tr>"
+        "</table></div></body></html>"
+    )
+    await fire("14 Weekly Summary", "Weekly Summary - Week ending 26 May 2026", weekly_html)
+
+    deletion_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#0F172A'>Account deletion confirmed</h2>"
+        "<p>Hi Sarah,</p>"
+        "<p>Your FleetShield365 account has been deleted. Your data will be retained for 30 days in case you change your mind; after that it will be permanently removed.</p>"
+        "<p style='color:#64748B;font-size:12px'>If this wasn't you, reply immediately so we can restore the account.</p></body></html>"
+    )
+    await fire("15 Account Deletion", "Account Deletion Confirmation", deletion_html)
+
+    creds_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px;background-color:#f8fafc'>"
+        "<div style='max-width:500px;margin:0 auto;background:white;padding:30px;border-radius:12px'>"
+        "<h2 style='color:#0f172a;margin-bottom:20px'>Welcome to FleetShield365!</h2>"
+        "<p style='color:#475569'>Hi Sarah,</p>"
+        "<p style='color:#475569'>You've been added as an operator for <strong>QA Test Fleet</strong>. You can now access the FleetShield365 mobile app.</p>"
+        "<div style='background-color:#f1f5f9;padding:20px;border-radius:8px;margin:20px 0'>"
+        "<h3 style='color:#0f172a;margin-top:0'>Your Login Details:</h3>"
+        "<p style='color:#475569;margin:5px 0'><strong>Username:</strong> sarah.wilson</p>"
+        "<p style='color:#475569;margin:5px 0'><strong>PIN:</strong> 4-digit code from your admin</p></div>"
+        "<div style='text-align:center;margin:30px 0'>"
+        "<a href='https://fleetshield365.com' style='background-color:#0d9488;color:white;padding:12px 30px;text-decoration:none;border-radius:8px;font-weight:bold'>Open FleetShield365</a></div></div></body></html>"
+    )
+    await fire("16 Send Driver Credentials", "Your Login Credentials for QA Test Fleet", creds_html)
+
+    incident_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#EF4444'>URGENT: Incident Report</h2>"
+        "<p>An incident has been reported by driver <strong>Sarah Wilson</strong>:</p>"
+        "<div style='background:#FEF2F2;border-left:4px solid #EF4444;padding:16px;margin:16px 0'>"
+        "<p><strong>Vehicle:</strong> Mercedes Actros (SAM-202)</p>"
+        "<p><strong>Severity:</strong> MODERATE</p>"
+        "<p><strong>Location:</strong> M1 Pacific Motorway, NSW</p>"
+        "<p><strong>Description:</strong> Light scrape against bollard while reversing in depot.</p></div>"
+        "<p>Open the FleetShield365 admin panel to review photos and update status.</p></body></html>"
+    )
+    await fire("17 Incident Notification", "URGENT Incident Report: Mercedes Actros - MODERATE", incident_html)
+
+    workshop_html = (
+        "<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+        "<h2 style='color:#F97316'>Defect Repair Request - SAM-202</h2>"
+        "<p>Please attend to the following defects on Mercedes Actros (SAM-202):</p>"
+        "<ul><li>Headlight light leak</li><li>Dashboard warning light</li></ul>"
+        "<p><strong>Reported by:</strong> Sarah Wilson on 27 May 2026</p>"
+        "<p><strong>Odometer:</strong> 124,580 km</p>"
+        "<p>Reply to this email to confirm receipt and provide an ETA.</p></body></html>"
+    )
+    await fire("18 Workshop Repair Request", "Defect Repair Request - SAM-202", workshop_html)
+
+    # --- create_alert / EmailService.send_alert_email path (5 alert_type variants) ---
+    alert_subject_map = {
+        "expiry_warning": "Reminder: Upcoming Vehicle Expiry",
+        "expiry_critical": "CRITICAL: Document Has Expired",
+        "driver_expiry_warning": "Reminder: Driver Document Expiring",
+        "driver_expiry_critical": "CRITICAL: Driver Document Expired",
+        "vehicle_offline": "Vehicle Status: Offline",
+    }
+    for i, (atype, subj) in enumerate(alert_subject_map.items(), start=19):
+        color = "#EF4444" if "critical" in atype or "unsafe" in atype else "#F59E0B"
+        html = (
+            f"<html><body style='font-family:Arial,sans-serif;background-color:#F8FAFC;padding:20px'>"
+            f"<div style='max-width:600px;margin:0 auto;background-color:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)'>"
+            f"<div style='background-color:{color};color:white;padding:20px;text-align:center'>"
+            f"<h1 style='margin:0;font-size:24px'>{subj}</h1></div>"
+            f"<div style='padding:30px'><p style='font-size:16px;color:#334155;line-height:1.6'>"
+            f"This is a sample {atype} alert sent for the FleetShield365 template QA preview. In production this email fires when the matching alert condition is met.</p>"
+            f"<hr style='border:none;border-top:1px solid #E2E8F0;margin:20px 0'>"
+            f"<p style='font-size:14px;color:#64748B'>This is an automated notification from FleetShield365. Please log in to your dashboard to take action.</p></div>"
+            f"<div style='background-color:#F1F5F9;padding:15px;text-align:center'>"
+            f"<p style='margin:0;font-size:12px;color:#94A3B8'>FleetShield365 - Vehicle Inspection Management</p></div></div></body></html>"
+        )
+        await fire(f"{i:02d} {atype}", subj, html)
+
+    return {
+        "to": to,
+        "total": len(sent),
+        "sent": [s for s in sent if s["ok"]],
+        "failed": [s for s in sent if not s["ok"]],
+    }
+
+
 # ============== Developer: platform-wide support inbox ==============
 
 @api_router.get("/developer/support")
