@@ -1090,7 +1090,7 @@ async def send_repeated_issues_email(company_id: str, vehicle_name: str, recent_
     # Send to all admins
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": ["super_admin", "admin"]}
+        "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None
     }).to_list(100)
     
     for admin in admins:
@@ -1286,7 +1286,7 @@ async def generate_weekly_summary():
             # master kill-switch.
             admins = await db.users.find({
                 "company_id": company_id,
-                "role": {"$in": ["super_admin", "admin"]}
+                "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None
             }).to_list(100)
 
             admin_ids = [str(a["_id"]) for a in admins]
@@ -1401,7 +1401,7 @@ async def generate_daily_summary():
 
             admins = await db.users.find({
                 "company_id": company_id,
-                "role": {"$in": ["super_admin", "admin"]},
+                "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None,
             }).to_list(100)
             for admin in admins:
                 if not admin.get("email"):
@@ -1469,7 +1469,7 @@ async def generate_missed_inspection_check():
 
             admins = await db.users.find({
                 "company_id": company_id,
-                "role": {"$in": ["super_admin", "admin"]},
+                "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None,
             }).to_list(100)
             for admin in admins:
                 if not admin.get("email"):
@@ -1535,7 +1535,7 @@ async def notify_admins(company_id: str, notification_type: str, title: str, bod
     # Get all admins for this company
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": ["super_admin", "admin"]}
+        "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None
     }).to_list(100)
     
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
@@ -1579,7 +1579,7 @@ async def send_activity_email(
     """
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": ["super_admin", "admin"]},
+        "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None,
     }).to_list(100)
     for admin in admins:
         prefs = await db.notification_preferences.find_one({"user_id": str(admin["_id"])}) or {}
@@ -1597,7 +1597,7 @@ async def notify_admins_with_photos(company_id: str, vehicle_name: str, driver_n
     # Get all admins for this company
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": ["super_admin", "admin"]}
+        "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None
     }).to_list(100)
     
     company = await db.companies.find_one({"_id": ObjectId(company_id)})
@@ -4473,7 +4473,7 @@ async def create_alert(company_id: str, alert_type: str, message: str, vehicle_i
 
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}
+        "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}, "deleted_at": None
     }).to_list(100)
 
     admin_emails: list = []
@@ -4627,6 +4627,16 @@ async def login(credentials: UserLogin, request: Request):
         if user:
             await _record_failed_login(user)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Reject soft-deleted (trashed) accounts. The credentials are valid
+    # at this point, so the person owns the account — a clear message is
+    # safe (no enumeration concern). Owner request 2026-05-28: a user in
+    # Trash must not be able to sign in. Restore from Trash to re-enable.
+    if user.get("deleted_at"):
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been removed. Contact your administrator to restore access.",
+        )
 
     # Successful auth — reset the failure counter.
     await _clear_failed_logins(user["_id"])
@@ -6101,7 +6111,7 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
     
     # Notify company admins
     try:
-        admins = await db.users.find({"company_id": company_id, "role": {"$in": ["super_admin", "admin"]}}).to_list(10)
+        admins = await db.users.find({"company_id": company_id, "role": {"$in": ["super_admin", "admin"]}, "deleted_at": None}).to_list(10)
         for admin in admins:
             if admin.get("email"):
                 await send_email_notification(
@@ -9368,7 +9378,7 @@ async def send_driver_expiry_email(company_id: str, driver_name: str, document_t
     """Send email notification about driver document expiry"""
     admins = await db.users.find({
         "company_id": company_id,
-        "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}
+        "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}, "deleted_at": None
     }).to_list(100)
     
     for admin in admins:
