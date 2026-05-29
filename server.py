@@ -1699,9 +1699,14 @@ _PASSWORD_POLICY_MIN_LEN = 8
 def validate_password_policy(password: str) -> None:
     """Raise HTTPException 400 if the password doesn't meet platform policy.
 
-    Single source of truth — every endpoint that sets a password calls
-    this. Reasons returned in ``detail`` so the client can render a
-    friendly message.
+    Single source of truth for admin / super_admin / company-owner
+    passwords (drivers use a 4-digit PIN via validate_driver_pin).
+
+    Owner request 2026-05-29 — simplified to a plain 8-character
+    minimum; the upper/lower/digit complexity requirement was dropped.
+    This is a SET-TIME check only — login never re-validates, so
+    existing users keep their current passwords and continue to
+    authenticate unchanged.
     """
     if not isinstance(password, str):
         raise HTTPException(status_code=400, detail="Password is required")
@@ -1709,21 +1714,6 @@ def validate_password_policy(password: str) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"Password must be at least {_PASSWORD_POLICY_MIN_LEN} characters",
-        )
-    if not re.search(r"[A-Z]", password):
-        raise HTTPException(
-            status_code=400,
-            detail="Password must contain at least one uppercase letter",
-        )
-    if not re.search(r"[a-z]", password):
-        raise HTTPException(
-            status_code=400,
-            detail="Password must contain at least one lowercase letter",
-        )
-    if not re.search(r"\d", password):
-        raise HTTPException(
-            status_code=400,
-            detail="Password must contain at least one digit",
         )
 
 
