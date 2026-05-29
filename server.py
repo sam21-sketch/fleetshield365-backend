@@ -1693,7 +1693,7 @@ def sanitize_user_doc(doc):
 # Password policy: min 8 chars, at least one upper + lower + digit.
 # Applied uniformly at every site that sets a password (register,
 # reset, accept-invite, admin reset).
-_PASSWORD_POLICY_MIN_LEN = 8
+_PASSWORD_POLICY_MIN_LEN = 6
 
 
 def validate_password_policy(password: str) -> None:
@@ -1702,7 +1702,7 @@ def validate_password_policy(password: str) -> None:
     Single source of truth for admin / super_admin / company-owner
     passwords (drivers use a 4-digit PIN via validate_driver_pin).
 
-    Owner request 2026-05-29 — simplified to a plain 8-character
+    Owner request 2026-05-29 — simplified to a plain 6-character
     minimum; the upper/lower/digit complexity requirement was dropped.
     This is a SET-TIME check only — login never re-validates, so
     existing users keep their current passwords and continue to
