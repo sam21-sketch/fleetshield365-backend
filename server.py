@@ -4893,9 +4893,11 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
     CORS middleware). So we keep ``request`` for the HTTP request
     and rename the body to ``payload``.
     """
-    # Case-insensitive email lookup
+    # Case-insensitive email lookup. Exclude trashed accounts — a user
+    # in Trash must not receive any mail (owner request 2026-05-28) and
+    # can't log in anyway.
     email_lower = payload.email.lower()
-    user = await db.users.find_one({"email": email_lower})
+    user = await db.users.find_one({"email": email_lower, "deleted_at": None})
 
     # Always return success to prevent email enumeration
     if not user:
@@ -5836,6 +5838,10 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     role: Optional[str] = None
+    # Optional password reset from the Users panel — owner request
+    # 2026-05-29 so a super_admin can set a new password for an admin
+    # without the admin having to run the forgot-password flow.
+    password: Optional[str] = None
 
 @api_router.get("/users")
 async def get_users(current_user: dict = Depends(get_current_user)):
@@ -5915,11 +5921,24 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
     })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     update_data = {k: v for k, v in user_data.dict().items() if v is not None}
+
+    # Password reset path — only the Company Owner (super_admin) may set
+    # another user's password. Hash it into password_hash (never store
+    # the raw value) and run the same policy check as everywhere else.
+    new_password = update_data.pop("password", None)
+    if new_password:
+        if current_user["role"] != UserRole.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Only the Company Owner can reset another user's password")
+        validate_password_policy(new_password)
+        update_data["password_hash"] = get_password_hash(new_password)
+        # Clear any legacy hash field so login can't read a stale value.
+        update_data["hashed_password"] = None
+
     if update_data:
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
-    
+
     updated_user = await db.users.find_one({"_id": ObjectId(user_id)})
     # Phase 3 — single sanitizer covers all secret fields.
     return sanitize_user_doc(serialize_doc(updated_user))
