@@ -11837,10 +11837,10 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
 
     # 1. Get all vehicles for this company
     vehicles_cursor = db.vehicles.find(
-        {"company_id": company_id},
+        {"company_id": company_id, **_soft_delete_filter()},
         {"name": 1, "registration_number": 1, "rego_expiry": 1, "insurance_expiry": 1,
          "safety_certificate_expiry": 1, "coi_expiry": 1, "status": 1,
-         "current_odometer": 1}
+         "current_odometer": 1, "custom_fields": 1}
     )
     vehicles = await vehicles_cursor.to_list(1000)
 
@@ -11995,17 +11995,62 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
         # document in the reasons list ("Rego expires in 3d").
         expiry_days_list: list = []
         expiring_docs = []
+        # Bucket helper — matches the Expiry page's five-way colour code so
+        # the deep-link into the vehicle edit form rings the field in the
+        # same colour (owner request 2026-05-29).
+        def _expiry_bucket(days: int) -> str:
+            if days < 0:
+                return "expired"
+            if days <= 7:
+                return "d7"
+            if days <= 21:
+                return "d21"
+            if days <= 45:
+                return "d45"
+            return "d70"
         for field, label in DOC_LABELS.items():
             val = v.get(field)
             if val:
-                try:
-                    exp_dt = datetime.fromisoformat(val[:10])
-                    days = (exp_dt - today_dt).days
-                    expiry_days_list.append((label, days))
-                    if days <= 30:
-                        expiring_docs.append({"name": label, "days_until_expiry": days})
-                except Exception:
-                    pass
+                # parse_date_flexible handles ISO AND DD/MM/YYYY — the old
+                # datetime.fromisoformat silently skipped AU-format dates,
+                # so those expiries were never scored or shown.
+                exp_dt = parse_date_flexible(val)
+                if not exp_dt:
+                    continue
+                days = (exp_dt - today_dt).days
+                expiry_days_list.append((label, days))
+                # Surface every expired OR within-70-day doc (was 30) so
+                # the card lists all of them, and tag with field + bucket
+                # so clicking deep-links to the vehicle edit form.
+                if days <= 70:
+                    expiring_docs.append({
+                        "name": label,
+                        "days_until_expiry": days,
+                        "field": field,
+                        "bucket": _expiry_bucket(days),
+                    })
+        # Vehicle custom-field expiries — same source the Expiry page +
+        # /expiry-summary scan. No single form field to deep-link to, so
+        # field stays null (clicking opens the edit form without a ring).
+        for cf in (v.get("custom_fields") or []):
+            if not isinstance(cf, dict):
+                continue
+            raw = (cf.get("expiry") or "").strip()
+            if not raw:
+                continue
+            exp_dt = parse_date_flexible(raw)
+            if not exp_dt:
+                continue
+            days = (exp_dt - today_dt).days
+            label = cf.get("label") or "Custom document"
+            expiry_days_list.append((label, days))
+            if days <= 70:
+                expiring_docs.append({
+                    "name": label,
+                    "days_until_expiry": days,
+                    "field": None,
+                    "bucket": _expiry_bucket(days),
+                })
         # Last inspection age
         last = last_insp_map.get(vid)
         if last:
@@ -12028,7 +12073,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 d_days = (nsd_dt - today_dt).days
                 if d_days <= 30:
                     expiry_days_list.append(("Next service", d_days))
-                    expiring_docs.append({"name": "Next service due", "days_until_expiry": d_days})
+                    expiring_docs.append({"name": "Next service due", "days_until_expiry": d_days, "field": None, "bucket": _expiry_bucket(d_days)})
             except Exception:
                 pass
         cur_odo = v.get("current_odometer")
@@ -12047,6 +12092,8 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                         else f" (in {int(remaining_km)}km)"
                     ),
                     "days_until_expiry": 0 if remaining_km <= 0 else 7,
+                    "field": None,
+                    "bucket": "expired" if remaining_km <= 0 else "d7",
                 })
         wu_str = latest_warranty_by_v.get(vid)
         if wu_str:
@@ -12055,7 +12102,7 @@ async def get_fleet_health(current_user: dict = Depends(get_current_user)):
                 w_days = (wu_dt - today_dt).days
                 if w_days <= 30:
                     expiry_days_list.append(("Warranty", w_days))
-                    expiring_docs.append({"name": "Warranty", "days_until_expiry": w_days})
+                    expiring_docs.append({"name": "Warranty", "days_until_expiry": w_days, "field": None, "bucket": _expiry_bucket(w_days)})
             except Exception:
                 pass
         # Has grounding defect?
