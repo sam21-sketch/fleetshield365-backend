@@ -7575,7 +7575,10 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
                 },
             }
         )
-    
+        # 2026-05-31 — bust drivers list cache so admin panel reflects
+        # the new license photo without waiting for the TTL.
+        invalidate_cache("drivers", company_id)
+
     return {"message": "License photos uploaded successfully", "updated_fields": list(update_data.keys())}
 
 @api_router.post("/drivers/{driver_id}/license-photos/view")
@@ -7760,7 +7763,10 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
                 },
             }
         )
-    
+        # 2026-05-31 — bust drivers list cache so the admin panel reflects
+        # the new cert photo immediately.
+        invalidate_cache("drivers", company_id)
+
     return {"message": f"{doc_type.replace('_', ' ').title()} uploaded successfully", "updated_fields": list(update_data.keys())}
 
 @api_router.get("/drivers/{driver_id}/documents/{doc_type}")
@@ -9294,6 +9300,13 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
     update_data = {k: v for k, v in update_dict.items() if v is not None}
     if update_data:
         await db.users.update_one({"_id": ObjectId(driver_id)}, {"$set": update_data})
+
+        # 2026-05-31 — bust the drivers list cache so the next GET
+        # /drivers actually reflects the edit. Without this, the admin
+        # panel sees stale rows for up to the cache TTL even though the
+        # DB row was updated correctly.
+        invalidate_cache("drivers", current_user["company_id"])
+        invalidate_cache("dashboard", current_user["company_id"])
 
         # Check for expiring documents in background (don't block response)
         asyncio.create_task(check_driver_expiry_alerts(driver_id, current_user["company_id"]))
