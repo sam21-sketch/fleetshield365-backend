@@ -1739,6 +1739,7 @@ def _persist_custom_documents(
     custom_documents: Optional[List[Any]],
     company_id: str,
     driver_id: str,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> List[dict]:
     """Persist each custom document's front/back to MinIO and return the
     storable shape (label + number + issue + expiry + object keys).
@@ -1788,6 +1789,7 @@ def _persist_custom_documents(
                 f"custom_documents[{idx}].front_base64",
                 expected_company_id=company_id,
                 type_key="driver_doc",
+                background_tasks=background_tasks,
             )
             record["front_object_key"] = key
         back_b64 = doc.get("back_base64")
@@ -1798,6 +1800,7 @@ def _persist_custom_documents(
                 f"custom_documents[{idx}].back_base64",
                 expected_company_id=company_id,
                 type_key="driver_doc",
+                background_tasks=background_tasks,
             )
             record["back_object_key"] = key
         stored.append(record)
@@ -1838,6 +1841,7 @@ def _persist_vehicle_custom_field_docs(
     custom_fields: Optional[List[Any]],
     company_id: str,
     vehicle_id: str,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> Optional[List[dict]]:
     """Persist each custom_field's optional `doc_base64` to MinIO.
 
@@ -1880,6 +1884,7 @@ def _persist_vehicle_custom_field_docs(
                 f"custom_fields[{idx}].doc_base64",
                 expected_company_id=company_id,
                 type_key="vehicle_doc",
+                background_tasks=background_tasks,
             )
             cf["doc_object_key"] = target
         cleaned.append(cf)
@@ -6212,7 +6217,7 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
 # ============== Vehicle Routes ==============
 
 @api_router.post("/vehicles")
-async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user: dict = Depends(require_active_tenant)):
+async def create_vehicle(vehicle: VehicleCreate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(require_active_tenant)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -6272,6 +6277,7 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         # doc_object_key so the base64 never lands in Mongo.
         "custom_fields": _persist_vehicle_custom_field_docs(
             vehicle.custom_fields, company_id, str(vehicle_id),
+            background_tasks=background_tasks,
         ),
         "created_at": utcnow()
     }
@@ -6320,6 +6326,7 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
             field_name,
             expected_company_id=company_id,
             type_key="vehicle_doc",
+            background_tasks=background_tasks,
         )
         vehicle_doc[doc_key] = target
 
@@ -6842,7 +6849,7 @@ async def get_vehicle_history(
 
 
 @api_router.put("/vehicles/{vehicle_id}")
-async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Request, current_user: dict = Depends(get_current_user)):
+async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -6897,6 +6904,7 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
             field_name,
             expected_company_id=company_id,
             type_key="vehicle_doc",
+            background_tasks=background_tasks,
         )
         update_data[doc_key] = target
 
@@ -6911,6 +6919,7 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
         # preserved by the helper.
         update_data["custom_fields"] = _persist_vehicle_custom_field_docs(
             update_data["custom_fields"], company_id, vehicle_id,
+            background_tasks=background_tasks,
         )
 
     if update_data:
@@ -7125,7 +7134,7 @@ async def get_drivers(
     return result
 
 @api_router.post("/drivers")
-async def create_driver(user: UserRegister, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_driver(user: UserRegister, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -7193,6 +7202,7 @@ async def create_driver(user: UserRegister, request: Request, current_user: dict
     # uploads land in the `compliance` bucket scoped to this driver_id.
     custom_documents = _persist_custom_documents(
         user.custom_documents, company_id, str(driver_id),
+        background_tasks=background_tasks,
     )
 
     driver_doc = {
@@ -7512,7 +7522,7 @@ async def download_operator_documents(request: DocumentDownloadRequest, current_
     )
 
 @api_router.post("/drivers/{driver_id}/license-photos")
-async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, current_user: dict = Depends(get_current_user)):
+async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """Upload license photos for a driver - Owner (super_admin) only"""
     # Only super_admin can upload license photos
     if current_user["role"] != UserRole.SUPER_ADMIN:
@@ -7543,6 +7553,7 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
             "front_photo_base64",
             expected_company_id=company_id,
             type_key="license",
+            background_tasks=background_tasks,
         )
         update_data["license_front_object_key"] = front_key
     if photos.back_photo_base64:
@@ -7557,6 +7568,7 @@ async def upload_license_photos(driver_id: str, photos: LicensePhotoUpload, curr
             "back_photo_base64",
             expected_company_id=company_id,
             type_key="license",
+            background_tasks=background_tasks,
         )
         update_data["license_back_object_key"] = back_key
     
@@ -7684,7 +7696,7 @@ class DocumentUpload(BaseModel):
     back_photo_base64: Optional[str] = None
 
 @api_router.post("/drivers/{driver_id}/documents/{doc_type}")
-async def upload_driver_documents(driver_id: str, doc_type: str, photos: DocumentUpload, current_user: dict = Depends(get_current_user)):
+async def upload_driver_documents(driver_id: str, doc_type: str, photos: DocumentUpload, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """Upload documents for a driver - Owner (super_admin) only"""
     # Only super_admin can upload
     if current_user["role"] != UserRole.SUPER_ADMIN:
@@ -7731,6 +7743,7 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
             "front_photo_base64",
             expected_company_id=company_id,
             type_key="driver_doc",
+            background_tasks=background_tasks,
         )
         update_data[front_key_field] = key
     if photos.back_photo_base64:
@@ -7745,6 +7758,7 @@ async def upload_driver_documents(driver_id: str, doc_type: str, photos: Documen
             "back_photo_base64",
             expected_company_id=company_id,
             type_key="driver_doc",
+            background_tasks=background_tasks,
         )
         update_data[back_key_field] = key
     
@@ -9258,7 +9272,7 @@ async def admin_reset_driver_password(driver_id: str, request: AdminResetPasswor
     return {"message": f"PIN reset successfully for {driver.get('name', 'driver')}"}
 
 @api_router.put("/drivers/{driver_id}")
-async def update_driver(driver_id: str, update: DriverUpdate, request: Request, current_user: dict = Depends(get_current_user)):
+async def update_driver(driver_id: str, update: DriverUpdate, request: Request, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """Update driver details including license and training"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -9295,6 +9309,7 @@ async def update_driver(driver_id: str, update: DriverUpdate, request: Request, 
             update_dict["custom_documents"],
             current_user["company_id"],
             driver_id,
+            background_tasks=background_tasks,
         )
 
     update_data = {k: v for k, v in update_dict.items() if v is not None}
