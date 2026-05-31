@@ -5995,6 +5995,26 @@ async def update_user(user_id: str, user_data: UserUpdate, current_user: dict = 
 
     update_data = {k: v for k, v in user_data.dict().items() if v is not None}
 
+    # 2026-05-31 — role change is restricted: only super_admin may change
+    # roles, and only to admin / driver. super_admin role and
+    # platform_owner role are out-of-band concerns; this endpoint must
+    # not be a path to promote yourself or anyone else. We also pin
+    # company_id and is_platform_owner so a crafted body can't change
+    # tenant or grant platform-owner via mass-assignment.
+    requested_role = update_data.pop("role", None)
+    if requested_role is not None:
+        if current_user["role"] != UserRole.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Only the Company Owner can change roles")
+        if requested_role not in (UserRole.ADMIN, UserRole.DRIVER):
+            raise HTTPException(status_code=400, detail="Role must be admin or driver")
+        if str(current_user["_id"]) == user_id:
+            raise HTTPException(status_code=400, detail="You cannot change your own role")
+        update_data["role"] = requested_role
+    # Strip any other privileged fields a client might smuggle through.
+    for blocked in ("company_id", "is_platform_owner", "password_hash",
+                    "hashed_password", "_id", "id"):
+        update_data.pop(blocked, None)
+
     # Password reset path — only the Company Owner (super_admin) may set
     # another user's password. Hash it into password_hash (never store
     # the raw value) and run the same policy check as everywhere else.
@@ -6771,8 +6791,11 @@ async def get_vehicle_history(
     driver_lookup: dict = {}
     if driver_ids:
         try:
+            # 2026-05-31 — tenant-scoped driver name lookup so an
+            # imported history row referencing a foreign driver_id can
+            # never leak a cross-tenant name.
             cursor = db.users.find(
-                {"_id": {"$in": [ObjectId(d) for d in driver_ids if d]}},
+                {"_id": {"$in": [ObjectId(d) for d in driver_ids if d]}, "company_id": current_user["company_id"]},
                 {"name": 1, "username": 1},
             )
             async for u in cursor:
@@ -7181,9 +7204,12 @@ async def create_driver(user: UserRegister, request: Request, background_tasks: 
                         "operator_enabled_at": utcnow()
                     }}
                 )
-                # Return the updated user
+                # Return the updated user — sanitize_user_doc strips
+                # password_hash + offline_cred_hash + failed_login_attempts
+                # + locked_until so the response never leaks secrets.
+                # 2026-05-31 — was missing here, only spotted by audit.
                 updated_user = await db.users.find_one({"_id": existing["_id"]})
-                return serialize_doc(updated_user)
+                return sanitize_user_doc(serialize_doc(updated_user))
             else:
                 raise HTTPException(status_code=400, detail="Email already registered")
 
@@ -7311,6 +7337,16 @@ async def delete_driver(driver_id: str, current_user: dict = Depends(get_current
         {"_id": ObjectId(driver_id)},
         _soft_delete_update(current_user.get("_id")),
     )
+
+    # 2026-05-31 — cascade-clear push tokens so a deleted driver never
+    # receives another notification on their old device. Tokens live in
+    # their own collection and were previously orphaned on delete,
+    # accumulating dead rows + leaking notifications.
+    try:
+        await db.push_tokens.delete_many({"user_id": driver_id})
+    except Exception:
+        # Non-fatal — soft-delete already succeeded, this is best-effort cleanup.
+        pass
 
     # Invalidate cache
     invalidate_cache("drivers", company_id)
@@ -8576,8 +8612,13 @@ async def get_inspections(
         driver_ids = list(set(i.get("driver_id") for i in inspections if i.get("driver_id")))
         vehicle_ids = list(set(i.get("vehicle_id") for i in inspections if i.get("vehicle_id")))
         
-        drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}}).to_list(500)
-        vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}}).to_list(500)
+        # 2026-05-31 — defensive tenant scoping. Even though driver_id /
+        # vehicle_id on an inspection are set at create-time from the
+        # author's company, we still constrain the enrichment lookup so
+        # any stray cross-tenant ID (data import bug, future feature)
+        # can never leak a name/registration into the response.
+        drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}, "company_id": company_id}).to_list(500)
+        vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}, "company_id": company_id}).to_list(500)
         
         drivers, vehicles = await asyncio.gather(drivers_task, vehicles_task)
         
@@ -8688,17 +8729,18 @@ async def get_inspection(inspection_id: str, current_user: dict = Depends(get_cu
             "inspection-photos", inspection["pdf_object_key"]
         )
 
-    # Add driver and vehicle info
+    # 2026-05-31 — tenant-scoped enrichment (see /inspections list above).
+    insp_company_id = inspection.get("company_id")
     if inspection.get("driver_id"):
-        driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"])})
+        driver = await db.users.find_one({"_id": ObjectId(inspection["driver_id"]), "company_id": insp_company_id})
         d_name = driver.get("name", driver.get("full_name", "Unknown")) if driver else "Unknown"
         d_user = driver.get("username", "") if driver else ""
         inspection["driver_name"] = f"{d_name} ({d_user})" if d_user and d_user != d_name else d_name
     else:
         inspection["driver_name"] = "Unknown"
-    
+
     if inspection.get("vehicle_id"):
-        vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"])})
+        vehicle = await db.vehicles.find_one({"_id": ObjectId(inspection["vehicle_id"]), "company_id": insp_company_id})
         v_name = vehicle.get("name", "Unknown") if vehicle else "Unknown"
         v_rego = vehicle.get("registration_number", "") if vehicle else ""
         inspection["vehicle_name"] = f"{v_name} ({v_rego})" if v_rego else v_name
@@ -8898,14 +8940,14 @@ async def get_fuel_submissions(
     ]
     submissions = await db.fuel_submissions.aggregate(pipeline).to_list(actual_limit)
     
-    # Get vehicle names
+    # Get vehicle names — tenant-scoped (defensive, like /inspections).
     vehicle_ids = list(set(s["vehicle_id"] for s in submissions))
-    vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids]}}).to_list(100)
+    vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids]}, "company_id": company_id}).to_list(100)
     vehicle_map = {str(v["_id"]): f"{v['name']} ({v.get('registration_number', '')})" if v.get('registration_number') else v['name'] for v in vehicles}
-    
-    # Get driver names
+
+    # Get driver names — tenant-scoped.
     driver_ids = list(set(s["driver_id"] for s in submissions))
-    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}}).to_list(100)
+    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}, "company_id": company_id}).to_list(100)
     driver_map = {str(d["_id"]): d for d in drivers}
     
     for s in submissions:
@@ -10544,6 +10586,10 @@ async def mark_alert_read(alert_id: str, current_user: dict = Depends(get_curren
         {"_id": ObjectId(alert_id), "company_id": current_user["company_id"]},
         {"$set": {"is_read": True}}
     )
+    # 2026-05-31 — bust cache so the unread count + dashboard reflect
+    # the read state immediately.
+    invalidate_cache("alerts", current_user["company_id"])
+    invalidate_cache("dashboard", current_user["company_id"])
     return {"message": "Alert marked as read"}
 
 # ============== Incident Reports ==============
@@ -10875,12 +10921,15 @@ async def export_incidents_csv(
         # incidents.created_at is stored as a Python datetime (see create
         # handler ~line 10206). Compare against datetime bounds, not
         # strings — a string $gte against a Mongo Date never matches.
+        # 2026-05-31 — parse as UTC-aware datetimes so the bounds compare
+        # cleanly with the timezone-aware values stored in Mongo. Naive
+        # datetimes here were silently off by the server's TZ offset.
         date_filter: dict = {}
         try:
             if date_from:
-                date_filter["$gte"] = datetime.fromisoformat(date_from)
+                date_filter["$gte"] = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
             if date_to:
-                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59").replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
@@ -11041,12 +11090,15 @@ async def export_incidents_pdf(
         # incidents.created_at is stored as a Python datetime (see create
         # handler ~line 10206). Compare against datetime bounds, not
         # strings — a string $gte against a Mongo Date never matches.
+        # 2026-05-31 — parse as UTC-aware datetimes so the bounds compare
+        # cleanly with the timezone-aware values stored in Mongo. Naive
+        # datetimes here were silently off by the server's TZ offset.
         date_filter: dict = {}
         try:
             if date_from:
-                date_filter["$gte"] = datetime.fromisoformat(date_from)
+                date_filter["$gte"] = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
             if date_to:
-                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59").replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
@@ -11068,11 +11120,12 @@ async def export_incidents_pdf(
 
     vehicle_id_set = {str(i.get("vehicle_id")) for i in incidents if i.get("vehicle_id")}
     driver_id_set = {str(i.get("driver_id")) for i in incidents if i.get("driver_id")}
+    # 2026-05-31 — tenant-scoped enrichment so cross-tenant IDs never leak.
     vehicles = await db.vehicles.find(
-        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}}
+        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}, "company_id": company_id}
     ).to_list(len(vehicle_id_set)) if vehicle_id_set else []
     drivers = await db.users.find(
-        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}}
+        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}, "company_id": company_id}
     ).to_list(len(driver_id_set)) if driver_id_set else []
     vehicle_map = {str(v["_id"]): v for v in vehicles}
     driver_map = {str(d["_id"]): d for d in drivers}
@@ -11419,12 +11472,15 @@ async def _export_incidents_pdf_unused() -> None:
         # incidents.created_at is stored as a Python datetime (see create
         # handler ~line 10206). Compare against datetime bounds, not
         # strings — a string $gte against a Mongo Date never matches.
+        # 2026-05-31 — parse as UTC-aware datetimes so the bounds compare
+        # cleanly with the timezone-aware values stored in Mongo. Naive
+        # datetimes here were silently off by the server's TZ offset.
         date_filter: dict = {}
         try:
             if date_from:
-                date_filter["$gte"] = datetime.fromisoformat(date_from)
+                date_filter["$gte"] = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
             if date_to:
-                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59")
+                date_filter["$lte"] = datetime.fromisoformat(date_to + "T23:59:59").replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="date_from/date_to must be ISO yyyy-mm-dd")
         query["created_at"] = date_filter
@@ -11450,11 +11506,12 @@ async def _export_incidents_pdf_unused() -> None:
 
     vehicle_id_set = {str(i.get("vehicle_id")) for i in incidents if i.get("vehicle_id")}
     driver_id_set = {str(i.get("driver_id")) for i in incidents if i.get("driver_id")}
+    # 2026-05-31 — tenant-scoped enrichment so cross-tenant IDs never leak.
     vehicles = await db.vehicles.find(
-        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}}
+        {"_id": {"$in": [ObjectId(v) for v in vehicle_id_set]}, "company_id": company_id}
     ).to_list(len(vehicle_id_set)) if vehicle_id_set else []
     drivers = await db.users.find(
-        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}}
+        {"_id": {"$in": [ObjectId(d) for d in driver_id_set]}, "company_id": company_id}
     ).to_list(len(driver_id_set)) if driver_id_set else []
     vehicle_map = {str(v["_id"]): v for v in vehicles}
     driver_map = {str(d["_id"]): d for d in drivers}
@@ -11672,7 +11729,12 @@ async def update_incident(
         {"_id": ObjectId(incident_id), "company_id": company_id},
         {"$set": update_data}
     )
-    
+    # 2026-05-31 — bust the incidents + dashboard cache so the admin
+    # panel reflects status/severity edits immediately. Without this,
+    # changes were stale until the TTL expired.
+    invalidate_cache("incidents", company_id)
+    invalidate_cache("dashboard", company_id)
+
     # Return updated incident
     updated = await db.incidents.find_one({"_id": ObjectId(incident_id)})
     return serialize_doc(updated)
@@ -13197,8 +13259,24 @@ async def restore_deleted_doc(
     # Bust caches that may have memoised the empty-of-this-row state.
     if collection == "vehicles":
         invalidate_cache("vehicles", company_id)
+        invalidate_cache("dashboard", company_id)
+        # 2026-05-31 — restore must mirror create-side bookkeeping.
+        # The delete path decrements `active_vehicles_count`; without
+        # this counter-increment on restore, the company doc drifts and
+        # Stripe per-vehicle billing under-charges over time.
+        try:
+            await db.companies.update_one(
+                {"_id": ObjectId(company_id)},
+                {"$inc": {"active_vehicles_count": 1}},
+            )
+        except Exception:
+            pass
     elif collection == "users":
         invalidate_cache("drivers", company_id)
+        invalidate_cache("dashboard", company_id)
+    elif collection == "incidents":
+        invalidate_cache("incidents", company_id)
+        invalidate_cache("dashboard", company_id)
     return {"message": "Restored", "collection": collection, "id": doc_id}
 
 
