@@ -15100,6 +15100,18 @@ async def get_developer_company_details(
             "email": company.get("email", ""),
             "created_at": company.get("created_at").isoformat() if isinstance(company.get("created_at"), datetime) else str(company.get("created_at", "")),
             "subscription_plan": company.get("subscription_plan", "trial"),
+            # 2026-05-31 — owner panel needs these fields to render the
+            # company detail card properly (current state was just
+            # name/users/vehicles which hid suspension + sub status).
+            "subscription_status": company.get("subscription_status"),
+            "subdomain": company.get("subdomain"),
+            "max_vehicles": company.get("max_vehicles"),
+            "trial_end": company.get("trial_end"),
+            "suspended": bool(company.get("suspended", False)),
+            "suspended_at": company.get("suspended_at"),
+            "suspended_reason": company.get("suspended_reason"),
+            "country": company.get("country"),
+            "timezone": company.get("timezone"),
             "users": users,
             "vehicles": vehicles,
             "stats": {
@@ -15108,6 +15120,8 @@ async def get_developer_company_details(
                 "inspections_this_week": recent_inspections
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Developer company details error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -15164,13 +15178,25 @@ async def toggle_user_freeze(
         logger.error(f"Developer freeze user error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+class DeveloperResetPasswordBody(BaseModel):
+    new_password: str
+
+
 @api_router.put("/developer/users/{user_id}/reset-password")
 async def reset_user_password(
     user_id: str,
-    new_password: str = "temp123",
+    body: DeveloperResetPasswordBody,
     current_user: dict = Depends(require_platform_owner),
 ):
-    """Reset a user's password (developer emergency access)"""
+    """Reset a user's password (developer emergency access).
+
+    2026-05-31 — owner-panel was sending `{new_password: "..."}` in the
+    JSON body but the previous signature declared `new_password: str` as
+    a query parameter, so FastAPI always saw the default `"temp123"`
+    and the real value was silently dropped. Now we read from a Pydantic
+    body model so the frontend's payload actually lands.
+    """
+    new_password = body.new_password
     try:
         validate_password_policy(new_password)
         target = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 1})
@@ -15192,6 +15218,11 @@ async def reset_user_password(
             raise HTTPException(status_code=404, detail="User not found")
 
         return {"message": "Password reset successfully", "temp_password": new_password}
+    except HTTPException:
+        # 2026-05-31 — re-raise custom 4xx so the client sees the real
+        # status (e.g. "password must differ from current"); the generic
+        # except below was wrapping every error as 500.
+        raise
     except Exception as e:
         logger.error(f"Developer reset password error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
