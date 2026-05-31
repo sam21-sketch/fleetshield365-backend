@@ -3527,7 +3527,7 @@ class VehicleCreate(BaseModel):
     assigned_driver_ids: Optional[List[str]] = None
     # Phase 2.2 — optional image, free-text notes, owner-defined extras.
     image_base64: Optional[str] = None
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(None, max_length=2000)
     custom_fields: Optional[List[VehicleCustomField]] = None
     # 2026-05-20 — image OR PDF for each of the four expiry documents.
     # The form already collects the EXPIRY DATE; this adds the supporting
@@ -3660,17 +3660,17 @@ class ServiceRecordCreate(BaseModel):
     vehicle_id: str
     service_date: str  # YYYY-MM-DD
     service_type: ServiceType
-    service_type_other: Optional[str] = None  # For "other" type
-    description: str
+    service_type_other: Optional[str] = Field(None, max_length=80)
+    description: str = Field(..., max_length=5000)
     cost: Optional[float] = None
     odometer_reading: Optional[int] = None
-    technician_name: Optional[str] = None
-    workshop_name: Optional[str] = None
-    next_service_date: Optional[str] = None  # Scheduled next service
-    next_service_odometer: Optional[int] = None  # Or at this odometer
-    attachments: Optional[List[str]] = []  # Base64 encoded photos/docs
-    warranty_until: Optional[str] = None  # Warranty expiry date
-    warranty_notes: Optional[str] = None  # Warranty details
+    technician_name: Optional[str] = Field(None, max_length=120)
+    workshop_name: Optional[str] = Field(None, max_length=120)
+    next_service_date: Optional[str] = None
+    next_service_odometer: Optional[int] = None
+    attachments: Optional[List[str]] = []
+    warranty_until: Optional[str] = None
+    warranty_notes: Optional[str] = Field(None, max_length=2000)
 
 class ServiceRecordUpdate(BaseModel):
     service_date: Optional[str] = None
@@ -3776,17 +3776,17 @@ class IncidentCreate(BaseModel):
     # and gets stored as the display name (no MinIO key prefix issues
     # because there's no vehicle row to reference).
     vehicle_id: Optional[str] = None
-    vehicle_other_label: Optional[str] = None
-    description: str
-    severity: str = IncidentSeverity.MODERATE  # minor, moderate, severe
-    location_address: Optional[str] = None
+    vehicle_other_label: Optional[str] = Field(None, max_length=120)
+    description: str = Field(..., max_length=5000)
+    severity: str = IncidentSeverity.MODERATE
+    location_address: Optional[str] = Field(None, max_length=300)
     gps_latitude: Optional[float] = None
     gps_longitude: Optional[float] = None
     other_party: OtherPartyDetails
     witnesses: Optional[List[WitnessDetails]] = []
-    police_report_number: Optional[str] = None
+    police_report_number: Optional[str] = Field(None, max_length=80)
     injuries_occurred: bool = False
-    injury_description: Optional[str] = None
+    injury_description: Optional[str] = Field(None, max_length=2000)
     damage_photos: List[str] = []  # Base64 encoded photos
     other_vehicle_photos: List[str] = []  # Base64 encoded photos
     scene_photos: List[str] = []  # Base64 encoded photos
@@ -9757,7 +9757,12 @@ async def get_service_records(
     """Get all service records with optional filtering"""
     if current_user["role"] not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # 2026-05-31 — clamp pagination so a malicious `?limit=999999&skip=999999`
+    # can't trigger a Mongo full-collection scan + huge serializer load.
+    limit = max(1, min(int(limit), 500))
+    skip = max(0, min(int(skip), 100_000))
+
     company_id = current_user["company_id"]
     # Phase 4 — exclude soft-deleted rows by default.
     query = {**_soft_delete_filter(), "company_id": company_id}
@@ -9775,10 +9780,10 @@ async def get_service_records(
             {"workshop_name": {"$regex": search, "$options": "i"}},
             {"service_type_other": {"$regex": search, "$options": "i"}}
         ]
-    
+
     # Get total count for pagination
     total = await db.service_records.count_documents(query)
-    
+
     # Get records sorted by service date (newest first)
     records = await db.service_records.find(query).sort("service_date", -1).skip(skip).limit(limit).to_list(limit)
     
@@ -10842,6 +10847,10 @@ async def get_incidents(
     skip: int = 0
 ):
     """Get all incidents for the company - OPTIMIZED"""
+    # 2026-05-31 — clamp pagination to prevent malicious giant scans.
+    limit = max(1, min(int(limit), 500))
+    skip = max(0, min(int(skip), 100_000))
+
     company_id = current_user["company_id"]
 
     # Phase 4 — exclude soft-deleted incidents by default.
