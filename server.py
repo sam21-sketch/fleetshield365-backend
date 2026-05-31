@@ -1834,6 +1834,76 @@ def _attach_custom_document_urls(user_doc: Optional[dict]) -> Optional[dict]:
     return user_doc
 
 
+def _persist_vehicle_custom_field_docs(
+    custom_fields: Optional[List[Any]],
+    company_id: str,
+    vehicle_id: str,
+) -> Optional[List[dict]]:
+    """Persist each custom_field's optional `doc_base64` to MinIO.
+
+    Returns the storable list of dicts with `doc_base64` swapped for
+    `doc_object_key`. Existing `doc_object_key` values are preserved when
+    no new `doc_base64` is provided (edit flow). Empty/missing rows fall
+    through untouched. Caller is responsible for assigning the return to
+    the vehicle doc's `custom_fields` field.
+    """
+    if not custom_fields:
+        return None
+    cleaned: List[dict] = []
+    for idx, raw in enumerate(custom_fields):
+        if hasattr(raw, "model_dump"):
+            cf = raw.model_dump()
+        elif hasattr(raw, "dict"):
+            cf = raw.dict()
+        elif isinstance(raw, dict):
+            cf = dict(raw)
+        else:
+            continue
+        # Preserve existing object key when the client sent the full row back
+        # without a new upload.
+        b64 = cf.pop("doc_base64", None)
+        if b64:
+            try:
+                raw_bytes = base64.b64decode(
+                    object_store._DATA_URL_PREFIX_RE.sub("", b64).strip(),
+                    validate=True,
+                )
+                detected = _detect_format(raw_bytes)
+                ext = {"jpeg": "jpg", "png": "png", "webp": "webp", "pdf": "pdf"}.get(detected, "bin")
+            except Exception:
+                ext = "bin"
+            target = (
+                f"vehicle-docs/{company_id}/{vehicle_id}/custom/{idx}.{ext}"
+            )
+            _upload_base64_or_400(
+                "compliance", target, b64, ext,
+                f"custom_fields[{idx}].doc_base64",
+                expected_company_id=company_id,
+                type_key="vehicle_doc",
+            )
+            cf["doc_object_key"] = target
+        cleaned.append(cf)
+    return cleaned[:10] if cleaned else None
+
+
+def _attach_vehicle_custom_field_urls(vehicle_doc: Optional[dict]) -> Optional[dict]:
+    """Attach presigned `doc_url` to each `custom_fields` entry that has
+    an object key. Mutates and returns the vehicle doc. No-op when the
+    vehicle has no custom fields or none of them carry a doc."""
+    if not vehicle_doc or not isinstance(vehicle_doc.get("custom_fields"), list):
+        return vehicle_doc
+    for cf in vehicle_doc["custom_fields"]:
+        if not isinstance(cf, dict):
+            continue
+        key = cf.get("doc_object_key")
+        if key:
+            try:
+                cf["doc_url"] = object_store.presign_get("compliance", key)
+            except Exception:
+                cf["doc_url"] = None
+    return vehicle_doc
+
+
 def reject_same_password(new_password: str, current_hash: Optional[str]) -> None:
     """Reject when the proposed password matches the user's current one.
 
@@ -3430,6 +3500,12 @@ class VehicleCustomField(BaseModel):
     # COI do. DD/MM/YYYY format (parse_date_flexible handles parsing).
     issue: Optional[str] = None
     expiry: Optional[str] = None
+    # 2026-05-31 — supporting doc (image or PDF) for each custom field.
+    # Frontend sends `doc_base64`; backend uploads to MinIO and replaces
+    # with `doc_object_key`. The read path attaches `doc_url` (presigned)
+    # so the UI can render a "View attached" link.
+    doc_base64: Optional[str] = None
+    doc_object_key: Optional[str] = None
 
 class VehicleCreate(BaseModel):
     name: str
@@ -6191,8 +6267,11 @@ async def create_vehicle(vehicle: VehicleCreate, request: Request, current_user:
         # custom_fields are persisted directly; the photo goes to MinIO
         # and only the object key is stored on the doc.
         "notes": (vehicle.notes or "").strip()[:2000] or None,
-        "custom_fields": (
-            [cf.dict() for cf in (vehicle.custom_fields or [])][:10] or None
+        # 2026-05-31 — custom_fields can carry an optional doc_base64
+        # (image or PDF). Helper uploads to MinIO and swaps in
+        # doc_object_key so the base64 never lands in Mongo.
+        "custom_fields": _persist_vehicle_custom_field_docs(
+            vehicle.custom_fields, company_id, str(vehicle_id),
         ),
         "created_at": utcnow()
     }
@@ -6492,6 +6571,8 @@ def _attach_vehicle_image_url(vehicle_doc: dict) -> dict:
                 vehicle_doc[url_field] = _presign_if_key("compliance", key)
             except Exception:
                 vehicle_doc[url_field] = None
+    # 2026-05-31 — also presign each custom_field's optional doc.
+    _attach_vehicle_custom_field_urls(vehicle_doc)
     return vehicle_doc
 
 
@@ -6824,9 +6905,12 @@ async def update_vehicle(vehicle_id: str, update: VehicleUpdate, request: Reques
     if "notes" in update_data and update_data["notes"] is not None:
         update_data["notes"] = update_data["notes"].strip()[:2000] or None
     if "custom_fields" in update_data and update_data["custom_fields"] is not None:
-        update_data["custom_fields"] = (
-            [cf.dict() if hasattr(cf, "dict") else cf for cf in update_data["custom_fields"]][:10]
-            or None
+        # 2026-05-31 — full-replace pattern. Helper uploads any new
+        # doc_base64 to MinIO and swaps in doc_object_key. Existing
+        # doc_object_key values on rows without a new doc_base64 are
+        # preserved by the helper.
+        update_data["custom_fields"] = _persist_vehicle_custom_field_docs(
+            update_data["custom_fields"], company_id, vehicle_id,
         )
 
     if update_data:
