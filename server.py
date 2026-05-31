@@ -16006,9 +16006,18 @@ class BroadcastRequest(BaseModel):
 @api_router.post("/developer/broadcast")
 async def developer_broadcast(
     payload: BroadcastRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_platform_owner),
 ):
-    """Send a broadcast email to every super_admin (per filter)."""
+    """Queue a broadcast email to every super_admin (per filter).
+
+    2026-05-31 — was sending emails synchronously inside the request
+    handler, which hung for ~3 s per recipient and tripped the axios /
+    Cloudflare timeouts once the platform had more than a handful of
+    tenants. Now we look up recipients synchronously (so we can return
+    the count) and fire the SMTP loop as a BackgroundTask. The HTTP
+    response returns immediately with `{queued, recipients}`.
+    """
     subj = (payload.subject or "").strip()
     body = (payload.body or "").strip()
     if not subj or not body:
@@ -16025,21 +16034,19 @@ async def developer_broadcast(
         raise HTTPException(status_code=429, detail="Broadcasts are limited to one per minute")
     _BROADCAST_LAST_RUN["at"] = now
 
-    # Resolve company filter
     company_query: dict = {}
     if payload.active_only:
-        # Treat anything that's not explicitly "trial_expired" or
-        # "suspended" as active.
         company_query["subscription_status"] = {"$nin": ["trial_expired", "suspended"]}
     co_docs = await db.companies.find(company_query, {"_id": 1}).to_list(2000)
     co_ids = [str(c["_id"]) for c in co_docs]
     if not co_ids:
-        return {"sent": 0, "failed": 0, "recipients": 0}
+        return {"queued": 0, "recipients": 0}
 
     recipients = await db.users.find(
         {"company_id": {"$in": co_ids}, "role": UserRole.SUPER_ADMIN},
         {"email": 1, "name": 1},
     ).to_list(5000)
+    addresses = [r["email"] for r in recipients if r.get("email")]
 
     html_body = (
         "<div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">"
@@ -16049,29 +16056,32 @@ async def developer_broadcast(
         + "</div>"
     )
 
-    sent = 0
-    failed = 0
-    for r in recipients:
-        addr = r.get("email")
-        if not addr:
-            continue
+    async def _fire_broadcast(addrs: List[str], subj_: str, body_: str, actor_id: str) -> None:
+        sent = 0
+        failed = 0
+        for addr in addrs:
+            try:
+                if "send_system_email" in globals():
+                    await send_system_email(addr, subj_, body_)
+                else:
+                    await send_email_notification(addr, subj_, body_)
+                sent += 1
+            except Exception:
+                failed += 1
         try:
-            await send_system_email(addr, subj, html_body) if "send_system_email" in globals() else await send_email_notification(addr, subj, html_body)
-            sent += 1
+            await log_audit_trail(
+                actor_id, "broadcast", "platform_email", "broadcast",
+                "platform-owner-panel",
+                {"subject": subj_, "sent": sent, "failed": failed,
+                 "recipients": len(addrs)},
+            )
         except Exception:
-            failed += 1
+            pass
 
-    try:
-        await log_audit_trail(
-            str(current_user.get("_id")),
-            "broadcast", "platform_email", "broadcast",
-            "platform-owner-panel",
-            {"subject": subj, "sent": sent, "failed": failed, "active_only": payload.active_only},
-        )
-    except Exception:
-        pass
-
-    return {"sent": sent, "failed": failed, "recipients": len(recipients)}
+    background_tasks.add_task(
+        _fire_broadcast, addresses, subj, html_body, str(current_user.get("_id")),
+    )
+    return {"queued": len(addresses), "recipients": len(addresses)}
 
 
 # ============== Owner-panel: org summary + charts ==============
