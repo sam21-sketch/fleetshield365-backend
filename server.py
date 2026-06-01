@@ -14555,6 +14555,222 @@ async def create_billing_portal_session(
         raise HTTPException(status_code=500, detail=f"Could not open billing portal: {e}")
 
 
+# ============== Rich billing details (Settings → Billing) ==============
+#
+# Surfaces a structured view of: current plan, monthly breakdown, this
+# period's accrual, last paid invoice, upcoming invoice estimate, and
+# the last 12 paid invoices. Pulls live from Stripe so the UI always
+# matches reality (Mongo state can drift if a webhook ever gets missed).
+#
+# Returns gracefully when Stripe isn't configured OR the tenant has
+# never subscribed — UI handles the "free/founding" case from the
+# resulting flags.
+
+def _stripe_to_dict(obj):
+    """StripeObject → plain dict, deep. v8+ breaks `.get` on the live
+    object, so JSON-roundtripping (preferred) or .to_dict() is the safe
+    way to read fields."""
+    try:
+        if hasattr(obj, "to_dict_recursive"):
+            return obj.to_dict_recursive()
+        if hasattr(obj, "to_dict"):
+            return obj.to_dict()
+    except Exception:
+        pass
+    return dict(obj) if obj else {}
+
+
+def _epoch_iso(ts):
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None).isoformat()
+    except Exception:
+        return None
+
+
+@api_router.get("/billing/details")
+async def get_billing_details(current_user: dict = Depends(get_current_user)):
+    """Rich billing summary for the Settings → Billing tab."""
+    if current_user.get("role") not in (UserRole.SUPER_ADMIN, UserRole.ADMIN):
+        raise HTTPException(status_code=403, detail="Only owners and admins can view billing")
+
+    company_id = current_user.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="User has no company")
+
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    pricing = await get_pricing()
+    trial_status = await get_trial_status(company_id)
+    customer_id = company.get("stripe_customer_id")
+    subscription_id = company.get("stripe_subscription_id")
+    sub_status_norm = (company.get("subscription_status") or "").lower()
+    is_subscribed = bool(subscription_id) and sub_status_norm not in ("canceled", "cancelled")
+
+    active_vehicles = await db.vehicles.count_documents({
+        **_soft_delete_filter(),
+        "company_id": company_id,
+    })
+
+    base_payload = {
+        "stripe_configured": bool(stripe.api_key),
+        "is_subscribed": is_subscribed,
+        "subscription_status": company.get("subscription_status"),
+        "currency": pricing.get("currency", "AUD"),
+        "active_vehicles": active_vehicles,
+        "pricing": {
+            "base_price": pricing["base_price"],
+            "per_vehicle": pricing["per_vehicle"],
+            "trial_days": pricing["trial_days"],
+            "currency": pricing.get("currency", "AUD"),
+        },
+        "trial": {
+            "status": trial_status.get("status"),
+            "days_left": trial_status.get("days_left"),
+            "trial_end": trial_status.get("trial_end"),
+            "enabled": pricing.get("trial_enabled", True),
+        },
+        "plan": None,
+        "this_period": None,
+        "last_invoice": None,
+        "upcoming_invoice": None,
+        "invoices": [],
+        "fetch_error": None,
+    }
+
+    if not stripe.api_key or not is_subscribed or not subscription_id:
+        return base_payload
+
+    # Pull live from Stripe. Every call wrapped so an outage gives a
+    # graceful "fetch_error" instead of a 500.
+    try:
+        sub_obj = stripe.Subscription.retrieve(
+            subscription_id, expand=["items.data.price"],
+        )
+        sub = _stripe_to_dict(sub_obj)
+
+        # Top-level current_period_end (older API) OR items[0].current_period_end (2025+).
+        period_end_epoch = sub.get("current_period_end")
+        period_start_epoch = sub.get("current_period_start")
+        items = (sub.get("items") or {}).get("data") or []
+        if not period_end_epoch and items:
+            period_end_epoch = items[0].get("current_period_end")
+            period_start_epoch = items[0].get("current_period_start")
+
+        # Build a normalised line-item view + monthly total.
+        norm_items = []
+        monthly_total_cents = 0
+        for it in items:
+            price = it.get("price") or {}
+            unit_amount = int(price.get("unit_amount") or 0)
+            qty = int(it.get("quantity") or 0)
+            monthly_total_cents += unit_amount * qty
+            product = price.get("product")
+            name = ""
+            if isinstance(product, dict):
+                name = product.get("name") or ""
+            elif isinstance(product, str):
+                # Product was returned by id only — best-effort fetch.
+                try:
+                    pobj = _stripe_to_dict(stripe.Product.retrieve(product))
+                    name = pobj.get("name") or ""
+                except Exception:
+                    pass
+            norm_items.append({
+                "name": name or "Subscription item",
+                "quantity": qty,
+                "unit_amount_cents": unit_amount,
+                "subtotal_cents": unit_amount * qty,
+                "currency": (price.get("currency") or "aud").lower(),
+                "recurring_interval": (price.get("recurring") or {}).get("interval") or "month",
+            })
+
+        base_payload["plan"] = {
+            "name": "Pro — Monthly" if sub_status_norm in ("active", "trialing", "past_due") else "Pro — Monthly (inactive)",
+            "status": sub.get("status") or sub_status_norm,
+            "monthly_total_cents": monthly_total_cents,
+            "currency": (norm_items[0]["currency"] if norm_items else "aud"),
+            "items": norm_items,
+            "cancel_at_period_end": bool(sub.get("cancel_at_period_end")),
+            "current_period_start": _epoch_iso(period_start_epoch),
+            "current_period_end": _epoch_iso(period_end_epoch),
+            "trial_end": _epoch_iso(sub.get("trial_end")),
+            "next_charge_at": _epoch_iso(period_end_epoch),
+        }
+
+        # This-period accrual estimate. Linear daily slice — Stripe's real
+        # proration logic for mid-period changes is more sophisticated but
+        # this gives the owner an honest "how much has built up so far".
+        if period_start_epoch and period_end_epoch:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            total_secs = int(period_end_epoch) - int(period_start_epoch)
+            elapsed = max(0, min(int(now_ts) - int(period_start_epoch), total_secs))
+            if total_secs > 0:
+                accrued_cents = int(monthly_total_cents * elapsed / total_secs)
+                base_payload["this_period"] = {
+                    "period_start": _epoch_iso(period_start_epoch),
+                    "period_end": _epoch_iso(period_end_epoch),
+                    "days_in_period": max(1, total_secs // 86400),
+                    "days_elapsed": elapsed // 86400,
+                    "accrued_cents": accrued_cents,
+                    "total_at_period_end_cents": monthly_total_cents,
+                }
+    except Exception as exc:
+        logger.exception("billing/details: subscription fetch failed")
+        base_payload["fetch_error"] = "Could not load live Stripe subscription details"
+
+    # Last paid invoice
+    try:
+        if customer_id:
+            inv_list = stripe.Invoice.list(customer=customer_id, limit=12)
+            invoices_raw = [_stripe_to_dict(i) for i in (inv_list.data or [])]
+            invoices_clean = []
+            for inv in invoices_raw:
+                invoices_clean.append({
+                    "id": inv.get("id"),
+                    "number": inv.get("number"),
+                    "status": inv.get("status"),
+                    "amount_paid_cents": int(inv.get("amount_paid") or 0),
+                    "amount_due_cents": int(inv.get("amount_due") or 0),
+                    "currency": (inv.get("currency") or "aud").lower(),
+                    "created_at": _epoch_iso(inv.get("created")),
+                    "paid_at": _epoch_iso(inv.get("status_transitions", {}).get("paid_at")) if isinstance(inv.get("status_transitions"), dict) else None,
+                    "hosted_invoice_url": inv.get("hosted_invoice_url"),
+                    "invoice_pdf": inv.get("invoice_pdf"),
+                    "period_start": _epoch_iso(inv.get("period_start")),
+                    "period_end": _epoch_iso(inv.get("period_end")),
+                })
+            base_payload["invoices"] = invoices_clean
+            paid = [i for i in invoices_clean if i["status"] == "paid"]
+            if paid:
+                base_payload["last_invoice"] = paid[0]
+    except Exception:
+        logger.exception("billing/details: invoice fetch failed")
+
+    # Upcoming invoice preview (next charge)
+    try:
+        if customer_id and subscription_id:
+            upcoming_raw = _stripe_to_dict(
+                stripe.Invoice.upcoming(customer=customer_id, subscription=subscription_id)
+            )
+            base_payload["upcoming_invoice"] = {
+                "amount_due_cents": int(upcoming_raw.get("amount_due") or 0),
+                "currency": (upcoming_raw.get("currency") or "aud").lower(),
+                "next_payment_attempt": _epoch_iso(upcoming_raw.get("next_payment_attempt")),
+                "period_start": _epoch_iso(upcoming_raw.get("period_start")),
+                "period_end": _epoch_iso(upcoming_raw.get("period_end")),
+            }
+    except Exception:
+        # Stripe returns 404 here when there's no upcoming invoice (e.g.
+        # subscription is cancelled). Silent skip is intentional.
+        pass
+
+    return base_payload
+
+
 @api_router.get("/subscription")
 async def get_subscription(current_user: dict = Depends(get_current_user)):
     """Subscription snapshot for the admin billing page. Phase 6
