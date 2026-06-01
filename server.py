@@ -8617,8 +8617,9 @@ async def get_inspections(
         # author's company, we still constrain the enrichment lookup so
         # any stray cross-tenant ID (data import bug, future feature)
         # can never leak a name/registration into the response.
-        drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}, "company_id": company_id}).to_list(500)
-        vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}, "company_id": company_id}).to_list(500)
+        tenant_id = current_user["company_id"]
+        drivers_task = db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids if did]}, "company_id": tenant_id}).to_list(500)
+        vehicles_task = db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids if vid]}, "company_id": tenant_id}).to_list(500)
         
         drivers, vehicles = await asyncio.gather(drivers_task, vehicles_task)
         
@@ -8941,13 +8942,14 @@ async def get_fuel_submissions(
     submissions = await db.fuel_submissions.aggregate(pipeline).to_list(actual_limit)
     
     # Get vehicle names — tenant-scoped (defensive, like /inspections).
+    tenant_id = current_user["company_id"]
     vehicle_ids = list(set(s["vehicle_id"] for s in submissions))
-    vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids]}, "company_id": company_id}).to_list(100)
+    vehicles = await db.vehicles.find({"_id": {"$in": [ObjectId(vid) for vid in vehicle_ids]}, "company_id": tenant_id}).to_list(100)
     vehicle_map = {str(v["_id"]): f"{v['name']} ({v.get('registration_number', '')})" if v.get('registration_number') else v['name'] for v in vehicles}
 
     # Get driver names — tenant-scoped.
     driver_ids = list(set(s["driver_id"] for s in submissions))
-    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}, "company_id": company_id}).to_list(100)
+    drivers = await db.users.find({"_id": {"$in": [ObjectId(did) for did in driver_ids]}, "company_id": tenant_id}).to_list(100)
     driver_map = {str(d["_id"]): d for d in drivers}
     
     for s in submissions:
