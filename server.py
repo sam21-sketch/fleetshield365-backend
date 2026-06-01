@@ -14404,9 +14404,35 @@ async def create_upgrade_checkout(
     per_vehicle = pricing_now["per_vehicle"]
     currency = (pricing_now.get("currency") or "AUD").lower()
 
-    # Re-use existing Stripe customer if registration created one.
+    # Re-use existing Stripe customer if registration created one — but
+    # validate it actually exists in the current Stripe mode. A tenant
+    # whose `stripe_customer_id` was minted while we were in test mode
+    # can't be re-used after a swap to live (and vice versa); we detect
+    # the 404 and mint a fresh customer instead of crashing. Stripe's
+    # error class path differs between v7/v8/v9+ — match by message
+    # content so we work across versions.
     customer_id = company.get("stripe_customer_id")
     try:
+        if customer_id:
+            try:
+                stripe.Customer.retrieve(customer_id)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "no such customer" in msg or "similar object exists in" in msg:
+                    logger.info(
+                        f"upgrade_checkout: stale customer_id {customer_id} for company {company_id} "
+                        f"(test/live mode mismatch); creating fresh customer"
+                    )
+                    customer_id = None
+                    # Stale subscription id is paired with the stale
+                    # customer — clear it too so the webhook handler
+                    # doesn't try to look up a non-existent sub.
+                    await db.companies.update_one(
+                        {"_id": ObjectId(company_id)},
+                        {"$unset": {"stripe_subscription_id": "", "subscription_ends_at": "", "next_payment_attempt_at": ""}},
+                    )
+                else:
+                    raise
         if not customer_id:
             customer = stripe.Customer.create(
                 email=current_user.get("email"),
@@ -14551,6 +14577,22 @@ async def create_billing_portal_session(
         )
         return {"url": session.url}
     except Exception as e:
+        msg = str(e).lower()
+        if "no such customer" in msg or "similar object exists in" in msg:
+            # Stale customer id (e.g., test → live mode swap). Clear it so
+            # the next Upgrade Now click creates a fresh customer.
+            await db.companies.update_one(
+                {"_id": ObjectId(company_id)},
+                {"$unset": {"stripe_customer_id": "", "stripe_subscription_id": "", "subscription_ends_at": ""}},
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Your previous subscription was in our test environment and isn't "
+                    "available in live mode. Click 'Upgrade Now' to start a fresh "
+                    "subscription with current pricing."
+                ),
+            )
         logger.error(f"create_billing_portal_session failed for {company_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not open billing portal: {e}")
 
