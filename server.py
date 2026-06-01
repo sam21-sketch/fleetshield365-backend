@@ -2496,7 +2496,9 @@ async def require_active_subscription(
         {
             "subscription_status": 1,
             "trial_ends_at": 1,
+            "trial_end": 1,
             "subscription_ends_at": 1,
+            "next_payment_attempt_at": 1,
         },
     )
     if not company:
@@ -2504,15 +2506,40 @@ async def require_active_subscription(
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     sub_status = (company.get("subscription_status") or "").lower()
+    # Both `trial_ends_at` (newer field) and `trial_end` (legacy string)
+    # are honoured so older tenants don't get locked out by a schema-rename.
     trial_ends = company.get("trial_ends_at")
+    if not isinstance(trial_ends, datetime):
+        legacy = company.get("trial_end")
+        if isinstance(legacy, str):
+            try:
+                trial_ends = datetime.fromisoformat(legacy.replace("Z", "+00:00"))
+                if trial_ends.tzinfo is not None:
+                    trial_ends = trial_ends.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                trial_ends = None
     sub_ends = company.get("subscription_ends_at")
+    next_attempt = company.get("next_payment_attempt_at")
 
     in_trial = isinstance(trial_ends, datetime) and trial_ends > now
     in_paid = sub_status == "active" and (
         not isinstance(sub_ends, datetime) or sub_ends > now
     )
+    # Grace window for past_due: keep drivers working while Stripe retries.
+    # Window = next retry date if known, otherwise PAST_DUE_GRACE_DAYS after
+    # the previous billing period ended. Owner can override via env.
+    grace_days = int(os.environ.get("PAST_DUE_GRACE_DAYS", "7"))
+    in_past_due_grace = False
+    if sub_status == "past_due":
+        grace_until: Optional[datetime] = None
+        if isinstance(next_attempt, datetime):
+            grace_until = next_attempt
+        elif isinstance(sub_ends, datetime):
+            grace_until = sub_ends + timedelta(days=grace_days)
+        if grace_until is not None and grace_until > now:
+            in_past_due_grace = True
 
-    if not (in_trial or in_paid):
+    if not (in_trial or in_paid or in_past_due_grace):
         raise HTTPException(
             status_code=402,
             detail=(
@@ -13895,7 +13922,38 @@ async def stripe_webhook(request: Request):
     
     event_type = event.get("type")
     data = event.get("data", {}).get("object", {})
-    
+
+    async def _email_billing_owners(company_id: str, subject: str, body_html: str) -> None:
+        """Email all super_admins + admins on the tenant. Best-effort; never raises."""
+        try:
+            users_cur = db.users.find(
+                {"company_id": company_id, "role": {"$in": [UserRole.SUPER_ADMIN, UserRole.ADMIN]}},
+                {"email": 1, "name": 1},
+            )
+            users = await users_cur.to_list(50)
+            for u in users:
+                email = u.get("email")
+                if not email:
+                    continue
+                html = _email_template_branded(
+                    heading=subject,
+                    body_html=body_html,
+                )
+                try:
+                    await send_system_email(email, subject, html)
+                except Exception as exc:
+                    logger.warning("billing email failed for %s: %s", email, exc)
+        except Exception as exc:
+            logger.warning("billing email lookup failed for %s: %s", company_id, exc)
+
+    def _epoch_to_dt(epoch_value) -> Optional[datetime]:
+        try:
+            if epoch_value is None:
+                return None
+            return datetime.fromtimestamp(int(epoch_value), tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+
     if event_type == "checkout.session.completed":
         # Payment successful, activate subscription
         company_id = data.get("metadata", {}).get("company_id")
@@ -13907,35 +13965,99 @@ async def stripe_webhook(request: Request):
                     "stripe_subscription_id": data.get("subscription"),
                 }}
             )
-    
+
     elif event_type == "customer.subscription.updated":
-        # Subscription updated
+        # Subscription updated. Store the period end so the grace-period
+        # gate in require_active_subscription can compare against it.
         subscription_id = data.get("id")
         status = data.get("status")
-        
+        period_end = _epoch_to_dt(data.get("current_period_end"))
+
+        update_doc: dict = {"subscription_status": status}
+        if period_end is not None:
+            update_doc["subscription_ends_at"] = period_end
         await db.companies.update_one(
             {"stripe_subscription_id": subscription_id},
-            {"$set": {"subscription_status": status}}
+            {"$set": update_doc},
         )
-    
+
     elif event_type == "customer.subscription.deleted":
-        # Subscription cancelled
+        # Subscription cancelled — both via owner action and dunning final fail.
         subscription_id = data.get("id")
-        
-        await db.companies.update_one(
+        period_end = _epoch_to_dt(data.get("current_period_end"))
+
+        update_doc: dict = {"subscription_status": "canceled"}
+        if period_end is not None:
+            update_doc["subscription_ends_at"] = period_end
+        result = await db.companies.update_one(
             {"stripe_subscription_id": subscription_id},
-            {"$set": {"subscription_status": "cancelled"}}
+            {"$set": update_doc},
         )
-    
+        if result.modified_count:
+            co = await db.companies.find_one(
+                {"stripe_subscription_id": subscription_id},
+                {"_id": 1, "name": 1},
+            )
+            if co:
+                period_str = period_end.strftime("%d %b %Y") if period_end else "now"
+                await _email_billing_owners(
+                    str(co["_id"]),
+                    "Your FleetShield365 subscription was cancelled",
+                    (
+                        f"<p>Your FleetShield365 subscription has been cancelled.</p>"
+                        f"<p>Access ends on <b>{period_str}</b>. After that drivers won't be able "
+                        f"to submit prestart inspections, fuel records or incidents from the mobile app.</p>"
+                        f"<p>You can resubscribe any time from Settings → Billing.</p>"
+                    ),
+                )
+
     elif event_type == "invoice.payment_failed":
-        # Payment failed
+        # Stripe will retry automatically (default ~3-4 attempts over 3 weeks).
+        # We flip the status to past_due; the grace-period gate gives the
+        # owner time to fix the card before drivers get locked out.
         subscription_id = data.get("subscription")
-        
-        await db.companies.update_one(
-            {"stripe_subscription_id": subscription_id},
-            {"$set": {"subscription_status": "past_due"}}
-        )
-    
+        if subscription_id:
+            next_attempt = _epoch_to_dt(data.get("next_payment_attempt"))
+            update_doc: dict = {"subscription_status": "past_due"}
+            if next_attempt is not None:
+                update_doc["next_payment_attempt_at"] = next_attempt
+            await db.companies.update_one(
+                {"stripe_subscription_id": subscription_id},
+                {"$set": update_doc},
+            )
+            co = await db.companies.find_one(
+                {"stripe_subscription_id": subscription_id},
+                {"_id": 1, "name": 1},
+            )
+            if co:
+                next_str = next_attempt.strftime("%d %b %Y") if next_attempt else "soon"
+                amount_due = (data.get("amount_due") or 0) / 100.0
+                currency = (data.get("currency") or "aud").upper()
+                await _email_billing_owners(
+                    str(co["_id"]),
+                    "FleetShield365 payment failed — please update your card",
+                    (
+                        f"<p>We couldn't charge your card for FleetShield365.</p>"
+                        f"<p><b>Amount due:</b> {currency} {amount_due:,.2f}<br>"
+                        f"<b>Next automatic retry:</b> {next_str}</p>"
+                        f"<p>If the retry fails as well, drivers will lose access to the mobile app. "
+                        f"Update your card now from Settings → Billing → Manage subscription.</p>"
+                    ),
+                )
+
+    elif event_type == "invoice.payment_succeeded":
+        # Recovery after a past_due retry — flip status back to active.
+        subscription_id = data.get("subscription")
+        if subscription_id:
+            period_end = _epoch_to_dt(data.get("period_end") or data.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end"))
+            update_doc: dict = {"subscription_status": "active"}
+            if period_end is not None:
+                update_doc["subscription_ends_at"] = period_end
+            await db.companies.update_one(
+                {"stripe_subscription_id": subscription_id},
+                {"$set": update_doc, "$unset": {"next_payment_attempt_at": ""}},
+            )
+
     return {"received": True}
 
 # ============== Push Notifications ==============
@@ -14318,6 +14440,66 @@ async def create_upgrade_checkout(
     except Exception as e:
         logger.error(f"create_upgrade_checkout failed for {company_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not start checkout: {e}")
+
+
+# ============== Stripe Customer Portal ==============
+#
+# Once a tenant has subscribed, this is the canonical place for them to
+# update their card, download invoices, change billing address, or
+# cancel. Stripe-hosted — no UI for us to build, and PCI scope stays at
+# Stripe.
+
+class BillingPortalRequest(BaseModel):
+    origin_url: Optional[str] = None  # where to land after the portal closes
+
+
+@api_router.post("/billing/portal")
+async def create_billing_portal_session(
+    payload: BillingPortalRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Open a Stripe Customer Portal session for the current tenant.
+
+    Auth: super_admin / admin only — drivers can't see Billing at all.
+    """
+    if current_user.get("role") not in (UserRole.SUPER_ADMIN, UserRole.ADMIN):
+        raise HTTPException(status_code=403, detail="Only owners and admins can manage billing")
+
+    if not stripe.api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Stripe is not configured on this server.",
+        )
+
+    company_id = current_user.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="User has no company")
+
+    company = await db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    customer_id = company.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Stripe customer linked to this tenant yet. "
+                "Start by subscribing through the Upgrade checkout."
+            ),
+        )
+
+    origin = payload.origin_url if (payload.origin_url and _is_allowed_origin(payload.origin_url)) else DEFAULT_ORIGIN_URL
+    origin = origin.rstrip('/')
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{origin}/settings?tab=billing",
+        )
+        return {"url": session.url}
+    except Exception as e:
+        logger.error(f"create_billing_portal_session failed for {company_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not open billing portal: {e}")
 
 
 @api_router.get("/subscription")
