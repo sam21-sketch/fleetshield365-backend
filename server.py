@@ -14586,6 +14586,16 @@ async def get_subscription(current_user: dict = Depends(get_current_user)):
         "company_id": current_user["company_id"],
     })
 
+    # `is_subscribed` answers "has this tenant committed to a paid plan
+    # in Stripe yet?" — True iff a Stripe Subscription is linked AND it
+    # hasn't been cancelled. This is independent of the in-trial flag:
+    # a tenant whose checkout completed during the trial gets
+    # is_subscribed=True even though Stripe still reports the sub as
+    # `trialing` until the first charge. Frontend uses this to decide
+    # "show Manage Subscription" vs "show Upgrade Now".
+    sub_status_norm = (company.get("subscription_status") or "").lower()
+    is_subscribed = bool(company.get("stripe_subscription_id")) and sub_status_norm not in ("canceled", "cancelled")
+
     return {
         "current_plan": current_plan,
         "plan_details": plan_details,
@@ -14596,8 +14606,10 @@ async def get_subscription(current_user: dict = Depends(get_current_user)):
         "trial_end": trial_status.get("trial_end"),
         "trial_enabled": pricing.get("trial_enabled", True),
         "is_active": trial_status.get("is_active", False),
+        "is_subscribed": is_subscribed,
         "subscription_message": trial_status.get("message"),
         "subscription_status": company.get("subscription_status"),
+        "subscription_ends_at": company.get("subscription_ends_at").isoformat() if isinstance(company.get("subscription_ends_at"), datetime) else company.get("subscription_ends_at"),
         # Live pricing (always in the platform currency from owner panel).
         "pricing": {
             "base_price": pricing["base_price"],
