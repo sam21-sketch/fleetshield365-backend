@@ -13799,6 +13799,13 @@ async def register_company(data: CompanyRegister):
                 mode="subscription",
                 success_url=f"{data.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
                 cancel_url=f"{data.origin_url}/pricing",
+                # Top-level metadata is mirrored on the
+                # checkout.session.completed webhook payload. Without
+                # this the webhook handler can't find the tenant by
+                # company_id (subscription_data.metadata lives on the
+                # Subscription, not the Session).
+                metadata={"company_id": company_id},
+                client_reference_id=company_id,
                 subscription_data={
                     "trial_period_days": pricing_now["trial_days"],
                     "metadata": {
@@ -13971,16 +13978,41 @@ async def stripe_webhook(request: Request):
             return None
 
     if event_type == "checkout.session.completed":
-        # Payment successful, activate subscription
-        company_id = data.get("metadata", {}).get("company_id")
+        # Payment successful, activate subscription. We try three lookup
+        # strategies in order so a missing metadata field doesn't leave
+        # the tenant stuck on trialing.
+        meta = data.get("metadata") or {}
+        company_id = meta.get("company_id")
+        customer_id = data.get("customer")
+        subscription_id = data.get("subscription")
+
+        update_doc = {
+            "subscription_status": "active",
+            "stripe_subscription_id": subscription_id,
+        }
+        # Stripe Subscriptions created via Checkout often start in
+        # `trialing` if the line items have trial_period_days. The
+        # customer.subscription.updated event will follow with the real
+        # status; here we just mark them past the trial-expired wall so
+        # they're not blocked.
+
         if company_id:
-            await db.companies.update_one(
-                {"_id": ObjectId(company_id)},
-                {"$set": {
-                    "subscription_status": "active",
-                    "stripe_subscription_id": data.get("subscription"),
-                }}
+            try:
+                result = await db.companies.update_one(
+                    {"_id": ObjectId(company_id)}, {"$set": update_doc},
+                )
+                logger.info(f"checkout.session.completed matched by metadata company_id={company_id}, modified={result.modified_count}")
+            except Exception as exc:
+                logger.error(f"checkout.session.completed update by company_id failed: {exc}")
+                company_id = None  # fall through to customer lookup
+
+        if not company_id and customer_id:
+            result = await db.companies.update_one(
+                {"stripe_customer_id": customer_id}, {"$set": update_doc},
             )
+            logger.info(f"checkout.session.completed matched by stripe_customer_id={customer_id}, modified={result.modified_count}")
+            if not result.modified_count:
+                logger.warning(f"checkout.session.completed couldn't find company for customer_id={customer_id}, subscription_id={subscription_id}")
 
     elif event_type == "customer.subscription.updated":
         # Subscription updated. Store the period end so the grace-period
@@ -14444,6 +14476,11 @@ async def create_upgrade_checkout(
             mode="subscription",
             success_url=f"{origin}/settings?tab=billing&upgrade=success",
             cancel_url=f"{origin}/settings?tab=billing&upgrade=cancelled",
+            # Mirror metadata to the session top-level so
+            # checkout.session.completed webhook can locate the tenant
+            # (subscription_data.metadata only reaches the Subscription).
+            metadata={"company_id": company_id, "upgrade": "true"},
+            client_reference_id=company_id,
             subscription_data=sub_data,
         )
         return {
