@@ -14792,18 +14792,59 @@ async def get_billing_details(current_user: dict = Depends(get_current_user)):
     except Exception:
         logger.exception("billing/details: invoice fetch failed")
 
-    # Upcoming invoice preview (next charge)
+    # Upcoming invoice preview (next charge) — expand line items so the
+    # UI can show each charge / credit individually. Stripe puts every
+    # mid-period quantity change as a pair of proration line items:
+    # "Unused time on N × Pro after DATE" (credit) +
+    # "Remaining time on M × Pro after DATE" (charge). Grouping these
+    # lets us show "+2 vehicles added Day 30 → $4.67 on next invoice"
+    # and "-1 vehicle removed Day 50 → $4.00 credit" cleanly.
     try:
         if customer_id and subscription_id:
-            upcoming_raw = _stripe_to_dict(
-                stripe.Invoice.upcoming(customer=customer_id, subscription=subscription_id)
-            )
+            upcoming_obj = stripe.Invoice.upcoming(customer=customer_id, subscription=subscription_id)
+            upcoming_raw = _stripe_to_dict(upcoming_obj)
+            lines_raw = (upcoming_raw.get("lines") or {}).get("data") or []
+            regular_lines = []
+            proration_charges = []
+            proration_credits = []
+            for ln in lines_raw:
+                desc = ln.get("description") or ""
+                amount_cents = int(ln.get("amount") or 0)
+                qty = int(ln.get("quantity") or 0)
+                proration = bool(ln.get("proration"))
+                period = ln.get("period") or {}
+                norm = {
+                    "description": desc,
+                    "amount_cents": amount_cents,
+                    "quantity": qty,
+                    "is_proration": proration,
+                    "period_start": _epoch_iso(period.get("start")),
+                    "period_end": _epoch_iso(period.get("end")),
+                }
+                if not proration:
+                    regular_lines.append(norm)
+                elif amount_cents < 0:
+                    proration_credits.append(norm)
+                else:
+                    proration_charges.append(norm)
+
+            subtotal_cents = int(upcoming_raw.get("subtotal") or 0)
+            total_cents = int(upcoming_raw.get("total") or 0)
             base_payload["upcoming_invoice"] = {
                 "amount_due_cents": int(upcoming_raw.get("amount_due") or 0),
+                "subtotal_cents": subtotal_cents,
+                "total_cents": total_cents,
                 "currency": (upcoming_raw.get("currency") or "aud").lower(),
                 "next_payment_attempt": _epoch_iso(upcoming_raw.get("next_payment_attempt")),
                 "period_start": _epoch_iso(upcoming_raw.get("period_start")),
                 "period_end": _epoch_iso(upcoming_raw.get("period_end")),
+                "regular_lines": regular_lines,
+                "proration_charges": proration_charges,
+                "proration_credits": proration_credits,
+                "proration_net_cents": (
+                    sum(p["amount_cents"] for p in proration_charges)
+                    + sum(p["amount_cents"] for p in proration_credits)
+                ),
             }
     except Exception:
         # Stripe returns 404 here when there's no upcoming invoice (e.g.
