@@ -13906,9 +13906,20 @@ async def stripe_webhook(request: Request):
             detail="Webhook signing not configured on this server",
         )
 
+    # Normalise to a plain (nested) dict. stripe.Webhook.construct_event
+    # returns a StripeObject; on stripe-python v8+/Python 3.14 calling
+    # `.get(...)` on it raises AttributeError("get") because StripeObject
+    # routes unknown attrs through `__getattr__ → __getitem__`. JSON
+    # round-trip on the raw payload bytes guarantees plain dicts all the
+    # way down, regardless of library version.
+    try:
+        event_dict = json.loads(payload)
+    except Exception:
+        event_dict = dict(event) if not isinstance(event, dict) else event
+
     # Idempotency: drop duplicate event IDs. Stripe retries on 5xx,
     # so without this a network blip could promote a tenant twice.
-    event_id = event.get("id")
+    event_id = event_dict.get("id")
     if event_id:
         existing = await db.stripe_events.find_one({"_id": event_id})
         if existing:
@@ -13916,12 +13927,17 @@ async def stripe_webhook(request: Request):
             return {"status": "duplicate"}
         await db.stripe_events.insert_one({
             "_id": event_id,
-            "type": event.get("type"),
+            "type": event_dict.get("type"),
             "received_at": datetime.now(timezone.utc),
         })
-    
-    event_type = event.get("type")
-    data = event.get("data", {}).get("object", {})
+
+    event_type = event_dict.get("type")
+    data_wrapper = event_dict.get("data") or {}
+    if not isinstance(data_wrapper, dict):
+        data_wrapper = dict(data_wrapper)
+    data = data_wrapper.get("object") or {}
+    if not isinstance(data, dict):
+        data = dict(data)
 
     async def _email_billing_owners(company_id: str, subject: str, body_html: str) -> None:
         """Email all super_admins + admins on the tenant. Best-effort; never raises."""
