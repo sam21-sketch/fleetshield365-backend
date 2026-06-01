@@ -8132,7 +8132,7 @@ async def _vehicle_for_inspection(vehicle_id: str, current_user: dict) -> dict:
 
 
 @api_router.post("/inspections/prestart")
-async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_prestart(inspection: PrestartCreate, request: Request, current_user: dict = Depends(require_active_subscription)):
     # 2026-05-19 — idempotency. Queue retries from the mobile app resend
     # the same payload with the same dedupHash → idempotency_key. Return
     # the existing record instead of creating a duplicate.
@@ -8356,7 +8356,7 @@ async def create_prestart(inspection: PrestartCreate, request: Request, current_
     return serialize_doc(inspection_doc)
 
 @api_router.post("/inspections/end-shift")
-async def create_end_shift(inspection: EndShiftCreate, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_end_shift(inspection: EndShiftCreate, request: Request, current_user: dict = Depends(require_active_subscription)):
     # 2026-05-19 — see prestart for context.
     existing = await _check_idempotency(
         db.inspections, current_user["company_id"], inspection.idempotency_key,
@@ -8857,7 +8857,7 @@ async def get_inspection_pdf(
 # ============== Fuel Submission Routes ==============
 
 @api_router.post("/fuel")
-async def create_fuel_submission(fuel: FuelSubmission, request: Request, current_user: dict = Depends(get_current_user)):
+async def create_fuel_submission(fuel: FuelSubmission, request: Request, current_user: dict = Depends(require_active_subscription)):
     """Driver submits fuel receipt"""
     # 2026-05-19 — idempotency. See PrestartCreate for context.
     existing = await _check_idempotency(
@@ -10693,7 +10693,7 @@ async def send_incident_alert_email(admin_email: str, company_name: str, inciden
 async def create_incident(
     incident: IncidentCreate,
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_active_subscription)
 ):
     """Create a new incident report"""
     company_id = current_user["company_id"]
